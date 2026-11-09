@@ -12,6 +12,7 @@ import { CommandStatusRow } from './CommandStatusRow.tsx'
 import { CompactionItem, type CompactionRowInjected } from './CompactionItem.tsx'
 import { ContextInjectionRow } from './ContextInjectionRow.tsx'
 import { MessageIconActions } from './MessageIconActions.tsx'
+import { OperatorReplyView, isOperatorReply } from './OperatorReplyView.tsx'
 import css from './MessageItem.module.css'
 
 const EMPTY_TEXT_FACTS: Readonly<Partial<UserTextFacts>> = {}
@@ -364,6 +365,9 @@ export const UserMessageNodeView = memo(function UserMessageNodeView({
 /** Injected-context keyed Chat renderer. */
 export const ContextMessageNodeView = memo(function ContextMessageNodeView({ node, t }: ChatNodeViewProps<'context'>) {
   const data = node.data
+  // A reply the orchestration posted for the operator is the bot's own message,
+  // not background context: render it readably instead of folding it away.
+  if (isOperatorReply(data.source)) return <OperatorReplyView content={data.content} t={t} />
   return (
     <ContextInjectionRow
       content={data.content}

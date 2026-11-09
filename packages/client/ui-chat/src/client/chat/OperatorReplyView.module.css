@@ -1,0 +1,12 @@
+/* Host-posted operator reply: the same narration column as an Assistant answer,
+   so a reply the tool reported as sent is readable in the conversation instead
+   of folded into a collapsed context-injection row. */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  margin: 8px 0 20px;
+  font-size: var(--dsh-content-font-size, 14px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+  color: var(--dsw-alias-label-primary);
+}
