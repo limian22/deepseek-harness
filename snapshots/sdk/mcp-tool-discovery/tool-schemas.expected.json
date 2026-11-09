@@ -1,0 +1,63 @@
+{
+  "initial": [
+    {
+      "name": "mcp_call__fixture",
+      "description": "Invoke one tool published by MCP server \"fixture\" under its original tool name, with the server's normal permissions, approvals, and timeouts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact tool name from mcp_discover__fixture."
+          },
+          "arguments": {
+            "type": "object",
+            "description": "Arguments object for the tool, matching its JSON Schema parameters.",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "mcp_describe__fixture",
+      "description": "Describe one tool published by MCP server \"fixture\", including its complete JSON Schema parameters.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact tool name from mcp_discover__fixture."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "mcp_discover__fixture",
+      "description": "Search the tools published by MCP server \"fixture\". Returns compact names and descriptions with paging; use mcp_describe__fixture for one tool's full parameter schema and mcp_call__fixture to invoke it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Case-insensitive substring of a tool name or description; omit to list every tool."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Number of matching tools to skip (default 0)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum entries to return (default and maximum 25)."
+          }
+        }
+      }
+    }
+  ],
+  "changes": []
+}

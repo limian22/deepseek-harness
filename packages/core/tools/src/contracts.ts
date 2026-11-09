@@ -122,6 +122,16 @@ export interface ToolRegistrationOptions {
    * @returns whether the tool participates in this step.
    */
   readonly when?: (context: ToolActivationContext) => boolean | Promise<boolean>
+  /**
+   * Include this registration in model-facing descriptions (default true).
+   * False withholds its schema from `definitions()`, `schemas()`, and every
+   * executor's prompt guidance while registration, scoped admission, and
+   * `get`/`executable` lookup keep it addressable — an on-demand composite
+   * dispatches it by its original name. Advertisement is presentation only:
+   * a model that calls a withheld name still passes policy, guards, approval,
+   * and step admission like any registered tool.
+   */
+  readonly advertise?: boolean
 }
 
 /** One step's admitted registrations, also used by nested PTC calls. */

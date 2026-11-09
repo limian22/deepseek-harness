@@ -70,6 +70,7 @@ A profile’s `cordis.patch.yml` replaces the entry’s complete `servers` map. 
 | `command` / `args` / `env` / `cwd` | — | stdio: executable, arguments, extra child env, working directory |
 | `url` / `headers` | — | streamable-http: endpoint URL and extra request headers |
 | `enabled` | `true` | Durable intent: `false` unmounts the instance and keeps the entry |
+| `exposure` / `discovery` | mcp-client defaults | Per-server [on-demand discovery](../mcp-client/README.md#on-demand-tool-discovery) and result budgets |
 | `startupTimeoutMs` | `30,000` | Budget for template resolution, negotiation, connection, and initial tool discovery |
 | `toolCallTimeoutMs` / `closeTimeoutMs` / `reconnect` / `toolLoading` | mcp-client defaults | Per-server overrides; `toolLoading: on-demand` lets agents [load the server's tools when they need them](../mcp-client/README.md#on-demand-tool-loading) |
 

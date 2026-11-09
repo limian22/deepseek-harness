@@ -27,7 +27,7 @@ kind: "package-reference"
 
 `ctx.tools.execute()` 接受完整的原始调用批次。独立服务调用没有 `agent`；模型步骤之外的程序调用（包括初始化钩子）没有 `log`。没有 `log` 的 Agent 仍提供工具作用域，但不会产生根调用／结果事件。
 
-在任何 agent 调用工具的地方挂载 `dsh-tools`：它提供 `ctx.tools`，即每个工具插件注册进去、循环分发所经过的注册表。注册一个工具就足以让它可见——注册表会自动把其 schema 送入系统提示词组装。
+在任何 agent 调用工具的地方挂载 `dsh-tools`：它提供 `ctx.tools`，即每个工具插件注册进去、循环分发所经过的注册表。默认情况下，注册工具就会将其参数定义加入系统提示词组装。
 
 ### 注册工具
 
@@ -70,7 +70,7 @@ ctx.tools.register(defineTool({
 
 `resolve({ agent, modelSelection, signal })` 返回步骤拥有的 `ResolvedToolSet`。将它作为 `toolSet` 传给提示词组装以及该步骤的 `ctx.tools.execute()` 批次，批次结束后释放；同一步骤内的重试复用它。执行器把批次的集合应用到每次调用，包括 PTC 程序的子调用。注册仍由 effect 持有；每份集合只准入原 agent scope 中的原注册。注销、新的限制或同名替换会阻止尚未开始的调用继续使用它；取消之后，调用以共享 pipeline 的取消结果结束。已经开始的操作保留协作取消义务。批次没有已解析集合时，条件工具调用返回 `UNKNOWN_TOOL`。
 
-`get(name, scope, toolSet)`、`definitions(scope, toolSet)` 和 `schemas(scope, toolSet)` 读取已准入集合；省略 `toolSet` 时只查看已注册定义，不计算条件。`executable(name, scope, toolSet)` 是执行时的查找：它应用集合，没有集合时排除条件注册。执行器的描述与分区通过 `AssembleContext.toolSet` 接收同一集合。展示变换不能增删可调用工具。
+`get(name, scope, toolSet)` 读取已准入定义；省略 `toolSet` 时只查看注册，不计算条件。`executable(name, scope, toolSet)` 应用步骤准入；没有集合时排除条件注册。`definitions(scope, toolSet)` 和 `schemas(scope, toolSet)` 仅返回允许展示的定义；执行器描述与分区接收同一展示集合。`register(definition, { advertise: false })` 从模型声明和生成的 SDK 指导中省略能力，但不移除注册、执行策略或步骤准入。该设置减少参数定义成本，不是访问控制；知道名称的调用方仍可调用，但必须通过限制与策略检查。
 
 ### 选择执行器
 

@@ -45,6 +45,7 @@ interface CompiledToolRestriction {
 interface ToolRegistration {
   readonly definition: ToolDefinition
   readonly when: ToolRegistrationOptions['when']
+  readonly advertise: boolean
 }
 
 /** One scope's complete registry view, derived in a single layer traversal. */
@@ -147,7 +148,7 @@ export class ToolsService extends Service {
     }
     return this.layers.effect(
       this.ctx,
-      layer => layer.tools.insert(name, { definition, when: options.when }),
+      layer => layer.tools.insert(name, { definition, when: options.when, advertise: options.advertise !== false }),
       { label: 'tools.register()' },
     )
   }
@@ -297,13 +298,17 @@ export class ToolsService extends Service {
   }
 
   /**
-   * Read the visible capability definitions for descriptions and program bindings.
+   * Read the model-facing capability definitions for descriptions and program
+   * bindings. Registrations declared with `advertise: false` are omitted while
+   * scoped admission and `get`/`executable` lookup still resolve them.
    * @param scope - viewing Agent or preset; omitted selects the global view.
    * @param toolSet - step admission; omit only to inspect registered definitions.
-   * @returns definitions after scoped shadowing and restrictions, limited to the step's admission when given.
+   * @returns advertised definitions after scoped shadowing and restrictions, limited to the step's admission when given.
    */
   definitions(scope?: ScopeKey, toolSet?: ResolvedToolSet): readonly ToolDefinition[] {
-    return toolSet === undefined ? [...this.view(scope).visible.values()] : [...toolSet.view(scope).values()]
+    const view = this.view(scope)
+    const source = toolSet === undefined ? view.visible : toolSet.view(scope)
+    return [...source.values()].filter(definition => view.registrations.get(definition.name)?.advertise !== false)
   }
 
   /**
@@ -410,4 +415,6 @@ export * from './executor.ts'
 export * from './schema.ts'
 export * from './json-schema.ts'
 export * from './presentation.ts'
+export * from './types.ts'
+export * from './sub-dispatch.ts'
 export { ToolsService as ToolRuntime }

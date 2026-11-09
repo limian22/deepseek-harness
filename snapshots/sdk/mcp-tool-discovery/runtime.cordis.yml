@@ -1,0 +1,21 @@
+- id: tool-executor-native
+  disabled: false
+
+- id: tool-executor-ptc
+  disabled: true
+
+- insert:
+    - id: mcp-discovery-fixture-server
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: fixture
+        command: !!js process.execPath
+        args: !!js '[process.env.DSH_MCP_DISCOVERY_FIXTURE]'
+        exposure: discovery
+        startupTimeoutMs: 30000
+        failOnStartupError: true
+        reconnect:
+          enabled: false
+    - id: mcp-discovery-assertions
+      name: './runtime.mjs'

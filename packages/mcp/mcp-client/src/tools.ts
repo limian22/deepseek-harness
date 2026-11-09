@@ -14,18 +14,19 @@
 
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import { specTypeSchemas, type Client, type ImageContent, type JsonSchemaType, type Tool } from '@modelcontextprotocol/client'
-import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv'
+import { specTypeSchemas, type Client, type ImageContent } from '@modelcontextprotocol/client'
 import type { Context } from '@deepseek-ai/cordis'
 import { isImageAdmissionError } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType, SaveImageAttachment } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolExecution, ToolExecutionResult, ToolRegistrationOptions } from '@deepseek-ai/dsh-tools'
 import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { JsonSchemaNode } from '@deepseek-ai/dsh-tools'
+import type { ToolExecutionPipeline } from '@deepseek-ai/dsh-tools/pipeline'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-import { describeError, McpLocalError, mcpRequestError, McpToolError } from './diagnostic.ts'
-import type { McpToolLoader } from './tool-loading.ts'
+import { describeError, McpLocalError } from './diagnostic.ts'
+import { createDiscoveryTools } from './discovery.ts'
+import type { ResolvedDiscoveryPolicy } from './discovery.ts'
 
 /** Resolved options relevant to tool bridging. */
 export interface ToolBridgeOptions {
@@ -34,33 +35,40 @@ export interface ToolBridgeOptions {
   /** Generation cancellation combined with each tool execution's signal. */
   signal: AbortSignal
   /**
-   * Remove secret values from tool-call failures before they reach callers;
-   * a failure keeps its `name` and `code`.
+   * Remove secret values from tool-call failures before they reach callers.
    * @param text - transport or protocol failure text, or MCP `isError` result text.
    * @returns the text with secret values replaced.
    */
   redact?: (text: string) => string
-  /** On-demand loading: the generation is published to this loader instead of the tool registry. */
-  loader?: McpToolLoader
+  /**
+   * On-demand exposure for this generation: original tools stay registered
+   * (withheld from model declarations) and three compact helpers are added in
+   * the same generation. Omitted keeps direct exposure.
+   */
+  discovery?: DiscoveryExposure
 }
 
-/**
- * Registration failed after the prior generation was removed and partial
- * registrations were rolled back (`MCP_TOOL_REGISTRATION_FAILED`).
- */
-export class McpToolRegistrationError extends McpLocalError {
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, 'MCP_TOOL_REGISTRATION_FAILED', options)
-  }
+/** Per-generation on-demand setup: validated budgets and the per-fiber invocation pipeline. */
+export interface DiscoveryExposure {
+  /** Validated discovery budgets. */
+  readonly policy: ResolvedDiscoveryPolicy
+  /** Per-fiber guarded pipeline that dispatches originals by their original name. */
+  readonly pipeline: ToolExecutionPipeline
 }
+
+/** Registration failed after the prior generation was removed and partial registrations were rolled back. */
+export class McpToolRegistrationError extends McpLocalError {}
 
 /** State for one sync generation: the current set of disposers keyed by public name. */
 export type ToolDisposers = Map<string, () => void>
 
-/**
- * Canonical MCP result exposed to PTC mode without discarding protocol blocks.
- * Each image block admitted to durable model context also carries its `attachment` reference.
- */
+/** One definition this generation publishes and its registration options. */
+interface RegistrationPlan {
+  definition: ToolDefinition
+  options: ToolRegistrationOptions
+}
+
+/** Canonical MCP result exposed to PTC mode without discarding protocol blocks. */
 export type McpResult<Structured extends JsonValue = JsonValue> = {
   content: JsonValue[]
   structuredContent?: Structured
@@ -116,30 +124,31 @@ export function publicToolName(serverName: string, rawName: string): string {
  *
  * Two phases keep the swap safe:
  *
- * 1. Fetch: let the SDK aggregate `tools/list` and build the full next
- *    generation of `ToolDefinition`s under public names. Any failure here
- *    (network error or duplicate raw name) rejects
- *    and leaves the previous generation registered untouched.
- * 2. Swap: dispose the previous generation, register the new one; an
- *    on-demand server publishes it to its loader, which registers only the
- *    loader tool and the tools agents loaded. A registry
- *    conflict here can only mean a foreign registration squats on this
- *    server's `mcp__<serverName>__` namespace — the partial generation is
- *    rolled back (zero tools from this server), logged, and rejected so the
- *    supervisor closes the failed connection generation.
+ * 1. Fetch and prepare: let the SDK aggregate `tools/list`, build the full
+ *    next generation of `ToolDefinition`s under public names, and prepare the
+ *    registration plan (discovery helpers plus server tools). Any failure here
+ *    (network error, duplicate raw name, or a helper that cannot be
+ *    constructed) rejects and leaves the previous generation registered
+ *    untouched.
+ * 2. Swap: dispose the previous generation, register the prepared plan. A
+ *    registry conflict here can only mean a foreign registration squats a
+ *    name from the plan — a server tool in the `mcp__<serverName>__` namespace
+ *    or one of the discovery helpers outside it — the partial generation is
+ *    rolled back (zero tools from this server), logged with the conflicting
+ *    name, and rejected so the supervisor closes the failed connection
+ *    generation.
  *
  * @param client - Connected MCP Client instance used to list and call tools.
  * @param ctx - Cordis context providing the `tools` service for registration.
- * @param opts - server namespace, call timeout, generation signal, optional error formatter, and optional on-demand loader.
+ * @param opts - server namespace, call timeout, generation signal, and optional error formatter.
  * @param previous - Disposer map from the prior sync generation; disposed
  *   during the swap phase (only after the fetch phase succeeded).
- * @param eligible - Judged again at the commit point, after the listing
- *   settled: a sync whose generation was abandoned meanwhile (startup budget
- *   elapsed, connection closed) publishes nothing and leaves `previous`
- *   untouched.
+ * @param eligible - Judged at the commit point, after the listing and the
+ *   registration plan settled: a sync whose generation was abandoned meanwhile
+ *   (startup budget elapsed, connection closed) publishes nothing and leaves
+ *   `previous` untouched.
  * @returns A map of registered public tool names to their unregister
- *   disposers — the exact set of live registrations owned by this server; an
- *   on-demand server's map holds only its loader's publication.
+ *   disposers — the exact set of live registrations owned by this server.
  */
 export async function syncTools(
   client: Client,
@@ -149,11 +158,10 @@ export async function syncTools(
   eligible: () => boolean = () => true,
 ): Promise<ToolDisposers> {
   // Phase 1: fetch and build the next generation without touching the registry.
-  const definitions = new Map<string, { rawName: string; definition: ToolDefinition }>()
+  const definitions = new Map<string, ToolDefinition>()
   const response = client.getServerCapabilities()?.tools === undefined
     ? { tools: [] }
     : await client.listTools(undefined, { cacheMode: 'refresh', signal: opts.signal })
-  const outputValidators = new AjvJsonSchemaValidator()
   for (const tool of response.tools) {
     const publicName = publicToolName(opts.serverName, tool.name)
     if (definitions.has(publicName)) {
@@ -161,19 +169,7 @@ export async function syncTools(
         `mcp-client(${opts.serverName}): server listed tool "${tool.name}" more than once — invalid tool list`,
       )
     }
-    if (publicName === opts.loader?.name) {
-      ctx.logger.warn(`mcp-client(${opts.serverName}): server tool "${tool.name}" is not offered because its name is the on-demand loader's`)
-      continue
-    }
-    // The bridge checks structured output itself: the SDK reports its local check as a
-    // ProtocolError indistinguishable from a server's JSON-RPC error.
-    const { outputSchema: _outputSchema, ...callDefinition } = tool
-    const outputCheck = compileOutputCheck(outputValidators, tool)
-    const invalidResult = (reason: string): McpToolError => {
-      const message = `Tool "${tool.name}" returned an invalid MCP result: ${reason}`
-      return new McpToolError(opts.redact === undefined ? message : opts.redact(message), 'MCP_INVALID_RESULT')
-    }
-    definitions.set(publicName, { rawName: tool.name, definition: createMcpToolDefinition(ctx, {
+    definitions.set(publicName, createMcpToolDefinition(ctx, {
       name: publicName,
       rawName: tool.name,
       description: tool.description ?? '',
@@ -181,36 +177,40 @@ export async function syncTools(
       outputSchema: tool.outputSchema,
       taskRequired: tool.execution?.taskSupport === 'required',
       call: async (args, execution) => {
-        // The generation closed and its tools await re-sync; the SDK would refuse the request unsent.
-        if (opts.signal.aborted) {
-          throw new McpToolError(`mcp-client(${opts.serverName}): server is disconnected`, 'MCP_SERVER_UNAVAILABLE')
-        }
-        if (outputCheck !== undefined && 'compileError' in outputCheck) {
-          throw invalidResult(`its output schema cannot be compiled: ${outputCheck.compileError}`)
-        }
-        let result: Awaited<ReturnType<Client['callTool']>>
         try {
-          result = await client.callTool(
+          const result = await client.callTool(
             { name: tool.name, arguments: args },
             { signal: AbortSignal.any([execution.signal, opts.signal]),
-              timeout: opts.toolCallTimeoutMs, toolDefinition: callDefinition },
+              timeout: opts.toolCallTimeoutMs, toolDefinition: tool },
           )
+          if (result.isError !== true || opts.redact === undefined) return result
+          return { isError: true, content: [{ type: 'text', text: opts.redact(extractText(result.content as JsonValue[], tool.name)) }] }
         } catch (error) {
-          // The SDK reports an aborted signal as a request timeout; cancellation
-          // and generation closure are reported as their own reasons instead.
-          execution.signal.throwIfAborted()
-          opts.signal.throwIfAborted()
-          throw mcpRequestError(error, `tool "${tool.name}"`, opts.redact)
+          if (opts.redact === undefined) throw error
+          throw new Error(opts.redact(describeError(error)))
         }
-        if (result.isError !== true) {
-          const failure = outputCheck === undefined ? undefined : outputCheck.check(result.structuredContent)
-          if (failure !== undefined) throw invalidResult(failure)
-          return result
-        }
-        if (opts.redact === undefined) return result
-        return { isError: true, content: [{ type: 'text', text: opts.redact(extractText(result.content as JsonValue[], tool.name)) }] }
       },
-    }) })
+    }))
+  }
+
+  // Still Phase 1: prepare the exact registration plan — discovery helpers
+  // (when enabled) followed by the server tools — without touching the
+  // registry, so a construction failure leaves the previous generation live.
+  const registrations: RegistrationPlan[] = []
+  if (opts.discovery !== undefined) {
+    // Helper names live outside `mcp__<server>__<raw>`, so a server may publish
+    // raw tools that would collide with a helper's short name without losing
+    // their public identity.
+    const helpers = createDiscoveryTools(ctx, {
+      serverName: opts.serverName,
+      definitions,
+      policy: opts.discovery.policy,
+      pipeline: opts.discovery.pipeline,
+    })
+    for (const definition of helpers.values()) registrations.push({ definition, options: {} })
+  }
+  for (const definition of definitions.values()) {
+    registrations.push({ definition, options: opts.discovery === undefined ? {} : { advertise: false } })
   }
 
   // Phase 2: swap generations — but only for a generation still entitled to
@@ -219,61 +219,23 @@ export async function syncTools(
   if (!eligible()) return previous
   for (const dispose of previous.values()) dispose()
   const disposers: ToolDisposers = new Map()
+  let registering: RegistrationPlan | undefined
   try {
-    if (opts.loader === undefined) {
-      for (const [publicName, { definition }] of definitions) {
-        disposers.set(publicName, ctx.tools.register(definition))
-      }
-    } else {
-      const offered = new Map([...definitions.values()].map(({ rawName, definition }) => [rawName, definition]))
-      disposers.set(opts.loader.name, opts.loader.publish(offered))
+    for (const plan of registrations) {
+      registering = plan
+      disposers.set(plan.definition.name, ctx.tools.register(plan.definition, plan.options))
     }
   } catch (error) {
-    // A conflict on an `mcp__<serverName>__`-qualified name means a foreign
-    // registration occupies this server's namespace. Roll back so the model
-    // sees either the full generation or none of it — never a partial set.
+    // Roll back so the model sees either the full generation or none of it —
+    // never a partial set. The failing name may be a server tool inside this
+    // server's namespace or one of the discovery helpers outside it, so name
+    // the exact definition instead of inferring the namespace from the error.
     for (const dispose of disposers.values()) dispose()
-    ctx.logger.error(`mcp-client(${opts.serverName}): tool registration failed, no tools registered: ${String(error)}`)
-    throw new McpToolRegistrationError('MCP tool registration failed', { cause: error })
+    const conflicting = registering?.definition.name ?? 'unknown tool'
+    ctx.logger.error(`mcp-client(${opts.serverName}): registration of "${conflicting}" failed, no tools registered: ${String(error)}`)
+    throw new McpToolRegistrationError(`MCP tool registration failed: cannot register "${conflicting}"`, { cause: error })
   }
   return disposers
-}
-
-/** A tool's compiled structured-output check, or why its advertised output schema cannot be compiled. */
-type OutputCheck = { compileError: string } | {
-  /**
-   * @param structured - `structuredContent` of a successful result.
-   * @returns why the value violates the advertised output schema, or undefined when it conforms.
-   */
-  check(structured: unknown): string | undefined
-}
-
-/**
- * Compile one tool's advertised output schema with the validator the SDK uses on Node.
- * @param validators - validator provider shared by one listing.
- * @param tool - listed tool; a tool without `outputSchema` needs no check.
- * @returns the check, a compile failure, or undefined without an output schema.
- */
-function compileOutputCheck(validators: AjvJsonSchemaValidator, tool: Tool): OutputCheck | undefined {
-  if (tool.outputSchema === undefined) return undefined
-  let validate: ReturnType<AjvJsonSchemaValidator['getValidator']>
-  try {
-    // The listed schema is the wire object the SDK passes to the same provider; only its optional `$schema` typing differs.
-    validate = validators.getValidator(tool.outputSchema as JsonSchemaType)
-  } catch (error) {
-    return { compileError: describeError(error) }
-  }
-  return {
-    check(structured) {
-      if (structured === undefined) return 'the tool has an output schema but returned no structured content'
-      try {
-        const result = validate(structured)
-        return result.valid ? undefined : `structured content does not match the output schema: ${result.errorMessage}`
-      } catch (error) {
-        return `structured content could not be validated: ${describeError(error)}`
-      }
-    },
-  }
 }
 
 /** Fields read from canonical content, including policy-owned value replacements. */
@@ -367,7 +329,7 @@ function createOutput(rawName: string, structuredSchema: JsonSchemaNode | undefi
     schema: {
       type: 'object',
       properties: {
-        content: { type: 'array', items: {}, description: 'MCP content blocks in order. An image block is an Image when the program can read it; otherwise it is the raw MCP block.' },
+        content: { type: 'array', items: {} },
         structuredContent: structuredSchema ?? {},
       },
       required: structuredSchema === undefined ? ['content'] : ['content', 'structuredContent'],
@@ -392,7 +354,7 @@ function createExecutor(
   const { rawName, taskRequired } = options
   return async (args: unknown, exec: ToolExecution) => {
     if (taskRequired) {
-      throw new McpToolError(`Tool "${rawName}" requires task-based execution, which this bridge does not support`, 'MCP_UNSUPPORTED_TASK_EXECUTION')
+      throw new Error(`Tool "${rawName}" requires task-based execution, which this bridge does not support`)
     }
     // The agent loop passes `JSON.parse(model_arguments)` which is usually an
     // object, but can be any JSON value if the model misbehaves (outputs a bare
@@ -401,7 +363,7 @@ function createExecutor(
     const argsObj = (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>
     const parsed = specTypeSchemas.CallToolResult['~standard'].validate(await options.call(argsObj, exec))
     if (parsed.issues !== undefined) {
-      throw new McpToolError(`Tool "${rawName}" returned an invalid MCP result: ${parsed.issues.map(issue => issue.message).join('; ')}`, 'MCP_INVALID_RESULT')
+      throw new Error(`Tool "${rawName}" returned an invalid MCP result: ${parsed.issues.map(issue => issue.message).join('; ')}`)
     }
     const result = parsed.value
 
@@ -410,7 +372,7 @@ function createExecutor(
 
     // MCP isError → throw so ToolRuntime produces an isError result for the model.
     if (result.isError === true) {
-      throw new McpToolError(text, 'MCP_TOOL_ERROR')
+      throw new Error(text)
     }
 
     const value: McpResult = {
@@ -419,18 +381,12 @@ function createExecutor(
         ? { structuredContent: result.structuredContent as JsonValue }
         : {},
     }
-    if (!containsImage(content)) return value
-    const fallback: ContentBlock[] = [{ type: 'text', text: extractText(content, rawName) }]
-    const { content: projected, attachments } = await prepareImageProjection(ctx, exec, content, rawName)
-    const admitted: McpResult = attachments === undefined ? value : {
-      ...value,
-      content: content.map((block, index) => {
-        const ref = attachments.get(index)
-        return ref === undefined || !isRecord(block) ? block : { ...block, attachment: { ...ref } }
-      }),
+    if (containsImage(content)) {
+      const fallback: ContentBlock[] = [{ type: 'text', text: extractText(content, rawName) }]
+      const projected = await prepareImageProjection(ctx, exec, content, rawName)
+      projections.set(exec, { value, fallback, content: projected })
     }
-    projections.set(exec, { value: admitted, fallback, content: projected })
-    return admitted
+    return value
   }
 }
 
@@ -503,14 +459,13 @@ function imageDiagnostic(block: McpContentBlock, reason: string): string {
  * Decode, preflight, and durably save one MCP result's ordered image batch.
  * Any refusal projects every image as text while retaining the canonical raw
  * value for programmatic callers.
- * @returns the projected content and, after admission, each image's reference by content index.
  */
 async function prepareImageProjection(
   ctx: Context,
   exec: ToolExecution,
   content: JsonValue[],
   toolName: string,
-): Promise<{ content: ContentBlock[]; attachments?: ReadonlyMap<number, ImageAttachmentRef> }> {
+): Promise<ContentBlock[]> {
   const decoded: SaveImageAttachment[] = []
   const validationErrors = new Map<number, string>()
   const imageIndexes: number[] = []
@@ -525,13 +480,13 @@ async function prepareImageProjection(
     }
   }
   if (validationErrors.size > 0) {
-    return { content: projectContent(content, toolName, (block, index) => ({
+    return projectContent(content, toolName, (block, index) => ({
       type: 'text',
       text: imageDiagnostic(
         block,
         validationErrors.get(index) ?? 'another image in the same result was invalid',
       ),
-    })) }
+    }))
   }
 
   let attachments: AttachmentStore
@@ -540,27 +495,24 @@ async function prepareImageProjection(
   } catch (error: unknown) {
     // resolveImageAdmission contains provider failures and throws Error only.
     const reason = (error as Error).message
-    return { content: projectContent(content, toolName, block => ({ type: 'text', text: imageDiagnostic(block, reason) })) }
+    return projectContent(content, toolName, block => ({ type: 'text', text: imageDiagnostic(block, reason) }))
   }
 
   try {
     const refs = await attachments.saveImages(decoded)
     const byIndex = new Map(imageIndexes.map((index, offset) => [index, refs[offset] as ImageAttachmentRef] as const))
-    return {
-      content: projectContent(content, toolName, (_block, index) => ({
-        type: 'image',
-        attachment: byIndex.get(index) as ImageAttachmentRef,
-      })),
-      attachments: byIndex,
-    }
+    return projectContent(content, toolName, (_block, index) => ({
+      type: 'image',
+      attachment: byIndex.get(index) as ImageAttachmentRef,
+    }))
   } catch (error: unknown) {
     const reason = isImageAdmissionError(error)
       ? `image admission rejected the result: ${error.message}`
       : 'durable image storage rejected the result'
-    return { content: projectContent(content, toolName, block => ({
+    return projectContent(content, toolName, block => ({
       type: 'text',
       text: imageDiagnostic(block, reason),
-    })) }
+    }))
   }
 }
 

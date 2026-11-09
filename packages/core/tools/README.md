@@ -27,7 +27,7 @@ Use `dsh-tools` to expose typed capabilities to models, validate calls, enforce 
 
 `ctx.tools.execute()` accepts a complete raw call batch. `agent` is absent for standalone service calls; `log` is absent for programmatic calls outside a model step, including initialization hooks. An Agent without `log` still supplies tool scope but does not produce root call/result events.
 
-Mount `dsh-tools` wherever agents call tools: it provides `ctx.tools`, the registry every tool plugin registers into and the selected executor resolves. Registering a tool is enough to make it visible — the registry feeds its schemas into the system-prompt assembly automatically.
+Mount `dsh-tools` wherever agents call tools: it provides `ctx.tools`, the registry every tool plugin registers into and the selected executor resolves. By default, registering a tool makes its schema visible in system-prompt assembly.
 
 ### Register a tool
 
@@ -70,7 +70,7 @@ The unified schema DSL supports `string`, `number`, `integer`, `boolean`, `null`
 
 `resolve({ agent, modelSelection, signal })` returns a step-owned `ResolvedToolSet`. Pass it as `toolSet` to prompt assembly and the step's `ctx.tools.execute()` batch, then dispose it after the batch settles; retries in the step reuse it. Executors apply the batch's set to every call, including PTC program subcalls. Registrations stay effect-owned; each selection admits only the original registration in its exact agent scope. Disposal, new restrictions, or same-name replacement prevent unstarted calls from using it; after cancellation, calls settle with the shared pipeline's cancellation results. Started operations retain their cooperative cancellation obligations. Conditional calls in a batch without a resolved set return `UNKNOWN_TOOL`.
 
-`get(name, scope, toolSet)`, `definitions(scope, toolSet)`, and `schemas(scope, toolSet)` inspect an admitted set; omitting `toolSet` inspects registered definitions without evaluating conditions. `executable(name, scope, toolSet)` is the execution lookup: it applies the set, and without one it excludes conditional registrations. Executor descriptions and sections receive the same selection as `AssembleContext.toolSet`. A presentation transform cannot add or remove callable tools.
+`get(name, scope, toolSet)` inspects an admitted definition; omitting `toolSet` inspects registrations without evaluating conditions. `executable(name, scope, toolSet)` applies step admission and excludes conditional registrations when no set is supplied. `definitions(scope, toolSet)` and `schemas(scope, toolSet)` return only advertised definitions; executor descriptions and sections receive that same presentation selection. `register(definition, { advertise: false })` omits a capability from model declarations and generated SDK guidance without removing its registration, execution policy, or step admission. This setting reduces schema cost; it is not access control. A caller that knows the name can still invoke it subject to restrictions and policy.
 
 ### Select an executor
 

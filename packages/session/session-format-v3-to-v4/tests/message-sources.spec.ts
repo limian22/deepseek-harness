@@ -27,7 +27,7 @@ describe('V4 source admission', () => {
     expect(before['kind']).toBe('plugin')
   })
 
-  it.each(['acme', 'plugin:acme', 'source:acme', '__proto__'])('retains direct source kind %s through migration and native restore', (kind) => {
+  it.each(['acme', 'plugin:acme', 'source:acme', '__proto__', 'mcp-mode'])('retains direct source kind %s through migration and native restore', (kind) => {
     const source = { kind, extra: { kind: 'plugin', plugin: 'opaque' } }
     const migrated = restore(source, 3)
     expect(migrated.events[0]?.data).toMatchObject({ source })

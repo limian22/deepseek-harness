@@ -1,0 +1,28 @@
+# Bilingual-pair consistency record for 2026-11-09-mcp-tool-discovery.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/plans/2026-11-09-mcp-tool-discovery.md
+/mcp-tool-discovery-implementation-plan:
+  en: 5557ace2a0fd4fd1
+  zh: e853eb4ce896e68f
+/mcp-tool-discovery-implementation-plan/scope-and-acceptance:
+  en: 470d0fc4de25df5e
+  zh: 8240ad28e0c3a2d7
+/mcp-tool-discovery-implementation-plan/measurement-card:
+  en: f9609f5d63b91f19
+  zh: 8280cff8292dc3f4
+/mcp-tool-discovery-implementation-plan/measurement-card/task-1-tool-presentation-and-execution-foundation:
+  en: df030c2e5a284765
+  zh: 800e33ac65723a54
+/mcp-tool-discovery-implementation-plan/measurement-card/task-2-mcp-discovery-and-invocation:
+  en: 37ede220b4b8165d
+  zh: d745ee2675e89c29
+/mcp-tool-discovery-implementation-plan/measurement-card/task-3-real-composition-transcript-and-measurement:
+  en: 2c1575d2ef488545
+  zh: d39441e3f07f95bb
+/mcp-tool-discovery-implementation-plan/measurement-card/task-4-documentation-review-and-verification:
+  en: baebffcd2de9ea1c
+  zh: 6d04b9d73538b005
+/mcp-tool-discovery-implementation-plan/ownership:
+  en: fecc5b40799a5199
+  zh: 1a8720228c152f08

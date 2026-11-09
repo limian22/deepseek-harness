@@ -29,6 +29,7 @@ The Web and Desktop profiles also mount the [MCP server manager](../../packages/
 |---|---|
 | Server identity, local process or HTTP endpoint, credentials, and process environment | [Client configuration](../../packages/mcp/mcp-client/README.md#use-this-package) |
 | Tool and resource request timeout, startup failure policy, and reconnection | [Client configuration](../../packages/mcp/mcp-client/README.md#use-this-package) |
+| Direct declarations or bounded on-demand tool discovery | Client `exposure` and `discovery`; see [on-demand discovery](../../packages/mcp/mcp-client/README.md#on-demand-tool-discovery) |
 | Resource discovery and reading | The [MCP resource service](../../packages/mcp/mcp-resources/README.md#use-this-package) is included in shipped profiles; it has no configuration fields |
 | Server instruction size limit | Client `maxInstructionBytes`; the composition supplies [system-prompt assembly](system-prompt.md) |
 | Permission decisions and supported image output | [Tool execution](tools.md) and [attachments](attachment.md) |

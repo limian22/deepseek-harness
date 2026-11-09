@@ -4874,9 +4874,9 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: 'definitions(scope?: ScopeKey, toolSet?: ResolvedToolSet): readonly ToolDefinition[]',
-        description: 'Read the visible capability definitions for descriptions and program bindings.',
+        description: 'Read the model-facing capability definitions for descriptions and program bindings. Registrations declared with `advertise: false` are omitted while scoped admission and `get`/`executable` lookup still resolve them.',
         parameters: [{ name: 'scope', description: 'viewing Agent or preset; omitted selects the global view.' }, { name: 'toolSet', description: 'step admission; omit only to inspect registered definitions.' }],
-        returns: 'definitions after scoped shadowing and restrictions, limited to the step\'s admission when given.',
+        returns: 'advertised definitions after scoped shadowing and restrictions, limited to the step\'s admission when given.',
       },
       {
         signature: 'schemas(scope?: ScopeKey, toolSet?: ResolvedToolSet): ToolSchema[]',
@@ -6161,9 +6161,9 @@ export const EVENT_API: readonly EventApiEntry[] = [
   {
     name: 'tools/ptc-dispatch-log',
     mode: 'waterfall',
-    signature: '\'tools/ptc-dispatch-log\'(this: Scoped<ToolsService>, dispatch: PtcDispatchLog, next: () => Promise<ContentBlock[]>): Promise<ContentBlock[]>',
-    summary: 'Allow a listener to replace content in the DURABLE LOG COPY of one `run_code` sub-dispatch outcome before the bridge appends its `tool/ptc-dispatch` event.',
-    description: 'Allow a listener to replace content in the DURABLE LOG COPY of one `run_code` sub-dispatch outcome before the bridge appends its `tool/ptc-dispatch` event. `next()` keeps the content unchanged; a listener may return replacement blocks (e.g. the spill policy\'s preview + locator for an oversized text result). Only the logged copy is affected — the program already received the complete value, and the model sees neither. A throwing listener is contained: the bridge falls back to logging the original settled content. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent\'s dispatches.',
+    signature: '\'tools/ptc-dispatch-log\'(this: Scoped<ToolsService>, dispatch: SubDispatchLog, next: () => Promise<ContentBlock[]>): Promise<ContentBlock[]>',
+    summary: 'Allow a listener to replace content in the DURABLE LOG COPY of one nested dispatch outcome before the bridge appends its `tool/ptc-dispatch` event.',
+    description: 'Allow a listener to replace content in the DURABLE LOG COPY of one nested dispatch outcome before the bridge appends its `tool/ptc-dispatch` event. `next()` keeps the content unchanged; a listener may return replacement blocks (e.g. the spill policy\'s preview + locator for an oversized text result). Only the logged copy is affected — the nested call\'s own result and its model-visible content are untouched. A throwing listener is contained: the bridge falls back to logging the original settled content. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent\'s dispatches.',
     parameters: [{ name: 'dispatch', description: 'the parent execution, sub-call identity, and the settled content to log.' }],
   },
   {
@@ -9291,10 +9291,6 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface PtcBindingNamespace {\n    global: string;\n    functions: Record<string, PtcBindingFunction>;\n    errorClass?: PtcBindingErrorClass;\n}',
   },
   {
-    name: 'PtcDispatchLog',
-    declaration: 'export interface PtcDispatchLog {\n    readonly exec: ToolExecution;\n    readonly agent?: Agent;\n    readonly subCallId: ToolCallId;\n    readonly name: string;\n    readonly isError: boolean;\n    readonly content: ContentBlock[];\n}',
-  },
-  {
     name: 'PtcJsonValue',
     declaration: 'export type PtcJsonValue = null | boolean | number | string | PtcJsonValue[] | {\n    [key: string]: PtcJsonValue;\n};',
   },
@@ -10863,6 +10859,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface SubagentStopReasonMap {\n    completed: \'completed\';\n    aborted: \'aborted\';\n    error: \'error\';\n    \'max-tokens\': \'max-tokens\';\n    refusal: \'refusal\';\n}',
   },
   {
+    name: 'SubDispatchLog',
+    declaration: 'export interface SubDispatchLog {\n    readonly exec: ToolExecution;\n    readonly agent?: Agent;\n    readonly subCallId: ToolCallId;\n    readonly name: string;\n    readonly isError: boolean;\n    readonly content: ContentBlock[];\n}',
+  },
+  {
     name: 'SubprocessCollect',
     declaration: 'export interface SubprocessCollect {\n    maxBytes: number;\n    spill?: {\n        maxBytes: number;\n    };\n}',
   },
@@ -11284,7 +11284,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'ToolRegistrationOptions',
-    declaration: 'export interface ToolRegistrationOptions {\n    readonly when?: (context: ToolActivationContext) => boolean | Promise<boolean>;\n}',
+    declaration: 'export interface ToolRegistrationOptions {\n    readonly when?: (context: ToolActivationContext) => boolean | Promise<boolean>;\n    readonly advertise?: boolean;\n}',
   },
   {
     name: 'ToolRemovalBlock',

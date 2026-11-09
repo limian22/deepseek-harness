@@ -70,6 +70,7 @@ profile 的 `cordis.patch.yml` 会替换条目的完整 `servers` 映射。需�
 | `command` / `args` / `env` / `cwd` | — | stdio：可执行文件、参数、附加子进程环境、工作目录 |
 | `url` / `headers` | — | streamable-http：端点 URL 与附加请求头 |
 | `enabled` | `true` | 持久意图：`false` 卸载实例但保留条目 |
+| `exposure` / `discovery` | mcp-client 默认值 | 逐服务配置[按需发现](../mcp-client/README.zh.md#on-demand-tool-discovery)与结果预算 |
 | `startupTimeoutMs` | `30,000` | 模板解析、协商、连接与初次工具发现的预算 |
 | `toolCallTimeoutMs` / `closeTimeoutMs` / `reconnect` / `toolLoading` | mcp-client 默认值 | 逐服务器覆盖；`toolLoading: on-demand` 让 agent [在需要时加载服务器的工具](../mcp-client/README.zh.md#on-demand-tool-loading) |
 
