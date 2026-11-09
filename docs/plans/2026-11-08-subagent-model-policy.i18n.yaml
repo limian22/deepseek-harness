@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-11-08-subagent-model-policy.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/plans/2026-11-08-subagent-model-policy.md
+/subagent-model-policy-implementation-plan:
+  en: fbfdfcb7e8347f5f
+  zh: 352651c0b36df8e4
+/subagent-model-policy-implementation-plan/global-constraints:
+  en: 3599d985842bb3c0
+  zh: cc420655b2877295
+/subagent-model-policy-implementation-plan/task-1-policy-aware-omitted-route-resolution:
+  en: 26553d383962c8ff
+  zh: 341794f6820884a2
+/subagent-model-policy-implementation-plan/task-2-entry-point-audit-and-consistency:
+  en: 99218eba177926aa
+  zh: 060a4895432c37a1
+/subagent-model-policy-implementation-plan/task-3-review-ui-copy-and-verification:
+  en: 5d3f768d2e4edc87
+  zh: 5e945d330b131503

@@ -111,6 +111,45 @@ type MaterializeInputs = MaterializeBase & (
   | { kind: 'external'; start: (signal: AbortSignal) => Promise<SubagentRun> }
 )
 
+/** One active targeted drain with its own exact selection and subagent tree root. */
+interface ActiveDrain {
+  /** Exact live ancestor that requested this selection. */
+  readonly parentId: SessionId
+  /** Exact subagent tree root owning the parent. */
+  readonly root: Agent
+  /** Ids selected by this call only; a concurrent drain never widens this set. */
+  readonly ids: ReadonlySet<SessionId>
+}
+
+/**
+ * One in-flight delivery's record of targeted drains that must reject its
+ * restore. It holds the drains that were active when the delivery was admitted
+ * plus every later drain for the same tree, and it lives exactly as long as the
+ * unsettled delivery, so no fixed history can evict a needed drain.
+ */
+interface DeliveryDrainToken {
+  readonly root: Agent
+  readonly drains: Set<ActiveDrain>
+}
+
+/** Startup admission inputs attached to one tracked materialization. */
+interface StartupScope {
+  /** Creation ancestry from the tree root to the direct creator, when known at admission. */
+  readonly ancestors?: readonly SessionId[]
+  /** Exact session this startup is producing, when known before creation. */
+  readonly targetId?: SessionId
+}
+
+/** Records a cold restore's resolved ancestry so a concurrent targeted drain can observe it. */
+interface StartupTracker {
+  /**
+   * Record the resolved creation ancestry of a restore. A targeted drain that
+   * started meanwhile rejects this startup with DRAINING before publication.
+   * @param ancestors - verified creation ancestry from the tree root to the direct creator.
+   */
+  setAncestors(ancestors: readonly SessionId[]): void
+}
+
 /**
  * One admitted materialization and the exact live ancestry observed at its
  * synchronous admission point. Retaining identities lets a scoped teardown
@@ -120,6 +159,10 @@ interface Materialization {
   readonly root: Agent
   readonly settled: Promise<void>
   readonly controller: AbortController
+  /** Creation ancestry from the tree root to the direct creator; empty until a cold restore resolves it. */
+  ancestors: readonly SessionId[]
+  /** Exact session produced by this startup, when known before publication. */
+  readonly targetId: SessionId | undefined
 }
 
 /** Residency state observed by the natural-settlement watcher. */
@@ -149,6 +192,12 @@ export class SubagentManager {
   private readonly ownerCtx: Context
   /** Exact subagent tree roots whose host teardown has closed admission. */
   private readonly closingRoots = new Set<Agent>()
+  /** Active targeted drains; each call keeps its own root and selection. */
+  private readonly activeDrains = new Set<ActiveDrain>()
+  /** In-flight deliveries whose cold restores must still observe earlier drains. */
+  private readonly deliveryTokens = new Set<DeliveryDrainToken>()
+  /** Activations stopped by a targeted drain; a delivery already holding one must not revive it. */
+  private readonly stoppedActivations = new WeakSet<Activation>()
   /** Sibling names held by creations that have not committed their catalog entry. */
   private readonly names = new SiblingNameReservations()
   private draining = false
@@ -298,6 +347,284 @@ export class SubagentManager {
   }
 
   /**
+   * Recursively stop only the selected members and their descendants.
+   *
+   * The parent must be the exact live ancestor that owns the selection: every
+   * selected id is verified as a member or admitted startup beneath it inside
+   * the same subagent tree before any state changes. A live target outside that
+   * subtree or another tree is rejected; an already-cold id is an accepted
+   * no-op. Unrelated same-root siblings and their pending startups keep running,
+   * and this method never closes whole-tree admission. Every selected activation
+   * and descendant is disposed deepest-first with per-id attribution, admitted
+   * startups beneath the selection are aborted and awaited, and selected
+   * admission is rechecked by delivery and restore paths until it is released.
+   * External backends are awaited through their own result, like the whole-tree
+   * drain, without adding a timeout.
+   * @param parent - exact live ancestor whose selected descendants stop.
+   * @param ids - child session ids to stop together with their creation descendants.
+   * @returns once every selected startup and activation has settled.
+   * @throws {SubagentError} `UNAUTHORIZED` for a dead parent or a live target
+   *   outside the parent's subtree; `ACTIVATION_TEARDOWN_FAILED` after all
+   *   branches settle when any selected teardown or residual startup failed.
+   */
+  async drainChildren(parent: Agent, ids: readonly SessionId[]): Promise<void> {
+    const root = this.rootOf(parent)
+    const selected = this.selectDrainTargets(parent, root, ids)
+    if (selected.size === 0) return
+    const drain: ActiveDrain = { parentId: parent.id, root, ids: selected }
+    this.activeDrains.add(drain)
+    // Attach the selection synchronously to every in-flight delivery for this
+    // tree. A restore that resolves after this drain settles still sees it, and
+    // the reference lives only with that unsettled delivery, so no fixed history
+    // can evict it.
+    for (const token of this.deliveryTokens) {
+      if (token.root === root) token.drains.add(drain)
+    }
+    const failures = new Map<SessionId, string>()
+    try {
+      // Backfilled cold-restore ancestry and late admitted startups can surface
+      // one round after an earlier scan, so scan to a bounded fixed point.
+      for (let round = 0; round < 8; round += 1) {
+        const pending = [...this.materializations].filter(item => this.coversMaterialization(drain, item))
+        for (const item of pending) item.controller.abort(this.stoppingError(root))
+        const targets = [...this.resident.values()]
+          .filter(item => this.coversActivation(drain, item))
+          .sort((left, right) => right.ancestors.length - left.ancestors.length)
+        let disposed = 0
+        for (const activation of targets) {
+          // Always await the memoized teardown, even when another drain already
+          // marked this activation: overlapping drains must join the same close
+          // transaction instead of treating it as settled. The WeakSet only
+          // records that a settled epoch must not be revived.
+          if (!this.stoppedActivations.has(activation)) disposed += 1
+          this.stoppedActivations.add(activation)
+          try {
+            await this.dispose(activation)
+          } catch (error: unknown) {
+            if (!failures.has(activation.childId)) {
+              failures.set(activation.childId, failureMessage(error))
+            }
+          }
+        }
+        // Unknown-ancestry restores are not waited on here: in-flight delivery
+        // tokens carry this drain across ancestry resolution, so unrelated
+        // restores in the same tree cannot delay a selected teardown.
+        const waits: Promise<unknown>[] = pending.map(item => item.settled)
+        if (waits.length === 0 && disposed === 0) break
+        await Promise.all(waits)
+      }
+
+      const leftover = [...this.resident.values()].filter(item => this.coversActivation(drain, item))
+      const leftoverStartup = [...this.materializations].filter(item => this.coversMaterialization(drain, item))
+      if (leftover.length > 0 || leftoverStartup.length > 0) {
+        throw new SubagentError(
+          `subagent targeted drain did not settle ${leftover.length} activation(s) `
+          + `and ${leftoverStartup.length} startup(s)`,
+          'ACTIVATION_TEARDOWN_FAILED',
+        )
+      }
+      if (failures.size > 0) {
+        throw new SubagentError(
+          `subagent teardown failed for ${failures.size} scoped activation(s): `
+          + [...failures].map(([id, message]) => `"${id}": ${message}`).join('; '),
+          'ACTIVATION_TEARDOWN_FAILED',
+        )
+      }
+    } finally {
+      this.activeDrains.delete(drain)
+    }
+  }
+
+  /**
+   * Verify a targeted selection before any admission state changes.
+   *
+   * A cold id is accepted only when every live activation or admitted startup
+   * that names it in its creation ancestry is inside the parent's own subtree;
+   * an id that authorizes work in another tree is rejected as unauthorized.
+   * @param parent - exact live ancestor that owns the selection.
+   * @param root - the live subagent tree root owning the parent.
+   * @param ids - requested member session ids.
+   * @returns the requested ids, including already-cold no-ops.
+   */
+  private selectDrainTargets(parent: Agent, root: Agent, ids: readonly SessionId[]): Set<SessionId> {
+    const selected = new Set<SessionId>()
+    const unauthorized = (id: SessionId): SubagentError => new SubagentError(
+      `subagent "${id}" is not a live descendant of agent "${parent.id}"`,
+      'UNAUTHORIZED',
+    )
+    for (const id of ids) {
+      if (id === parent.id) {
+        throw new SubagentError(`subagent "${id}" cannot be drained through itself`, 'UNAUTHORIZED')
+      }
+      const activation = this.resident.get(id)
+      if (activation !== undefined) {
+        if (activation.root !== root || !activation.ancestors.includes(parent.id)) throw unauthorized(id)
+        selected.add(id)
+        continue
+      }
+      // A live Agent with no Activation under this drain's tree (another tree's
+      // root or an ordinary rooted Agent) is not a cold subagent member. Treating
+      // it as a no-op would let its id authorize unrelated live work.
+      if (this.ctx.agents.get(id) !== undefined) throw unauthorized(id)
+      // A cold id may still own live descendants or an admitted restore. Every
+      // candidate naming it in its creation ancestry must belong to this parent's
+      // subtree; otherwise the cold id would authorize stopping another branch.
+      let claimed = false
+      for (const candidate of this.resident.values()) {
+        if (!candidate.ancestors.includes(id)) continue
+        if (candidate.root !== root || !candidate.ancestors.includes(parent.id)) throw unauthorized(id)
+        claimed = true
+      }
+      for (const item of this.materializations) {
+        const targetMatch = item.targetId === id
+        if (!targetMatch && !item.ancestors.includes(id)) continue
+        if (item.root !== root) throw unauthorized(id)
+        if (item.ancestors.length === 0) {
+          // An unknown-ancestry restore cannot be classified yet. Only a tree-root
+          // drain can safely claim the exact id; a nested drain fails closed so it
+          // never stops another branch of the same tree.
+          if (targetMatch) {
+            if (parent !== root) throw unauthorized(id)
+            claimed = true
+          }
+          continue
+        }
+        if (!item.ancestors.includes(parent.id)) throw unauthorized(id)
+        claimed = true
+      }
+      // A delivery already in flight for this tree may materialize this pure cold
+      // id after this call returns (for example while it waits on the child lock).
+      // Claim it so that delivery's token rejects its restore; a delivery started
+      // after this drain no longer sees the scope and may resume normally.
+      if (!claimed && [...this.deliveryTokens].some(token => token.root === root)) {
+        claimed = true
+      }
+      // A pure cold id with no live work and no in-flight delivery is an accepted
+      // no-op: it grants no admission control, so a later resume is not blocked.
+      if (claimed) selected.add(id)
+    }
+    return selected
+  }
+
+  /** Whether one drain scope selects this exact activation or one of its ancestors. */
+  private coversActivation(drain: ActiveDrain, activation: Activation): boolean {
+    return activation.root === drain.root
+      && (drain.ids.has(activation.childId) || activation.ancestors.some(id => drain.ids.has(id)))
+      // A nested scope never owns work outside its own parent subtree, even when a
+      // wildcard cold claim put the exact id in its selection.
+      && (drain.parentId === drain.root.id || activation.ancestors.includes(drain.parentId))
+  }
+
+  /**
+   * Whether one drain scope selects this startup. Unknown cold-restore ancestry
+   * is not covered by a nested drain until the ancestry is classified; only a
+   * tree-root drain may claim an exact selected id directly.
+   */
+  private coversMaterialization(drain: ActiveDrain, item: Materialization): boolean {
+    if (item.root !== drain.root) return false
+    if (item.ancestors.length === 0) {
+      return drain.parentId === drain.root.id
+        && item.targetId !== undefined
+        && drain.ids.has(item.targetId)
+    }
+    const direct = item.targetId !== undefined && drain.ids.has(item.targetId)
+    if (!direct && !item.ancestors.some(id => drain.ids.has(id))) return false
+    return drain.parentId === drain.root.id || item.ancestors.includes(drain.parentId)
+  }
+
+  /** First active drain whose selection covers this exact Agent. */
+  private activeDrainForAgent(agent: Agent): ActiveDrain | undefined {
+    const activation = this.resident.get(agent.id)
+    if (activation !== undefined && activationAgent(activation) === agent) {
+      for (const drain of this.activeDrains) {
+        if (this.coversActivation(drain, activation)) return drain
+      }
+      return undefined
+    }
+    // A bare id match must not cross trees: a selected cold id from another tree
+    // must not reject that tree's root when it becomes live during this drain.
+    for (const drain of this.activeDrains) {
+      if (drain.root === agent && drain.ids.has(agent.id)) return drain
+    }
+    return undefined
+  }
+
+  /** First active drain that may deny this exact target id before ancestry is known. */
+  private activeDrainForTarget(childId: SessionId, root: Agent): ActiveDrain | undefined {
+    for (const drain of this.activeDrains) {
+      // Only a tree-root drain can deny an exact id unconditionally. A nested
+      // drain's cold claims stay provisional until restore ancestry is published
+      // and checked against its parent by coversActivation/assertDeliveryDrain.
+      if (drain.root === root && drain.parentId === drain.root.id && drain.ids.has(childId)) return drain
+    }
+    return undefined
+  }
+
+  /** First active drain whose selection covers this activation. */
+  private activeDrainForActivation(activation: Activation): ActiveDrain | undefined {
+    for (const drain of this.activeDrains) {
+      if (this.coversActivation(drain, activation)) return drain
+    }
+    return undefined
+  }
+
+  /** First active drain whose selection covers this startup. */
+  private activeDrainForMaterialization(item: Materialization): ActiveDrain | undefined {
+    for (const drain of this.activeDrains) {
+      if (this.coversMaterialization(drain, item)) return drain
+    }
+    return undefined
+  }
+
+  /** Reject a delivery or restore to an exactly selected member id. */
+  private assertStoppingTarget(childId: SessionId, root: Agent): void {
+    if (this.activeDrainForTarget(childId, root) !== undefined) throw this.stoppingError(root)
+  }
+
+  /** Reject input to a selected or descendant activation, including a drained epoch. */
+  private assertStoppingActivation(activation: Activation, root: Agent): void {
+    if (this.stoppedActivations.has(activation)
+      || this.activeDrainForActivation(activation) !== undefined) {
+      throw this.stoppingError(root)
+    }
+  }
+
+  /** Reject a restore whose in-flight token captured a drain covering its ancestry. */
+  private assertDeliveryDrain(
+    token: DeliveryDrainToken,
+    root: Agent,
+    childId: SessionId,
+    ancestors: readonly SessionId[],
+  ): void {
+    const covered = (drain: ActiveDrain): boolean => drain.root === root
+      && (drain.ids.has(childId) || ancestors.some(id => drain.ids.has(id)))
+      // A nested drain only covers work proven beneath its own parent; a
+      // same-tree sibling branch is not stopped by another captain's drain.
+      && (drain.parentId === root.id || ancestors.includes(drain.parentId))
+    if ([...token.drains].some(covered) || [...this.activeDrains].some(covered)) {
+      throw this.stoppingError(root)
+    }
+  }
+
+  /** Whether an in-flight token captured a drain covering this exact activation. */
+  private tokenStopsTarget(token: DeliveryDrainToken, activation: Activation): boolean {
+    for (const drain of token.drains) {
+      if (this.coversActivation(drain, activation)) return true
+    }
+    return false
+  }
+
+  /** Build the admission error for one active targeted drain. */
+  private stoppingError(root?: Agent): SubagentError {
+    return new SubagentError(
+      root === undefined
+        ? 'a selected subagent subtree is draining; the operation was not admitted'
+        : `subagent tree "${root.id}" is draining selected member(s); the operation was not admitted`,
+      'DRAINING',
+    )
+  }
+
+  /**
    * Start one continuable background child and resolve at initial inbox acceptance.
    * Every earlier failure disposes any created handle and rolls back Activation
    * and its capacity slot without returning either id.
@@ -418,6 +745,9 @@ export class SubagentManager {
         )
       })
       return { ...this.receipt(established), childId, messageId }
+    }, {
+      ancestors: ancestry.ancestors,
+      ...spec.childId === undefined ? {} : { targetId: spec.childId },
     })
   }
 
@@ -489,7 +819,7 @@ export class SubagentManager {
         }
         throw error
       }
-    })
+    }, { ancestors: ancestry.ancestors })
   }
 
   /** Capture the explicit or inherited directory while the parent still owns startup. */
@@ -694,6 +1024,7 @@ export class SubagentManager {
   private assertAdmitting(agent: Agent): void {
     const closing = this.closingTeardownFor(agent)
     if (closing === undefined) {
+      if (this.activeDrainForAgent(agent) !== undefined) throw this.stoppingError()
       if (this.resident.get(agent.id)?.closing !== undefined) {
         throw new SubagentError(`subagent "${agent.id}" is closing`, 'ACTIVATION_CLOSING')
       }
@@ -714,6 +1045,7 @@ export class SubagentManager {
    */
   private materialize(inputs: MaterializeInputs): Promise<Activation> {
     this.assertAdmitting(inputs.root)
+    this.assertMaterializationAdmitted(inputs)
     inputs.signal.throwIfAborted()
     const pool = this.rootPool(inputs.root)
     const releaseSlot = pool.reserve(this.maxActiveSubagents())
@@ -723,15 +1055,54 @@ export class SubagentManager {
     })
   }
 
+  /** Reject a materialization whose creator or exact target entered a targeted drain. */
+  private assertMaterializationAdmitted(inputs: MaterializeInputs): void {
+    const covered = [...this.activeDrains].some(drain => drain.root === inputs.root
+      // Every coverage predicate is root + selected ancestry + parent scoped.
+      && (drain.parentId === drain.root.id || inputs.ancestors.includes(drain.parentId))
+      && (inputs.ancestors.some(id => drain.ids.has(id))
+        // Only a tree-root drain owns an exact id unconditionally; a nested
+        // cold claim stays provisional until restore ancestry is classified.
+        || (inputs.kind === 'local' && drain.parentId === drain.root.id && drain.ids.has(inputs.childId))))
+    if (covered) throw this.stoppingError(inputs.root)
+  }
+
   /** Keep subagent tree shutdown and host waits joined to preparation, publication, and rollback. */
-  private trackStartup<T>(root: Agent, signal: AbortSignal, start: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private trackStartup<T>(
+    root: Agent,
+    signal: AbortSignal,
+    start: (signal: AbortSignal, tracker: StartupTracker) => Promise<T>,
+    scope: StartupScope = {},
+  ): Promise<T> {
     this.assertAdmitting(root)
+    const covered = [...this.activeDrains].some(drain => drain.root === root
+      // Same root + parent guard as every other scope-coverage predicate.
+      && (drain.parentId === drain.root.id || scope.ancestors?.includes(drain.parentId) === true)
+      && ((scope.targetId !== undefined && drain.parentId === drain.root.id && drain.ids.has(scope.targetId))
+        || scope.ancestors?.some(id => drain.ids.has(id))))
+    if (covered) throw this.stoppingError(root)
     signal.throwIfAborted()
     const settled = Promise.withResolvers<void>()
     const controller = new AbortController()
-    const materialization: Materialization = { root, settled: settled.promise, controller }
+    const materialization: Materialization = {
+      root,
+      settled: settled.promise,
+      controller,
+      ancestors: scope.ancestors ?? [],
+      targetId: scope.targetId,
+    }
+    const tracker: StartupTracker = {
+      setAncestors: (ancestors: readonly SessionId[]): void => {
+        materialization.ancestors = [...ancestors]
+        if (this.activeDrainForMaterialization(materialization) !== undefined) {
+          const error = this.stoppingError(root)
+          materialization.controller.abort(error)
+          throw error
+        }
+      },
+    }
     this.materializations.add(materialization)
-    return start(AbortSignal.any([signal, controller.signal])).catch((error: unknown) => {
+    return start(AbortSignal.any([signal, controller.signal]), tracker).catch((error: unknown) => {
       if (error instanceof Error && error.name === 'AbortError') this.assertAdmitting(root)
       throw error
     }).finally(() => {
@@ -910,6 +1281,7 @@ export class SubagentManager {
     this.resident.set(childId, activation)
     try {
       this.assertAdmitting(root)
+      this.assertStoppingTarget(childId, root)
       inputs.signal.throwIfAborted()
       const wakeSettlement = (): void => { this.wake(activation) }
       if (activation.kind === 'local') {
@@ -1183,36 +1555,61 @@ export class SubagentManager {
   private async deliverToMember(
     root: Agent, childId: SessionId, content: ContentBlock[], options: ChildDeliveryOptions,
   ): Promise<MessageId> {
-    while (true) {
-      this.assertAdmitting(root)
-      options.signal.throwIfAborted()
-      const result = await this.locks.run(childId, async () => {
-        if (childId === root.id) {
-          if (contentHasImage(content)) await this.assertImageCapable(root, options.signal)
-          options.signal.throwIfAborted()
-          options.authorize?.()
-          this.assertAdmitting(root)
-          const message = createUserMessage({ content, source: options.source })
-          this.sendWaking(root, message, options.delivery)
-          options.onAccepted?.()
-          return { messageId: message.id }
+    // Capture every drain already active for this tree before the first await and
+    // keep receiving later ones. The token lives until this delivery settles, so a
+    // cold restore cannot outlive or be evicted from the drain history it spans.
+    const token: DeliveryDrainToken = {
+      root,
+      drains: new Set([...this.activeDrains].filter(drain => drain.root === root)),
+    }
+    this.deliveryTokens.add(token)
+    try {
+      while (true) {
+        this.assertAdmitting(root)
+        this.assertStoppingTarget(childId, root)
+        options.signal.throwIfAborted()
+        const result = await this.locks.run(childId, async () => {
+          if (childId === root.id) {
+            if (contentHasImage(content)) await this.assertImageCapable(root, options.signal)
+            options.signal.throwIfAborted()
+            options.authorize?.()
+            this.assertAdmitting(root)
+            const message = createUserMessage({ content, source: options.source })
+            this.sendWaking(root, message, options.delivery)
+            options.onAccepted?.()
+            return { messageId: message.id }
+          }
+          this.assertStoppingTarget(childId, root)
+          const activation = this.resident.get(childId)
+          if (activation === undefined) {
+            const restored = await this.restoreTarget(root, childId, options.signal, token)
+            return { messageId: await this.submitMaterialized(restored, content, options, root) }
+          }
+          if (activation.root !== root) throw new SubagentError('target belongs to another subagent tree', 'UNAUTHORIZED')
+          this.assertStoppingActivation(activation, root)
+          requireLocalActivation(activation)
+          if (activation.closing === undefined && contentHasImage(content)) {
+            await this.assertImageCapable(requireLocalActivation(activation).handle.agent, options.signal)
+          }
+          if (activation.closing !== undefined) {
+            return { closing: activation.closing, activation, stopped: this.stoppedActivations.has(activation) }
+          }
+          const messageId = this.submitAdmitted(activation, content, options, root)
+          return { messageId }
+        })
+        if ('messageId' in result) return result.messageId
+        await Promise.allSettled([result.closing])
+        // Recheck both the selection and the exact drained epoch after closure: the
+        // drain may have released its id set before this waiter resumed.
+        if (result.stopped
+          || this.stoppedActivations.has(result.activation)
+          || this.activeDrainForActivation(result.activation) !== undefined
+          || this.tokenStopsTarget(token, result.activation)) {
+          throw this.stoppingError(root)
         }
-        const activation = this.resident.get(childId)
-        if (activation === undefined) {
-          const restored = await this.restoreTarget(root, childId, options.signal)
-          return { messageId: await this.submitMaterialized(restored, content, options, root) }
-        }
-        if (activation.root !== root) throw new SubagentError('target belongs to another subagent tree', 'UNAUTHORIZED')
-        requireLocalActivation(activation)
-        if (activation.closing === undefined && contentHasImage(content)) {
-          await this.assertImageCapable(requireLocalActivation(activation).handle.agent, options.signal)
-        }
-        if (activation.closing !== undefined) return { closing: activation.closing }
-        const messageId = this.submitAdmitted(activation, content, options, root)
-        return { messageId }
-      })
-      if ('messageId' in result) return result.messageId
-      await Promise.allSettled([result.closing])
+      }
+    } finally {
+      this.deliveryTokens.delete(token)
     }
   }
 
@@ -1228,10 +1625,16 @@ export class SubagentManager {
   }
 
   /** Reconstruct only the target under its subagent tree root; the caller owns acceptance or rollback. */
-  private async restoreTarget(root: Agent, childId: SessionId, signal: AbortSignal): Promise<Activation> {
-    return this.trackStartup(root, signal, async (signal) => {
+  private async restoreTarget(
+    root: Agent,
+    childId: SessionId,
+    signal: AbortSignal,
+    token: DeliveryDrainToken,
+  ): Promise<Activation> {
+    return this.trackStartup(root, signal, async (signal, tracker) => {
       using source = await this.observeContinuation(childId, signal)
       this.assertAdmitting(root)
+      this.assertStoppingTarget(childId, root)
       const ownEvents = source.events.slice(source.inheritedEventCount)
       let descriptor: ReturnType<typeof foldSubagentDescriptor>
       try {
@@ -1250,6 +1653,11 @@ export class SubagentManager {
         )
       }
       const { ancestors, path } = await this.resolveCreationAncestry(source, signal, root)
+      // Publish the resolved ancestry before any materialization: a targeted drain
+      // that started meanwhile rejects this restore instead of letting it revive.
+      tracker.setAncestors(ancestors)
+      this.assertDeliveryDrain(token, root, childId, ancestors)
+      this.assertStoppingTarget(childId, root)
       let activation: Activation
       try {
         const projectedPreset = source.projections?.values.agentPreset
@@ -1284,7 +1692,7 @@ export class SubagentManager {
         throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
       }
       return activation
-    })
+    }, { targetId: childId })
   }
 
   /** Admit a materialized child, commit its creation fact, and release it on failure. */
@@ -1329,6 +1737,7 @@ export class SubagentManager {
     options.signal.throwIfAborted()
     options.authorize?.()
     this.assertAdmitting(parent)
+    this.assertStoppingActivation(activation, activation.root)
     try {
       this.deliver(activation, message, options.delivery)
     } finally {

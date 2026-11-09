@@ -45,11 +45,11 @@
   en: 74d91b364b23f88d
   zh: 19cc558105efe8df
 /deepseek-ai-dsh-subagent/understand-the-implementation/design-concept:
-  en: e6f77fc75a73b0ab
-  zh: 7133698a3923e192
+  en: f16ff316bab66a4e
+  zh: f46328d67598a003
 /deepseek-ai-dsh-subagent/understand-the-implementation/source-map:
-  en: 5923a61c09d9ae04
-  zh: 15202a92872a11e9
+  en: c514fc4e3f690bd5
+  zh: 34161cab8f922e6c
 /deepseek-ai-dsh-subagent/understand-the-implementation/provider-preparation-and-structured-output:
   en: 824914462110bcf1
   zh: ae5ce35d09801728
@@ -123,8 +123,8 @@
   en: 59e848fca82a46fb
   zh: fcd6a8a2bb58609f
 /deepseek-ai-dsh-subagent/known-limitations-and-deferred-work:
-  en: fb3ae9c914da17ff
-  zh: 18d2fe7caadc9c70
+  en: 06db3f52db8ad08f
+  zh: f29853f1a26dd42d
 /deepseek-ai-dsh-subagent/known-limitations-and-deferred-work/dev-note:
   en: 25cc0909348666bb
   zh: 95517f12de100049

@@ -1,0 +1,16 @@
+# Bilingual-pair consistency record for guide.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/upgrade-guide/v0.2.2-rc.1/subagent-model-policy/guide.md
+/:
+  en: 824c6d3004c292d1
+  zh: ee3a2e78715f515a
+/child-model-policies-constrain-every-delegation:
+  en: b4d88209d066a7f3
+  zh: ed746d31137aa52b
+/child-model-policies-constrain-every-delegation/change:
+  en: 438704a3a4567bda
+  zh: 9d7105ae97029658
+/child-model-policies-constrain-every-delegation/migration:
+  en: 42c7ef7547badfb4
+  zh: a7346ebb985f8f1e

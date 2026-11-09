@@ -1038,4 +1038,46 @@ await new Promise(() => {})`))
       expect(unwrapped).toBe(PtcWorkflowEngine)
     })
   })
+
+  describe('Session model selection policy', () => {
+    const FLASH = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
+    const PRO = { provider: 'deepseek-official', model: 'deepseek-v4-pro' }
+    const GPT = { provider: 'openai', model: 'gpt-5' }
+
+    /** Record the user's exact allowed child models on the workflow parent's Session. */
+    function recordPolicy(parent: Agent): void {
+      parent.session.append('subagent/model-selection-policy', { allowedModels: [FLASH, PRO] })
+    }
+
+    it('rejects an explicit workflow route outside the Session policy before starting the child', async () => {
+      const { ctx, parent, provider } = await setup({ reply: () => text('must not run') })
+      ;(parent as { options: Agent['options'] }).options = { provider: GPT.provider, model: GPT.model }
+      recordPolicy(parent)
+      const result = await run(ctx, parent, scripted(
+        `return await agent('hello', { provider: '${GPT.provider}', model: '${GPT.model}' })`,
+      ))
+      expect(result.stopReason).toBe('error')
+      expect(result.error).toContain('is not allowed for this Session')
+      expect(provider.runs).toHaveLength(0)
+    })
+
+    it('resolves an omitted workflow route to the first listed model instead of the parent route', async () => {
+      const { ctx, parent, provider } = await setup({ reply: () => text('ok') })
+      ;(parent as { options: Agent['options'] }).options = { provider: GPT.provider, model: GPT.model }
+      recordPolicy(parent)
+      const result = await run(ctx, parent, scripted("return await agent('hello')"))
+      expect(result.stopReason).toBe('completed')
+      expect(provider.runs[0]?.request.agentOptions).toEqual(FLASH)
+    })
+
+    it('keeps a listed explicit workflow route', async () => {
+      const { ctx, parent, provider } = await setup({ reply: () => text('ok') })
+      recordPolicy(parent)
+      const result = await run(ctx, parent, scripted(
+        `return await agent('hello', { provider: '${PRO.provider}', model: '${PRO.model}' })`,
+      ))
+      expect(result.stopReason).toBe('completed')
+      expect(provider.runs[0]?.request.agentOptions).toEqual(PRO)
+    })
+  })
 })

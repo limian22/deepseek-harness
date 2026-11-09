@@ -577,6 +577,21 @@ interrupt(targetSessionId: SessionId, authority: SubagentInterruptAuthority): vo
 async drainDescendants(parents: readonly Agent[]): Promise<void>
 
 /**
+ * Recursively stop only the selected members and their descendants beneath an
+ * exact live ancestor, leaving unrelated same-root siblings and their pending
+ * startups running. This is the targeted drain seam older Agent Teams plugins
+ * call as `drainChildren(parent, ids)`; it never closes whole-tree admission and
+ * never substitutes the root-wide `drainDescendants`.
+ * @param parent - exact live ancestor that owns the selected subtree.
+ * @param ids - selected child session ids; cold ids are accepted no-ops.
+ * @returns once every selected startup and activation has settled.
+ * @throws {SubagentError} `UNAUTHORIZED` when the parent is not the exact live
+ *   ancestor of a live target; `ACTIVATION_TEARDOWN_FAILED` after all branches
+ *   settle when any selected teardown failed.
+ */
+async drainChildren(parent: Agent, ids: readonly SessionId[]): Promise<void>
+
+/**
  * Recursively list reachable parent catalogs in stable pre-order, preserving
  * each catalog's event order. Each row carries its catalog parent and depth;
  * external children are leaves; one-shot and unknown-mode children remain

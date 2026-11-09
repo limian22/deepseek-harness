@@ -40,6 +40,7 @@ import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock, MessageId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import { canonicalClientTimeZone } from '@deepseek-ai/dsh-util-time'
 import { Remote, RemoteError, TypertRemoteService, principalOf, type Principal } from '@deepseek-ai/dsh-typert-protocol'
 import {
@@ -73,6 +74,14 @@ import { listDescendants as listSubagentDescendants, resolveAgentPath } from './
 import type { SubagentDescendantListEntry } from './list-children.ts'
 import { subagentIdentityProjectionDefinition, subagentTimingProjectionDefinition } from './projection.ts'
 import { subagentCatalogProjectionDefinition } from './catalog.ts'
+import { parentAgentOptionsForDelegation } from './child-agent.ts'
+import {
+  assertAllowedModelSelection,
+  firstAllowedRoute,
+  subagentModelSelectionPolicy,
+  subagentModelSelectionProjectionDefinition,
+} from './model-selection.ts'
+import type { AllowedModelRoute } from './model-selection.ts'
 import { ROOT_AGENT_NAME } from './names.ts'
 
 export type {} from './catalog.ts'
@@ -113,6 +122,15 @@ export type {
 export { STRUCTURED_OUTPUT_TOOL } from './structured.ts'
 export { SubagentError, type SubagentErrorCode } from './error.ts'
 export { assertSubagentMaxDepth, delegationDepthOf } from './depth.ts'
+export {
+  assertAllowedModelRoutes,
+  assertAllowedModelSelection,
+  firstAllowedRoute,
+  modelRouteKey,
+  subagentModelSelectionPolicy,
+  subagentModelSelectionProjectionDefinition,
+} from './model-selection.ts'
+export type { AllowedModelRoute, ModelSelectionPolicy } from './model-selection.ts'
 export {
   appendDelegatedPolicyOverrides,
   applyChildComposition,
@@ -201,6 +219,8 @@ export class SubagentRuntime extends TypertRemoteService {
   static inject = ['workingDirectory', 'sessionProjections']
   private providers = new Map<string, SubagentProvider>()
   private manager: SubagentManager | undefined
+  /** Durable per-Session child-route authorization, registered with the seam. */
+  private modelSelectionPolicy: ProjectionHandle<AllowedModelRoute[] | null> | undefined
   /**
    * The contained lifecycle-edge publisher. Built here because scoped dispatch
    * keys its carrier by this exact service instance, whose own context filter
@@ -215,6 +235,7 @@ export class SubagentRuntime extends TypertRemoteService {
 
   protected async [Service.init](): Promise<void> {
     const ctx = this.ctx
+    this.modelSelectionPolicy = await ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
     const catalogProjection = await ctx.sessionProjections.register(subagentCatalogProjectionDefinition)
     await ctx.sessionProjections.register(subagentTimingProjectionDefinition)
     const identityProjection = await ctx.sessionProjections.register(subagentIdentityProjectionDefinition)
@@ -277,22 +298,23 @@ export class SubagentRuntime extends TypertRemoteService {
       throw new SubagentError('reserved child ids require a local backend', 'UNSUPPORTED_CAPABILITY')
     }
     assertSubagentMaxDepth(spec.maxDepth)
-    this.assertCapabilities(provider, spec)
     const manager = this.requireManager()
     if (this.ctx.get('agents')?.get(spec.parent.id) !== spec.parent) {
       throw new SubagentError('subagent creation requires the exact live parent agent', 'UNAUTHORIZED')
     }
-    if (spec.outputSchema !== undefined) assertObjectJsonSchema(spec.outputSchema)
+    const admitted = this.admitModelSelection(provider, spec)
+    this.assertCapabilities(provider, admitted)
+    if (admitted.outputSchema !== undefined) assertObjectJsonSchema(admitted.outputSchema)
     const prepare = provider.prepareContinuable?.bind(provider)
     if (prepare !== undefined) {
-      return manager.startLocal(spec, (request) => {
+      return manager.startLocal(admitted, (request) => {
         this.assertProviderCurrent(provider)
         return prepare(request)
       })
     }
     // oxlint-disable-next-line typescript/no-non-null-assertion -- registerProvider requires start when prepareContinuable is absent.
     const start = provider.start!.bind(provider)
-    return manager.startExternal(spec, (request) => {
+    return manager.startExternal(admitted, (request) => {
       this.assertProviderCurrent(provider)
       return start(request)
     })
@@ -422,6 +444,26 @@ export class SubagentRuntime extends TypertRemoteService {
     // An absent activation manager cannot own materialized children.
     if (manager === undefined) return
     await manager.drainDescendants(parents)
+  }
+
+  /**
+   * Recursively stop only the selected members and their descendants beneath an
+   * exact live ancestor, leaving unrelated same-root siblings and their pending
+   * startups running. This is the targeted drain seam older Agent Teams plugins
+   * call as `drainChildren(parent, ids)`; it never closes whole-tree admission and
+   * never substitutes the root-wide `drainDescendants`.
+   * @param parent - exact live ancestor that owns the selected subtree.
+   * @param ids - selected child session ids; cold ids are accepted no-ops.
+   * @returns once every selected startup and activation has settled.
+   * @throws {SubagentError} `UNAUTHORIZED` when the parent is not the exact live
+   *   ancestor of a live target; `ACTIVATION_TEARDOWN_FAILED` after all branches
+   *   settle when any selected teardown failed.
+   */
+  async drainChildren(parent: Agent, ids: readonly SessionId[]): Promise<void> {
+    const manager = this.manager
+    // An absent activation manager cannot own materialized children.
+    if (manager === undefined) return
+    await manager.drainChildren(parent, ids)
   }
 
   /**
@@ -563,6 +605,53 @@ export class SubagentRuntime extends TypertRemoteService {
    */
   getProvider(name: string): SubagentProvider | undefined {
     return this.providers.get(name)
+  }
+
+  /**
+   * Resolve a child's LLM route under the Session's recorded model-selection
+   * policy before any backend starts. With no recorded policy the request is
+   * returned unchanged.
+   *
+   * A complete declared route must already be authorized and is rejected
+   * otherwise, never redirected. A partial declared route finishes from the
+   * provider route defaults or the parent route, then the completed route is
+   * validated. No declared route resolves deterministically inside the policy.
+   * @param provider - backend that will run the child.
+   * @param spec - requested activation.
+   * @returns the activation carrying its authorized `agentOptions` route.
+   */
+  private admitModelSelection(provider: SubagentProvider, spec: SubagentActivationSpec): SubagentActivationSpec {
+    const handle = this.modelSelectionPolicy
+    const routes = handle === undefined ? undefined : subagentModelSelectionPolicy(handle, spec.parent.session)
+    if (routes === undefined) return spec
+    if (!provider.capabilities.agentOptions) {
+      throw new SubagentError(
+        `subagent provider "${provider.name}" cannot honor this Session's allowed child models because it cannot select a child LLM route; choose a backend that supports agentOptions or start the Session without model selection`,
+        'UNSUPPORTED_CAPABILITY',
+      )
+    }
+    const policy = { routes }
+    const parentOptions = parentAgentOptionsForDelegation(spec.parent)
+    const declared = spec.agentOptions
+    const declaredProvider = declared?.provider
+    const declaredModel = declared?.model
+    let route: AllowedModelRoute
+    if (declaredProvider !== undefined && declaredModel !== undefined) {
+      route = { provider: declaredProvider, model: declaredModel }
+      assertAllowedModelSelection(policy, parentOptions, route)
+    } else if (declaredProvider !== undefined || declaredModel !== undefined) {
+      const base = provider.agentRouteDefaults ?? parentOptions
+      const mergedProvider = declaredProvider ?? base.provider
+      const mergedModel = declaredModel ?? base.model
+      if (mergedProvider === undefined || mergedModel === undefined) {
+        throw new SubagentError('child LLM selection requires an effective provider and model', 'UNSUPPORTED_CAPABILITY')
+      }
+      route = { provider: mergedProvider, model: mergedModel }
+      assertAllowedModelSelection(policy, parentOptions, route)
+    } else {
+      route = firstAllowedRoute(policy, [provider.agentRouteDefaults, parentOptions])
+    }
+    return { ...spec, agentOptions: { ...declared, provider: route.provider, model: route.model } }
   }
 
   /** A pending start must use the exact provider whose capabilities were checked. */

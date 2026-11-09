@@ -99,6 +99,7 @@ This section explains how the service is built and where the observable behavior
 - **One managed lifetime.** `SubagentManager` owns startup, message admission, capacity, runtime ownership, and disposal. Each activation retains its lifecycle identity and a local AgentHandle or external SubagentRun; the manager publishes paired events through the service's scoped emitter. Local inbox and idle state belong only to the local variant.
 - **Fulfillment is publication.** `startActivation()` returns only after the child is accepted and its handle can cancel that exact execution.
 - **Trusted same-process values.** Requests, descriptors, and results are borrowed immutable; serialization and hostile-input validation belong at process and wire boundaries.
+- **One route rule per Session.** A recorded `subagent/model-selection-policy` authorizes every child LLM route: a complete declared route is validated and never redirected, an omitted route resolves to the first allowed configured, provider-default, or parent route, and a backend that cannot select a route is rejected instead of running an unauthorized model.
 
 ### Source map
 
@@ -116,6 +117,7 @@ This section explains how the service is built and where the observable behavior
 | [`src/list-children.ts`](src/list-children.ts) | Direct and recursive parent-catalog reads |
 | [`src/control.ts`](src/control.ts) | Browser control request validation and stable failure codes |
 | [`src/control-types.ts`](src/control-types.ts) | Client-safe catalog row, control requests, receipts, and failures |
+| [`src/model-selection.ts`](src/model-selection.ts) | Durable Session child-route policy, its projection, and the deterministic implicit route |
 | [`src/archive-admission.ts`](src/archive-admission.ts) | The `subagent` family of the Workspace registry's archive admission: running descendants and their parent-cause cancel |
 
 ### Provider preparation and structured output
@@ -250,6 +252,7 @@ These limits define when the seam is a poor fit or needs special operational car
 - **Descendant reads are sequential** — each reachable catalog, including one-shot children, takes one observation. A cold Session without a valid prepared observation requires a full-log read; large cold trees can accumulate storage latency.
 - **Names are permanent** — a name stays taken among its creator's children for as long as the catalog entry exists; names cannot be changed or reused, and no migration names children whose catalog entries predate names.
 - **External children execute once** — ACP, DSH SDK, Codex, and Claude Code have no local child Session and accept no follow-up input. Their parent-owned records remain discoverable after disposal.
+- **Fixed-runtime backends cannot honor a model list** — with a recorded Session policy, a backend whose provider reports `agentOptions: false` (ACP, Codex, Claude Code) is rejected at start rather than running its own fixed model. Start the Session without model selection or use an `agentOptions`-capable backend.
 - **Messaging stays within one tree** — targets must be the root or continuable members. Only the restored target consumes activation capacity. Browser prompts retain their separate human Queue-or-Steer control path.
 - **Wake gap during cancellation convergence** — a follow-up accepted after an interrupt signal but before the Agent becomes idle stays queued until another waking send.
 - **Pending injected context retains an Activation** — settlement conservatively treats every Inbox occurrence as unfinished. Context parked after the Agent becomes idle keeps the child and its live ancestors resident until a waking delivery claims it, a queue mutation removes it, or manager teardown discards it. Host completion joins active work, pending child creation, and resource cleanup, but does not wait for a subtree containing only idle parked inboxes; it neither completes those activation results nor discards their messages.
