@@ -150,6 +150,8 @@ interface SessionEventSearchDocument extends SessionEventRecord {
 
 The combined `ctx.sessionQuery` seam has two full-text scopes. `searchSessions()` groups the corpus by strongest matching event; `searchEvents()` searches one session. Requests bind an opaque cursor to the normalized query, metadata filters, and limit. The event text scan is intentionally absent from provider metadata filters.
 
+A request may also set `snapshot: true` to ask the provider to capture its complete ranking on the first page, so later pages keep the same results while sources keep changing. Capture support is provider-specific: a provider without it ignores the flag and continues with generation-bound cursors, and one that captures still reports `SESSION_QUERY_STALE_CURSOR` once its capture expires.
+
 ```ts type-equiv
 /** Provider-owned opaque continuation token returned by session search. */
 type SessionSearchCursor = Branded<'SessionSearchCursor'>

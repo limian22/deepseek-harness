@@ -42,6 +42,11 @@ import {
   openSearchDatabase,
 } from './schema.ts'
 import {
+  SESSION_QUERY_SNAPSHOT_MAX_ROWS,
+  SnapshotStore,
+  type SearchSnapshot,
+} from './snapshots.ts'
+import {
   type NormalizedEventRequest,
   type NormalizedSessionRequest,
   FTS_HIGHLIGHT_END,
@@ -64,6 +69,13 @@ export {
   SESSION_QUERY_SQLITE_SCHEMA_VERSION,
   type JournalMode,
 } from './schema.ts'
+export {
+  SESSION_QUERY_SNAPSHOT_MAX_BYTES,
+  SESSION_QUERY_SNAPSHOT_MAX_ENTRIES,
+  SESSION_QUERY_SNAPSHOT_MAX_ROWS,
+  SESSION_QUERY_SNAPSHOT_TTL_MS,
+  type SnapshotLimits,
+} from './snapshots.ts'
 
 /** Boot-context slot for a launcher-owned absolute path to this process's derived query index. */
 export const SESSION_QUERY_SQLITE_PATH_KEY = 'launcherSessionQueryPath'
@@ -199,6 +211,26 @@ interface CursorPayload {
   offset: number
 }
 
+interface SnapshotCursorPayload {
+  version: 2
+  instance: string
+  scope: 'sessions' | 'events'
+  fingerprint: string
+  snapshot: string
+  offset: number
+}
+
+interface SnapshotContinuation {
+  readonly snapshot: string
+  readonly offset: number
+}
+
+/** Parsed cursor payload; the shape decides which continuation kind it is. */
+type CursorPayloadValue =
+  & Omit<Partial<CursorPayload>, 'version'>
+  & Omit<Partial<SnapshotCursorPayload>, 'version'>
+  & { version?: unknown }
+
 /** Concrete SQLite owner of the combined `ctx.sessionQuery` service. */
 export class SqliteSessionQueryEngine extends SessionQueryEngine {
   static override inject = ['sessions', 'sessionProjections']
@@ -238,6 +270,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _closed = false
   private _closePromise: Promise<void> | undefined
   private readonly _optionalPersistenceFiber: Fiber
+  private readonly _sessionSnapshots = new SnapshotStore<SessionSearchHit, undefined>()
+  private readonly _eventSnapshots = new SnapshotStore<SessionEventSearchHit, SessionHeader>()
 
   constructor(ctx: Context, config: Config) {
     // The assignment expression resolves before the base constructor can
@@ -275,13 +309,33 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const signal = exec?.signal
     return this._serialized(signal, async () => {
       await this._ensureReady(signal)
+      const fingerprint = requestFingerprint(normalized)
+      const payload = normalized.cursor === undefined ? undefined : parseCursor(normalized.cursor)
+      const continuation = payload === undefined
+        ? undefined
+        : snapshotContinuation(payload, this._instance, 'sessions', fingerprint)
+      if (continuation !== undefined) {
+        const snapshot = this._sessionSnapshots.take(continuation.snapshot)
+        if (snapshot === undefined) throw staleSnapshot()
+        return snapshotPage(snapshot, this._instance, 'sessions', continuation.offset, normalized.limit)
+      }
       const persistenceBinding = await this._reconcile(signal)
       assertNotAborted(signal)
+      if (normalized.snapshot && payload === undefined) {
+        const captured = this._querySessions(normalized, 0, persistenceBinding, SESSION_QUERY_SNAPSHOT_MAX_ROWS)
+        if (captured.length <= SESSION_QUERY_SNAPSHOT_MAX_ROWS) {
+          const snapshot = this._sessionSnapshots.store(
+            fingerprint,
+            captured.map(row => this._sessionHit(row)),
+            undefined,
+          )
+          return snapshotPage(snapshot, this._instance, 'sessions', 0, normalized.limit)
+        }
+      }
       const generation = String(this._globalGeneration)
-      const fingerprint = requestFingerprint(normalized)
-      const offset = normalized.cursor === undefined
+      const offset = payload === undefined
         ? 0
-        : decodeCursor(normalized.cursor, this._instance, 'sessions', fingerprint, generation)
+        : decodeCursor(payload, this._instance, 'sessions', fingerprint, generation)
       const rows = this._querySessions(normalized, offset, persistenceBinding)
       return page(rows, normalized.limit, row => this._sessionHit(row), cursorOffset => encodeCursor({
         version: 1,
@@ -303,13 +357,39 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const signal = exec?.signal
     return this._serialized(signal, async () => {
       await this._ensureReady(signal)
+      const fingerprint = requestFingerprint(normalized)
+      const payload = normalized.cursor === undefined ? undefined : parseCursor(normalized.cursor)
+      const continuation = payload === undefined
+        ? undefined
+        : snapshotContinuation(payload, this._instance, 'events', fingerprint)
+      if (continuation !== undefined) {
+        const snapshot = this._eventSnapshots.take(continuation.snapshot)
+        if (snapshot === undefined) throw staleSnapshot()
+        return {
+          session: snapshot.meta,
+          ...snapshotPage(snapshot, this._instance, 'events', continuation.offset, normalized.limit),
+        }
+      }
       const persistenceBinding = await this._reconcile(signal)
       assertNotAborted(signal)
       const target = this._targetObservation(normalized.sessionId, persistenceBinding)
-      const fingerprint = requestFingerprint(normalized)
-      const offset = normalized.cursor === undefined
+      if (normalized.snapshot && payload === undefined) {
+        const captured = this._queryEvents(normalized, 0, persistenceBinding, SESSION_QUERY_SNAPSHOT_MAX_ROWS)
+        if (captured.length <= SESSION_QUERY_SNAPSHOT_MAX_ROWS) {
+          const snapshot = this._eventSnapshots.store(
+            fingerprint,
+            captured.map(row => this._eventHit(row)),
+            target.header,
+          )
+          return {
+            session: target.header,
+            ...snapshotPage(snapshot, this._instance, 'events', 0, normalized.limit),
+          }
+        }
+      }
+      const offset = payload === undefined
         ? 0
-        : decodeCursor(normalized.cursor, this._instance, 'events', fingerprint, target.generation)
+        : decodeCursor(payload, this._instance, 'events', fingerprint, target.generation)
       const rows = this._queryEvents(normalized, offset, persistenceBinding)
       return {
         session: target.header,
@@ -354,6 +434,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         // Opening already closed a partially-created handle; disposal only waits.
       }
     }
+    this._sessionSnapshots.clear()
+    this._eventSnapshots.clear()
     this._db?.close()
     this._db = undefined
   }
@@ -501,7 +583,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       assertNotAborted(signal)
       const persistenceBinding = this._persistenceBinding
       const persistence = persistenceBinding.service
-      const initiallyLive = new Set(this.ctx.sessions.list().map(session => session.id))
+      const initiallyLive = new Map(this.ctx.sessions.list().map(session => [session.id, session]))
       let persisted = new Map<SessionId, ObservedPersistedSession>()
       if (persistence !== undefined) {
         try {
@@ -529,7 +611,10 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           const afterSnapshots = await persistence.list(listOptions)
           assertNotAborted(signal)
           const after = materializePersistenceSnapshots(afterSnapshots)
-          if (!samePersistenceSnapshots(persisted, after)) continue
+          if (!samePersistenceSnapshots(persisted, after, (id) => {
+            const owner = initiallyLive.get(id)
+            return owner !== undefined && this.ctx.sessions.get(id) === owner
+          })) continue
           if (this._persistenceBinding !== persistenceBinding) continue
         } catch (error: unknown) {
           if (isAbort(error) || signal?.aborted) {
@@ -546,14 +631,16 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           )
         }
       }
+      const liveOwners = new Map(this.ctx.sessions.list().map(session => [session.id, session]))
+      if (!sameSessionOwners(initiallyLive, liveOwners)) continue
+      if (this._persistenceBinding !== persistenceBinding) continue
       const live = new Map<SessionId, ObservedSession>()
-      for (const session of this.ctx.sessions.list()) {
+      for (const session of liveOwners.values()) {
         const observed = observeLive(session)
         const durable = persisted.get(session.id)
         if (durable !== undefined) assertSessionHeadersCompatible(observed.header, durable.header)
         live.set(session.id, observed)
       }
-      if (!sameSessionIds(initiallyLive, live)) continue
       return { persistenceBinding, persisted, live }
     }
     throw new SessionQueryError(
@@ -649,6 +736,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     request: NormalizedSessionRequest,
     offset: number,
     persistenceBinding: PersistenceBinding,
+    limit = request.limit,
   ): SearchRow[] {
     const selected = selectedDocumentsSql()
     const sessionWhere = buildSessionWhere(request.sessionFilters)
@@ -659,7 +747,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined),
       ...sessionWhere.params,
       ...eventWhere.params,
-      request.limit + 1,
+      limit + 1,
       offset,
     ]
     assertPortableBindingCount(bindings.length)
@@ -686,6 +774,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     request: NormalizedEventRequest,
     offset: number,
     persistenceBinding: PersistenceBinding,
+    limit = request.limit,
   ): SearchRow[] {
     const selected = selectedDocumentsSql()
     const eventWhere = buildEventWhere(request.filters)
@@ -695,7 +784,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined),
       request.sessionId,
       ...eventWhere.params,
-      request.limit + 1,
+      limit + 1,
       offset,
     ]
     assertPortableBindingCount(bindings.length)
@@ -912,26 +1001,27 @@ function materializePersistenceSnapshots(
 function samePersistenceSnapshots(
   before: ReadonlyMap<SessionId, ObservedPersistedSession>,
   after: ReadonlyMap<SessionId, ObservedPersistedSession>,
+  revisionShadowed: (id: SessionId) => boolean,
 ): boolean {
   if (before.size !== after.size) return false
   for (const [id, first] of before) {
     const second = after.get(id)
     if (
       second === undefined
-      || first.revision !== second.revision
+      || (first.revision !== second.revision && !revisionShadowed(id))
       || !sameHeader(first.header, second.header)
     ) return false
   }
   return true
 }
 
-function sameSessionIds(
-  before: ReadonlySet<SessionId>,
-  after: ReadonlyMap<SessionId, ObservedSession>,
+function sameSessionOwners(
+  before: ReadonlyMap<SessionId, Session>,
+  after: ReadonlyMap<SessionId, Session>,
 ): boolean {
   if (before.size !== after.size) return false
-  for (const id of before) {
-    if (!after.has(id)) return false
+  for (const [id, owner] of before) {
+    if (after.get(id) !== owner) return false
   }
   return true
 }
@@ -977,37 +1067,66 @@ function encodeCursor(payload: CursorPayload): SessionSearchCursorValue {
   return brandString<SessionSearchCursorValue>(Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url'))
 }
 
+function parseCursor(cursor: SessionSearchCursorValue): CursorPayloadValue {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
+  } catch (error: unknown) {
+    throw invalidCursor(error)
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw invalidCursor(new Error('cursor payload must be a JSON object'))
+  }
+  return parsed
+}
+
+function snapshotContinuation(
+  payload: CursorPayloadValue,
+  instance: string,
+  scope: SnapshotCursorPayload['scope'],
+  fingerprint: string,
+): SnapshotContinuation | undefined {
+  if (payload.version !== 2) return undefined
+  const { snapshot, offset } = payload
+  if (
+    payload.instance !== instance
+    || payload.scope !== scope
+    || payload.fingerprint !== fingerprint
+    || typeof snapshot !== 'string'
+    || typeof offset !== 'number'
+    || !Number.isSafeInteger(offset)
+    || offset < 0
+  ) {
+    throw invalidCursor(new Error('snapshot cursor does not belong to this normalized request'))
+  }
+  return { snapshot, offset }
+}
+
 function decodeCursor(
-  cursor: SessionSearchCursorValue,
+  payload: CursorPayloadValue,
   instance: string,
   scope: CursorPayload['scope'],
   fingerprint: string,
   generation: string,
 ): number {
-  let decoded: Partial<CursorPayload>
-  try {
-    decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<CursorPayload>
-  } catch (error: unknown) {
-    throw invalidCursor(error)
-  }
   if (
-    decoded.version !== 1
-    || decoded.instance !== instance
-    || decoded.scope !== scope
-    || decoded.fingerprint !== fingerprint
-    || !Number.isSafeInteger(decoded.offset)
-    || decoded.offset === undefined
-    || decoded.offset < 0
+    payload.version !== 1
+    || payload.instance !== instance
+    || payload.scope !== scope
+    || payload.fingerprint !== fingerprint
+    || !Number.isSafeInteger(payload.offset)
+    || payload.offset === undefined
+    || payload.offset < 0
   ) {
     throw invalidCursor(new Error('cursor does not belong to this normalized request'))
   }
-  if (decoded.generation !== generation) {
+  if (payload.generation !== generation) {
     throw new SessionQueryError(
       'session-search cursor is stale because its relevant corpus changed',
       'SESSION_QUERY_STALE_CURSOR',
     )
   }
-  return decoded.offset
+  return payload.offset
 }
 
 function invalidCursor(cause: unknown): SessionQueryError {
@@ -1016,6 +1135,45 @@ function invalidCursor(cause: unknown): SessionQueryError {
     'SESSION_QUERY_INVALID_CURSOR',
     { cause },
   )
+}
+
+function staleSnapshot(): SessionQueryError {
+  return new SessionQueryError(
+    'session-search snapshot is no longer available',
+    'SESSION_QUERY_STALE_CURSOR',
+  )
+}
+
+/**
+ * Take one page from a captured ranking and continue it while hits remain.
+ * @param snapshot - captured hits in ranking order.
+ * @param instance - owning engine identity bound into the next cursor.
+ * @param scope - search kind bound into the next cursor.
+ * @param offset - first captured hit of this page.
+ * @param limit - maximum hits in this page.
+ * @returns the page, with a snapshot cursor while more hits remain.
+ */
+function snapshotPage<Row, Meta>(
+  snapshot: SearchSnapshot<Row, Meta>,
+  instance: string,
+  scope: SnapshotCursorPayload['scope'],
+  offset: number,
+  limit: number,
+): SessionSearchPage<Row> {
+  const items = snapshot.rows.slice(offset, offset + limit)
+  const nextOffset = offset + items.length
+  if (nextOffset >= snapshot.rows.length) return { items }
+  return {
+    items,
+    nextCursor: SessionSearchCursor(Buffer.from(JSON.stringify({
+      version: 2,
+      instance,
+      scope,
+      fingerprint: snapshot.fingerprint,
+      snapshot: snapshot.id,
+      offset: nextOffset,
+    } satisfies SnapshotCursorPayload), 'utf8').toString('base64url')),
+  }
 }
 
 function resolveConfig(config: Config): ResolvedConfig {

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { SessionId } from '@deepseek-ai/dsh-session'
-import { brandString } from '@deepseek-ai/dsh-brand'
-import type { SessionSearchCursor, SessionQueryErrorCode } from '@deepseek-ai/dsh-session-query'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionSearchCursor, type SessionQueryErrorCode } from '@deepseek-ai/dsh-session-query'
 import {
   buildEventWhere,
   buildSessionWhere,
@@ -31,37 +30,43 @@ describe('SQLite search request normalization', () => {
       sessionFilters: [],
       eventFilters: [],
       limit: 2,
+      snapshot: false,
     })
     expect(normalizeSessionRequest({
       query: 'needle',
       sessionFilters: [{ kind: 'availability', values: ['live'] }],
       eventFilters: [{ kind: 'surface', values: ['current'] }],
       limit: 3,
-      cursor: brandString<SessionSearchCursor>('next'),
+      snapshot: true,
+      cursor: SessionSearchCursor('next'),
     }, limits)).toEqual({
       query: 'needle',
       sessionFilters: [{ kind: 'availability', values: ['live'] }],
       eventFilters: [{ kind: 'surface', values: ['current'] }],
       limit: 3,
-      cursor: brandString<SessionSearchCursor>('next'),
+      snapshot: true,
+      cursor: SessionSearchCursor('next'),
     })
-    expect(normalizeEventRequest({ sessionId: brandString<SessionId>('s'), query: 'needle' }, limits)).toEqual({
-      sessionId: brandString<SessionId>('s'),
+    expect(normalizeEventRequest({ sessionId: SessionId('s'), query: 'needle' }, limits)).toEqual({
+      sessionId: SessionId('s'),
       query: 'needle',
       filters: [],
       limit: 2,
+      snapshot: false,
     })
     expect(normalizeEventRequest({
-      sessionId: brandString<SessionId>('s'),
+      sessionId: SessionId('s'),
       query: 'needle',
       filters: [{ kind: 'seq', from: 1 }],
-      cursor: brandString<SessionSearchCursor>('next'),
+      snapshot: 'yes' as never,
+      cursor: SessionSearchCursor('next'),
     }, limits)).toEqual({
-      sessionId: brandString<SessionId>('s'),
+      sessionId: SessionId('s'),
       query: 'needle',
       filters: [{ kind: 'seq', from: 1 }],
       limit: 2,
-      cursor: brandString<SessionSearchCursor>('next'),
+      snapshot: false,
+      cursor: SessionSearchCursor('next'),
     })
   })
 
@@ -75,7 +80,7 @@ describe('SQLite search request normalization', () => {
     expect(() => normalizeEventRequest({ sessionId: 1 as never, query: 'x' }, limits))
       .toThrow(expectCode('SESSION_QUERY_INVALID_FILTER'))
     expect(() => normalizeEventRequest({
-      sessionId: brandString<SessionId>('s'),
+      sessionId: SessionId('s'),
       query: 'x',
       cursor: 1 as never,
     }, limits)).toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
@@ -88,11 +93,11 @@ describe('SQLite search request normalization', () => {
       eventFilters: [{} as never],
     }, limits)).toThrow(expectCode('SESSION_QUERY_INVALID_FILTER'))
     for (const limit of [1.5, 0, 4]) {
-      expect(() => normalizeEventRequest({ sessionId: brandString<SessionId>('s'), query: 'x', limit }, limits))
+      expect(() => normalizeEventRequest({ sessionId: SessionId('s'), query: 'x', limit }, limits))
         .toThrow(expectCode('SESSION_QUERY_INVALID_LIMIT'))
     }
     expect(() => normalizeEventRequest({
-      sessionId: brandString<SessionId>('s'),
+      sessionId: SessionId('s'),
       query: 'x',
       limit: SQLITE_MAX_PAGE_LIMIT + 1,
     }, { defaultLimit: 1, maxLimit: SQLITE_MAX_PAGE_LIMIT + 1 }))
@@ -119,9 +124,9 @@ describe('SQLite search predicate compilation', () => {
       params: [],
       predicateCount: 1,
     })
-    expect(buildSessionWhere([{ kind: 'id', values: [brandString<SessionId>('a'), brandString<SessionId>('b')] }])).toEqual({
+    expect(buildSessionWhere([{ kind: 'id', values: [SessionId('a'), SessionId('b')] }])).toEqual({
       sql: 'session_id IN (?, ?)',
-      params: [brandString<SessionId>('a'), brandString<SessionId>('b')],
+      params: [SessionId('a'), SessionId('b')],
       predicateCount: 1,
     })
     expect(buildSessionWhere([{ kind: 'cwd', values: [] }])).toEqual({
@@ -139,9 +144,9 @@ describe('SQLite search predicate compilation', () => {
       params: ['/a'],
       predicateCount: 1,
     })
-    expect(buildSessionWhere([{ kind: 'parent', values: [brandString<SessionId>('p'), null] }])).toEqual({
+    expect(buildSessionWhere([{ kind: 'parent', values: [SessionId('p'), null] }])).toEqual({
       sql: '(parent_session IN (?) OR parent_session IS NULL)',
-      params: [brandString<SessionId>('p')],
+      params: [SessionId('p')],
       predicateCount: 1,
     })
     expect(buildSessionWhere([
@@ -181,13 +186,13 @@ describe('SQLite search predicate compilation', () => {
   it('rejects predicate builders above the supported FTS5 outer budget', () => {
     const filters = Array.from(
       { length: SQLITE_FTS5_OUTER_PREDICATE_LIMIT },
-      () => ({ kind: 'id' as const, values: [brandString<SessionId>('safe')] }),
+      () => ({ kind: 'id' as const, values: [SessionId('safe')] }),
     )
 
     expect(buildSessionWhere(filters).predicateCount).toBe(SQLITE_FTS5_OUTER_PREDICATE_LIMIT)
     expect(() => buildSessionWhere([
       ...filters,
-      { kind: 'id', values: [brandString<SessionId>('over')] },
+      { kind: 'id', values: [SessionId('over')] },
     ])).toThrow(expectCode('SESSION_QUERY_INVALID_FILTER'))
   })
 
@@ -211,22 +216,24 @@ describe('SQLite query identity and presentation', () => {
   it('canonicalizes request and filter ordering in both scopes', () => {
     const sessionA: NormalizedSessionRequest = {
       query: 'needle',
+      snapshot: false,
       limit: 2,
       sessionFilters: [
         { kind: 'cwd', values: ['/b', '/a'] },
-        { kind: 'parent', values: [null, brandString<SessionId>('p')] },
-        { kind: 'id', values: [brandString<SessionId>('same'), brandString<SessionId>('same')] },
+        { kind: 'parent', values: [null, SessionId('p')] },
+        { kind: 'id', values: [SessionId('same'), SessionId('same')] },
         { kind: 'created-at', from: 1 },
       ],
       eventFilters: [{ kind: 'time', to: 9 }],
     }
     const sessionB: NormalizedSessionRequest = {
       query: 'needle',
+      snapshot: false,
       limit: 2,
       sessionFilters: [
         { kind: 'created-at', from: 1 },
-        { kind: 'id', values: [brandString<SessionId>('same'), brandString<SessionId>('same')] },
-        { kind: 'parent', values: [brandString<SessionId>('p'), null] },
+        { kind: 'id', values: [SessionId('same'), SessionId('same')] },
+        { kind: 'parent', values: [SessionId('p'), null] },
         { kind: 'cwd', values: ['/a', '/b'] },
       ],
       eventFilters: [{ kind: 'time', to: 9 }],
@@ -234,19 +241,21 @@ describe('SQLite query identity and presentation', () => {
     expect(requestFingerprint(sessionA)).toBe(requestFingerprint(sessionB))
 
     const eventA: NormalizedEventRequest = {
-      sessionId: brandString<SessionId>('s'),
+      sessionId: SessionId('s'),
       query: 'needle',
+      snapshot: false,
       limit: 2,
       filters: [{ kind: 'seq' }, { kind: 'surface', values: ['shadowed', 'current'] }],
     }
     const eventB: NormalizedEventRequest = {
-      sessionId: brandString<SessionId>('s'),
+      sessionId: SessionId('s'),
       query: 'needle',
+      snapshot: false,
       limit: 2,
       filters: [{ kind: 'surface', values: ['current', 'shadowed'] }, { kind: 'seq' }],
     }
     expect(requestFingerprint(eventA)).toBe(requestFingerprint(eventB))
-    expect(requestFingerprint(eventA)).not.toBe(requestFingerprint({ ...eventB, sessionId: brandString<SessionId>('other') }))
+    expect(requestFingerprint(eventA)).not.toBe(requestFingerprint({ ...eventB, sessionId: SessionId('other') }))
   })
 
   it('normalizes, bounds, and positions snippets by Unicode code point', () => {

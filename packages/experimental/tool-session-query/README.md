@@ -90,7 +90,7 @@ The design history lives in the [model-facing session query tools note](../../..
 
 ### Operation flow
 
-Each executor derives the caller, normalizes the model's arguments into service filters, authorizes the target (or the requested parent ids) against the caller workspace, and collects results through the service boundary. Both search tools page internally through provider cursors while the observed generation stays valid, stopping at `maxSearchResults`; because one search consumes generation-bound provider cursors, the two search tools execute exclusively with sibling tool calls, while the three exact trace/read tools opt into parallel execution. Lineage output replaces unauthorized ancestor and descendant boundaries with markers containing no hidden session id.
+Each executor derives the caller, normalizes the model's arguments into service filters, authorizes the target (or the requested parent ids) against the caller workspace, and collects results through the service boundary. Both search tools request captured pagination from the provider, so the internal pages they read keep the ranking captured by the first page even while other sessions keep writing; a provider without capture support still works through generation-bound cursors. Both search tools page internally while the observed generation stays valid, stopping at `maxSearchResults`; because one search consumes provider cursors minted by the service, the two search tools execute exclusively with sibling tool calls, while the three exact trace/read tools opt into parallel execution. Lineage output replaces unauthorized ancestor and descendant boundaries with markers containing no hidden session id.
 
 </details>
 
@@ -168,6 +168,7 @@ Append-only result text follows the reusable request prefix and does not invalid
 These limits define when this package is a poor fit or needs special operational care. They are current package constraints, not a task backlog.
 
 - **Search caps without continuation** — search returns at most the deployment cap and asks the model to narrow its query when more matches exist; there is no continuation token.
+- **Broad result sets still depend on a quiet corpus** — captured pagination covers at most the provider's capture cap (500 hits); a wider result set keeps generation-bound cursors and can still ask for a retry while other sessions write.
 - **Conservative workspace identity** — workspace identity is exact-string `cwd` equality, so symlink-equivalent paths do not share authority.
 - **Inline payloads without the spill policy** — custom compositions without the generic spill policy accept complete trace and event payloads inline.
 

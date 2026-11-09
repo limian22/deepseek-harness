@@ -96,6 +96,7 @@ async function executeSessionSearch(
         query,
         sessionFilters,
         eventFilters,
+        snapshot: true,
         ...cursor === undefined ? {} : { cursor },
       }, { signal: exec.signal })),
     hit => hit.header.id !== caller.id && workspaceAccess.recordAuthorized(hit, caller),
@@ -152,6 +153,7 @@ async function executeEventSearch(
           sessionId,
           query,
           filters,
+          snapshot: true,
           ...cursor === undefined ? {} : { cursor },
         }, { signal: exec.signal }))
       workspaceAccess.assertObservedTargetAuthorized(caller, sessionId, page.session)

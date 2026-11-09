@@ -429,6 +429,7 @@ describe('input validation and translation', () => {
         { kind: 'type', values: ['plugin/open-event'] },
         { kind: 'surface', values: ['shadowed'] },
       ],
+      snapshot: true,
     })
   })
 
@@ -1296,6 +1297,19 @@ describe('search paging, prior-history bounds, titles, and cancellation', () => 
     expect(output).toContain('Parent: [outside workspace]')
     expect(output).not.toContain('outside-parent-secret')
     expect(output).toContain('Result cap reached')
+  })
+
+  it('requests captured pagination so a later page survives concurrent writes', async () => {
+    const mounted = await mount()
+    const target = createSession(mounted.ctx, 'target', '/work')
+
+    await mounted.call('session_search', { query: 'needle' })
+    await mounted.call('session_event_search', { query: 'needle', session_id: target.id })
+
+    expect(FakeQuery.sessionRequests).toHaveLength(1)
+    expect(FakeQuery.sessionRequests[0]?.snapshot).toBe(true)
+    expect(FakeQuery.eventRequests).toHaveLength(1)
+    expect(FakeQuery.eventRequests[0]?.snapshot).toBe(true)
   })
 
   it('does not report a cap when only rejected hits remain after the authorized limit', async () => {

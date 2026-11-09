@@ -150,6 +150,8 @@ interface SessionEventSearchDocument extends SessionEventRecord {
 
 整合后的 `ctx.sessionQuery` seam 提供两个全文搜索范围。`searchSessions()` 按匹配度最强的事件对语料库分组；`searchEvents()` 搜索单个会话。请求将不透明游标与规范化后的查询、元数据过滤器和结果数量上限绑定。提供方的元数据过滤器有意不包含事件文本扫描。
 
+请求还可以设置 `snapshot: true`，要求提供方在第一页捕获完整排序，使后续页在来源持续变化时仍返回同一批结果。捕获支持取决于提供方：不支持的提供方会忽略该标志并继续使用世代绑定游标，支持捕获的提供方在捕获过期后仍返回 `SESSION_QUERY_STALE_CURSOR`。
+
 ```ts type-equiv
 /** Provider-owned opaque continuation token returned by session search. */
 type SessionSearchCursor = Branded<'SessionSearchCursor'>

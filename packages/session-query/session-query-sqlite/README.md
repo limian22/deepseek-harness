@@ -60,6 +60,8 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 Ranking is deterministic: more actual FTS5 highlighted-match spans first, then shorter documents, with event time, session id, and seq breaking ties. Results carry plain-text snippets bounded by `snippetChars` Unicode code points, with no provider-specific numeric score. Pages continue through an opaque `SessionSearchCursor` bound to the exact normalized request; a cursor becomes stale when its relevant corpus changes (`SESSION_QUERY_STALE_CURSOR`), and a within-session cursor survives changes to unrelated sessions while a cross-session cursor does not.
 
+A caller that reads several pages while other sessions keep writing can pass `snapshot: true`. The first page captures the complete ranking (at most 500 hits) and returns a snapshot cursor, so later pages read that capture and concurrent writes never invalidate the rest of the search. A capture stays continuable for two minutes, and each scope retains at most eight captures and 32 MiB of hits; expired or evicted captures fail with `SESSION_QUERY_STALE_CURSOR` exactly like a changed corpus. A result set larger than the cap falls back to generation-bound cursors instead of silently truncating.
+
 The `unicode61` tokenizer matches tokens and phrases, not arbitrary substrings: `AI` does not match the token `BRAID`. Use `ctx.sessionQuery.filterEvents()` with a `text` clause when a literal whitespace-flexible substring scan is required.
 
 ### When to defer or disable search
@@ -68,7 +70,7 @@ With `openAt: first-search`, the service activates without importing `node:sqlit
 
 ### Failures and recovery
 
-Typed `SessionQueryError` failures carry stable codes: `SESSION_QUERY_SEARCH_DISABLED` when search is configured off; `SESSION_QUERY_INDEX_FAILED` when the index cannot open or reconcile; `SESSION_QUERY_SESSION_NOT_FOUND` when a search target is absent; `SESSION_QUERY_STALE_CURSOR` when the corpus changed between pages — retry the complete search call; and `SESSION_QUERY_INVALID_CURSOR` for a cursor that does not belong to this request. Cancellation is honored between synchronous SQLite calls; a statement already executing on the JavaScript thread cannot be interrupted.
+Typed `SessionQueryError` failures carry stable codes: `SESSION_QUERY_SEARCH_DISABLED` when search is configured off; `SESSION_QUERY_INDEX_FAILED` when the index cannot open or reconcile; `SESSION_QUERY_SESSION_NOT_FOUND` when a search target is absent; `SESSION_QUERY_STALE_CURSOR` when the corpus changed between pages or a capture expired — retry the complete search call; and `SESSION_QUERY_INVALID_CURSOR` for a cursor that does not belong to this request. Cancellation is honored between synchronous SQLite calls; a statement already executing on the JavaScript thread cannot be interrupted.
 
 -----
 
@@ -87,6 +89,7 @@ The backend is built on one separation and three commitments:
 - **Derived index, never the source store.** The FTS rows live in a dedicated disposable database; the session-persistence database is never opened here.
 - **Live-preferred observation.** One serialized state machine compares persistence snapshot revisions, reads only new or changed logs through short-lived read handles, and reconciles in one transaction, so a search reflects the newest stable state.
 - **Generation-bound cursors.** Every corpus change bumps a generation; cursors carry the generation they were created under and fail stale rather than returning a shifted page.
+- **Opt-in captured pagination.** A `snapshot: true` search captures its ranking once, so a caller reading several pages is not invalidated by writes elsewhere; captures are bounded by age, count, and bytes, and an oversized result set keeps the generation-bound behavior.
 - **Literal phrases as data.** Caller query text is quoted into one FTS5 phrase so query syntax stays inert, and reserved highlight markers are stripped from documents before indexing.
 
 The design history lives in the [SQLite FTS5 session search note](../../../.agents/notes/archived/feature/2026-07-10-sqlite-session-query-provider.md) and the [unified service decision](../../../.agents/notes/archived/architecture/2026-07-23-unified-session-query-service.md).
@@ -143,6 +146,7 @@ These limits define when this package is a poor fit or needs special operational
 - **No caller authorization** — this is a trusted context-wide service; a model tool or UI must enforce its own access policy.
 - **Synchronous query execution** — `DatabaseSync` blocks the JavaScript thread during MATCH execution and cannot interrupt a statement already running.
 - **Token recall, not arbitrary substrings** — the `unicode61` tokenizer does not match substrings inside a larger token; use `filterEvents()` for literal scans.
+- **Captured pagination is process-local and bounded** — a capture is not shared across processes or restarts, expires after two minutes, and holds at most 500 hits; wider result sets keep generation-bound cursors.
 - **Single-owner derived index** — one service in one process must own each index path; external writers and multi-process sharing are unsupported.
 
 <a id="dev-note"></a>

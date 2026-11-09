@@ -2,17 +2,16 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
-import { brandString } from '@deepseek-ai/dsh-brand'
 import { DatabaseSync } from 'node:sqlite'
 import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import SessionStore, { SessionLogOffset, SessionSeq, SESSION_FORMAT_VERSION, type SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionLogOffset, SessionSeq, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { SessionEvent, SessionHeader, SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import SessionPersistence, {
   SessionPersistenceNotFoundError,
-  type SessionPersistenceRevision,
+  SessionPersistenceRevision,
   SessionReadOnlyError,
 } from '@deepseek-ai/dsh-session-persistence'
 import type {
@@ -25,12 +24,14 @@ import type {
 } from '@deepseek-ai/dsh-session-persistence'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SqliteSessionQueryEngine, {
+  SESSION_QUERY_SNAPSHOT_MAX_ROWS,
+  SESSION_QUERY_SNAPSHOT_TTL_MS,
   SESSION_QUERY_SQLITE_SCHEMA_VERSION,
 } from '@deepseek-ai/dsh-session-query-sqlite'
 import {
   SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY,
   SessionQueryError,
-  type SessionSearchCursor,
+  SessionSearchCursor,
   type SessionAvailability,
   type SessionQueryErrorCode,
   type SessionSearchRequest,
@@ -57,7 +58,7 @@ async function temporaryPath(name = 'search.db'): Promise<string> {
 }
 
 function header(id: string, createdAt = 1, extra: Partial<SessionHeader> = {}): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, id: brandString<SessionId>(id), createdAt, isSeeded: false, ...extra }
+  return { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt, isSeeded: false, ...extra }
 }
 
 function messageEvents(text: string, time = 1): SessionEvent[] {
@@ -77,13 +78,35 @@ function expectCode(code: SessionQueryErrorCode): Error {
 }
 
 function replaceCursorOffset(
-  cursor: SessionSearchCursor,
+  cursor: ReturnType<typeof SessionSearchCursor>,
   offset: number,
-): SessionSearchCursor {
+): ReturnType<typeof SessionSearchCursor> {
+  return mutateCursor(cursor, { offset })
+}
+
+function mutateCursor(
+  cursor: ReturnType<typeof SessionSearchCursor>,
+  patch: Record<string, unknown>,
+): ReturnType<typeof SessionSearchCursor> {
   const payload = JSON.parse(
     Buffer.from(cursor, 'base64url').toString('utf8'),
   ) as Record<string, unknown>
-  return brandString<SessionSearchCursor>(Buffer.from(JSON.stringify({ ...payload, offset }), 'utf8').toString('base64url'))
+  return SessionSearchCursor(Buffer.from(JSON.stringify({ ...payload, ...patch }), 'utf8').toString('base64url'))
+}
+
+async function collectSessionIds(ctx: Context, text: string): Promise<SessionIdType[]> {
+  const ids: SessionIdType[] = []
+  let cursor: ReturnType<typeof SessionSearchCursor> | undefined
+  do {
+    const page = await ctx.sessionQuery.searchSessions({
+      query: text,
+      limit: 1,
+      ...cursor === undefined ? {} : { cursor },
+    })
+    ids.push(...page.items.map(item => item.header.id))
+    cursor = page.nextCursor
+  } while (cursor !== undefined)
+  return ids
 }
 
 class TestHandle implements SessionHandle {
@@ -185,7 +208,7 @@ class TestPersistence extends SessionPersistence {
     if (entry === undefined) return Promise.resolve(undefined)
     return Promise.resolve({
       header: structuredClone(entry.meta),
-      revision: brandString<SessionPersistenceRevision>(`test:${TestPersistence.revisions.get(id)}`),
+      revision: SessionPersistenceRevision(`test:${TestPersistence.revisions.get(id)}`),
     })
   }
 
@@ -197,7 +220,7 @@ class TestPersistence extends SessionPersistence {
     const snapshots = TestPersistence.listOverride?.()
       ?? [...TestPersistence.entries.values()].map(entry => ({
         header: structuredClone(entry.meta),
-        revision: brandString<SessionPersistenceRevision>(`test:${TestPersistence.revisions.get(entry.meta.id)}`),
+        revision: SessionPersistenceRevision(`test:${TestPersistence.revisions.get(entry.meta.id)}`),
       }))
     await TestPersistence.listEffect?.(options?.signal)
     return snapshots
@@ -267,8 +290,8 @@ describe('SQLite session search', () => {
     const service = ctx.sessionQuery as SqliteSessionQueryEngine
     expect(service.config.openAt).toBe('never')
 
-    const parent = brandString<SessionId>('never-parent')
-    const child = brandString<SessionId>('never-child')
+    const parent = SessionId('never-parent')
+    const child = SessionId('never-child')
     ctx.sessions.create(parent, { seed: messageEvents('never opened needle'), meta: { createdAt: 10 } })
     ctx.sessions.create(child, { meta: { parentSession: parent, createdAt: 20 } })
 
@@ -341,7 +364,7 @@ describe('SQLite session search', () => {
 
   it('searches two-character Unicode61 tokens in live-only sessions', async () => {
     const ctx = await liveContext({ path: ':memory:', snippetChars: 20 })
-    const session = ctx.sessions.create(brandString<SessionId>('live'), {
+    const session = ctx.sessions.create(SessionId('live'), {
       seed: messageEvents('inherited context'),
       inheritedEventCount: SessionLogOffset(1),
       // agentPreset rides along: the index rebuilds the header a caller reads,
@@ -368,7 +391,7 @@ describe('SQLite session search', () => {
 
   it('excludes assistant reasoning while indexing visible answer text', async () => {
     const ctx = await liveContext()
-    const session = ctx.sessions.create(brandString<SessionId>('reasoning'))
+    const session = ctx.sessions.create(SessionId('reasoning'))
     session.append(
       'assistant/message',
       {
@@ -399,7 +422,7 @@ describe('SQLite session search', () => {
 
   it('searches all surfaces by default and applies metadata before ranking', async () => {
     const ctx = await liveContext({ path: ':memory:', defaultLimit: 10, maxLimit: 20 })
-    const parent = brandString<SessionId>('parent')
+    const parent = SessionId('parent')
     const events: SessionEvent[] = [
       { type: 'user/message', seq: SessionSeq(0), time: 10, data: createUserMessage({
         content: [{ type: 'text', text: 'needle original' }], source: { kind: 'user' },
@@ -419,13 +442,13 @@ describe('SQLite session search', () => {
       }), surfaceOp: { op: 'replace', startSeq: SessionSeq(0), endSeq: SessionSeq(0) }, sourceEventSeqs: [SessionSeq(0)] },
       { type: 'turn/end', seq: SessionSeq(3), time: 13, data: { turn: 1, reason: { kind: 'error', error: { message: 'needle failure', code: 'UNKNOWN' } } } },
     ]
-    ctx.sessions.create(brandString<SessionId>('a'), { seed: events, meta: { cwd: '/a', parentSession: parent, createdAt: 20 } })
-    ctx.sessions.create(brandString<SessionId>('b'), { seed: messageEvents('needle peer', 12), meta: { createdAt: 20 } })
+    ctx.sessions.create(SessionId('a'), { seed: events, meta: { cwd: '/a', parentSession: parent, createdAt: 20 } })
+    ctx.sessions.create(SessionId('b'), { seed: messageEvents('needle peer', 12), meta: { createdAt: 20 } })
 
-    const all = await ctx.sessionQuery.searchEvents({ sessionId: brandString<SessionId>('a'), query: 'needle' })
+    const all = await ctx.sessionQuery.searchEvents({ sessionId: SessionId('a'), query: 'needle' })
     expect(new Set(all.items.map(item => item.surface))).toEqual(new Set(['current', 'shadowed', 'log-only']))
     await expect(ctx.sessionQuery.searchEvents({
-      sessionId: brandString<SessionId>('a'),
+      sessionId: SessionId('a'),
       query: 'needle',
       filters: [
         { kind: 'seq', from: 2, to: 2 },
@@ -438,7 +461,7 @@ describe('SQLite session search', () => {
     const grouped = await ctx.sessionQuery.searchSessions({
       query: 'needle',
       sessionFilters: [
-        { kind: 'id', values: [brandString<SessionId>('a')] },
+        { kind: 'id', values: [SessionId('a')] },
         { kind: 'cwd', values: ['/a'] },
         { kind: 'created-at', from: 20, to: 20 },
         { kind: 'parent', values: [parent] },
@@ -448,7 +471,7 @@ describe('SQLite session search', () => {
     })
     expect(grouped.items).toHaveLength(1)
     expect(grouped.items[0]).toMatchObject({
-      header: { id: brandString<SessionId>('a'), cwd: '/a', parentSession: parent },
+      header: { id: SessionId('a'), cwd: '/a', parentSession: parent },
       live: true,
       persisted: false,
       bestMatch: { seq: SessionSeq(0), surface: 'shadowed' },
@@ -457,7 +480,7 @@ describe('SQLite session search', () => {
 
   it('searches at the supported FTS5 outer-predicate boundary in both scopes', async () => {
     const ctx = await liveContext()
-    const session = ctx.sessions.create(brandString<SessionId>('predicate-boundary'), {
+    const session = ctx.sessions.create(SessionId('predicate-boundary'), {
       seed: messageEvents('needle'),
       meta: { cwd: '/work' },
     })
@@ -481,7 +504,7 @@ describe('SQLite session search', () => {
 
   it('rejects unsupported FTS5 outer-predicate counts with typed errors', async () => {
     const ctx = await liveContext()
-    const session = ctx.sessions.create(brandString<SessionId>('predicate-limit'), { seed: messageEvents('needle') })
+    const session = ctx.sessions.create(SessionId('predicate-limit'), { seed: messageEvents('needle') })
     const sessionFilters = Array.from(
       { length: 1_100 },
       () => ({ kind: 'id' as const, values: [session.id] }),
@@ -512,22 +535,22 @@ describe('SQLite session search', () => {
 
   it('uses literal phrase tokens, stable ties, and bounded Unicode snippets', async () => {
     const ctx = await liveContext({ path: ':memory:', defaultLimit: 10, maxLimit: 10, snippetChars: 5 })
-    ctx.sessions.create(brandString<SessionId>('a'), { seed: messageEvents('😀😀 alpha beta BRAID 😀😀', 10), meta: { createdAt: 1 } })
-    ctx.sessions.create(brandString<SessionId>('b'), { seed: messageEvents('alpha beta', 10), meta: { createdAt: 1 } })
-    ctx.sessions.create(brandString<SessionId>('c'), { seed: messageEvents('alpha middle beta', 10), meta: { createdAt: 1 } })
-    ctx.sessions.create(brandString<SessionId>('d'), { seed: messageEvents('alpha beta', 10), meta: { createdAt: 1 } })
-    ctx.sessions.create(brandString<SessionId>('operator'), { seed: messageEvents('needle OR absent', 10), meta: { createdAt: 1 } })
-    ctx.sessions.create(brandString<SessionId>('only'), { seed: messageEvents('needle only', 10), meta: { createdAt: 1 } })
-    ctx.sessions.create(brandString<SessionId>('quote'), { seed: messageEvents('say "needle" exactly', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('a'), { seed: messageEvents('😀😀 alpha beta BRAID 😀😀', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('b'), { seed: messageEvents('alpha beta', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('c'), { seed: messageEvents('alpha middle beta', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('d'), { seed: messageEvents('alpha beta', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('operator'), { seed: messageEvents('needle OR absent', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('only'), { seed: messageEvents('needle only', 10), meta: { createdAt: 1 } })
+    ctx.sessions.create(SessionId('quote'), { seed: messageEvents('say "needle" exactly', 10), meta: { createdAt: 1 } })
 
     const phrase = await ctx.sessionQuery.searchSessions({ query: 'alpha beta' })
-    expect(phrase.items.map(item => item.header.id)).toEqual([brandString<SessionId>('b'), brandString<SessionId>('d'), brandString<SessionId>('a')])
+    expect(phrase.items.map(item => item.header.id)).toEqual([SessionId('b'), SessionId('d'), SessionId('a')])
     expect(phrase.items.every(item => Array.from(item.bestMatch.snippet).length <= 5)).toBe(true)
     await expect(ctx.sessionQuery.searchSessions({ query: 'AI' })).resolves.toEqual({ items: [] })
     await expect(ctx.sessionQuery.searchSessions({ query: 'needle OR absent' }))
-      .resolves.toMatchObject({ items: [{ header: { id: brandString<SessionId>('operator') } }] })
+      .resolves.toMatchObject({ items: [{ header: { id: SessionId('operator') } }] })
     await expect(ctx.sessionQuery.searchSessions({ query: 'say "needle"' }))
-      .resolves.toMatchObject({ items: [{ header: { id: brandString<SessionId>('quote') } }] })
+      .resolves.toMatchObject({ items: [{ header: { id: SessionId('quote') } }] })
     await expect(ctx.sessionQuery.searchSessions({ query: '*' })).resolves.toEqual({ items: [] })
   })
 
@@ -542,22 +565,22 @@ describe('SQLite session search', () => {
     ])
     const ctx = await liveContext()
     const persistence = await ctx.plugin(TestPersistence)
-    ctx.sessions.create(brandString<SessionId>('a-live'), {
+    ctx.sessions.create(SessionId('a-live'), {
       seed: messageEvents('needle needle', 10),
       meta: { createdAt: persisted.createdAt },
     })
 
     const result = await ctx.sessionQuery.searchSessions({
       query: 'needle',
-      sessionFilters: [{ kind: 'id', values: [brandString<SessionId>('a-live'), persisted.id] }],
+      sessionFilters: [{ kind: 'id', values: [SessionId('a-live'), persisted.id] }],
     })
-    expect(result.items.map(item => item.header.id)).toEqual([brandString<SessionId>('a-live'), persisted.id])
+    expect(result.items.map(item => item.header.id)).toEqual([SessionId('a-live'), persisted.id])
     await persistence.dispose()
   })
 
   it('positions snippets from FTS5 matches across diacritics and punctuation', async () => {
     const ctx = await liveContext({ path: ':memory:', snippetChars: 14 })
-    const session = ctx.sessions.create(brandString<SessionId>('snippet'), {
+    const session = ctx.sessions.create(SessionId('snippet'), {
       seed: messageEvents('long long long—café,\nnext value', 10),
     })
 
@@ -571,14 +594,14 @@ describe('SQLite session search', () => {
 
   it('binds cursors to requests and only invalidates within-session pages for target changes', async () => {
     const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
-    const target = ctx.sessions.create(brandString<SessionId>('target'), {
+    const target = ctx.sessions.create(SessionId('target'), {
       seed: [
         ...messageEvents('needle one', 10),
         { ...messageEvents('needle two', 11)[0]!, seq: SessionSeq(1) },
         { ...messageEvents('needle three', 12)[0]!, seq: SessionSeq(2) },
       ],
     })
-    ctx.sessions.create(brandString<SessionId>('other'), { seed: messageEvents('needle other', 10) })
+    ctx.sessions.create(SessionId('other'), { seed: messageEvents('needle other', 10) })
 
     const eventPage = await ctx.sessionQuery.searchEvents({ sessionId: target.id, query: 'needle', limit: 1 })
     const sessionPage = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1 })
@@ -595,7 +618,7 @@ describe('SQLite session search', () => {
     })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
 
     const eventKeys = eventPage.items.map(item => `${item.sessionId}:${item.seq}`)
-    let eventCursor: SessionSearchCursor | undefined = eventPage.nextCursor
+    let eventCursor: ReturnType<typeof SessionSearchCursor> | undefined = eventPage.nextCursor
     while (eventCursor !== undefined) {
       const next = await ctx.sessionQuery.searchEvents({
         sessionId: target.id,
@@ -610,7 +633,7 @@ describe('SQLite session search', () => {
     expect(new Set(eventKeys).size).toBe(eventKeys.length)
 
     const sessionIds = sessionPage.items.map(item => item.header.id)
-    let sessionCursor: SessionSearchCursor | undefined = sessionPage.nextCursor
+    let sessionCursor: ReturnType<typeof SessionSearchCursor> | undefined = sessionPage.nextCursor
     while (sessionCursor !== undefined) {
       const next = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, cursor: sessionCursor })
       sessionIds.push(...next.items.map(item => item.header.id))
@@ -619,7 +642,7 @@ describe('SQLite session search', () => {
     expect(sessionIds).toHaveLength(2)
     expect(new Set(sessionIds).size).toBe(sessionIds.length)
 
-    ctx.sessions.create(brandString<SessionId>('unrelated'), { seed: messageEvents('needle unrelated', 20) })
+    ctx.sessions.create(SessionId('unrelated'), { seed: messageEvents('needle unrelated', 20) })
     await expect(ctx.sessionQuery.searchEvents({
       sessionId: target.id,
       query: 'needle',
@@ -646,11 +669,275 @@ describe('SQLite session search', () => {
     })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
   })
 
+  it('serves snapshot session pages from the captured ranking while the corpus changes', async () => {
+    const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+    ctx.sessions.create(SessionId('snap-one'), { seed: messageEvents('needle alpha', 10) })
+    ctx.sessions.create(SessionId('snap-two'), { seed: messageEvents('needle beta', 20) })
+    ctx.sessions.create(SessionId('snap-three'), { seed: messageEvents('needle gamma', 30) })
+
+    const baseline = await collectSessionIds(ctx, 'needle')
+    expect(baseline).toHaveLength(3)
+
+    const first = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, snapshot: true })
+    if (first.nextCursor === undefined) throw new Error('expected a snapshot cursor')
+
+    ctx.sessions.create(SessionId('snap-four'), { seed: messageEvents('needle delta', 40) })
+
+    const ids = first.items.map(item => item.header.id)
+    let cursor: ReturnType<typeof SessionSearchCursor> | undefined = first.nextCursor
+    while (cursor !== undefined) {
+      const page = await ctx.sessionQuery.searchSessions({
+        query: 'needle',
+        limit: 1,
+        snapshot: true,
+        cursor,
+      })
+      ids.push(...page.items.map(item => item.header.id))
+      cursor = page.nextCursor
+    }
+
+    expect(ids).toEqual(baseline)
+  })
+
+  it('serves snapshot event pages without seeing events appended after the first page', async () => {
+    const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+    const target = ctx.sessions.create(SessionId('snap-events'), {
+      seed: [
+        ...messageEvents('needle one', 10),
+        { ...messageEvents('needle two', 11)[0]!, seq: SessionSeq(1) },
+        { ...messageEvents('needle three', 12)[0]!, seq: SessionSeq(2) },
+      ],
+    })
+
+    const baseline: number[] = []
+    let baselineCursor: ReturnType<typeof SessionSearchCursor> | undefined
+    do {
+      const page = await ctx.sessionQuery.searchEvents({
+        sessionId: target.id,
+        query: 'needle',
+        limit: 1,
+        ...baselineCursor === undefined ? {} : { cursor: baselineCursor },
+      })
+      baseline.push(...page.items.map(item => item.seq))
+      baselineCursor = page.nextCursor
+    } while (baselineCursor !== undefined)
+    expect(baseline).toHaveLength(3)
+
+    const first = await ctx.sessionQuery.searchEvents({
+      sessionId: target.id,
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+    })
+    if (first.nextCursor === undefined) throw new Error('expected a snapshot cursor')
+
+    target.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'needle four' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+
+    const seqs = first.items.map(item => item.seq)
+    let cursor: ReturnType<typeof SessionSearchCursor> | undefined = first.nextCursor
+    while (cursor !== undefined) {
+      const page = await ctx.sessionQuery.searchEvents({
+        sessionId: target.id,
+        query: 'needle',
+        limit: 1,
+        snapshot: true,
+        cursor,
+      })
+      seqs.push(...page.items.map(item => item.seq))
+      cursor = page.nextCursor
+    }
+
+    expect(seqs).toEqual(baseline)
+  })
+
+  it('keeps snapshot cursors bound to their scope and normalized request', async () => {
+    const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+    const target = ctx.sessions.create(SessionId('snap-bound'), {
+      seed: [
+        ...messageEvents('needle one', 10),
+        { ...messageEvents('needle two', 11)[0]!, seq: SessionSeq(1) },
+      ],
+    })
+    ctx.sessions.create(SessionId('snap-bound-other'), { seed: messageEvents('needle other', 20) })
+
+    const sessions = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, snapshot: true })
+    const events = await ctx.sessionQuery.searchEvents({
+      sessionId: target.id,
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+    })
+    if (sessions.nextCursor === undefined || events.nextCursor === undefined) {
+      throw new Error('expected snapshot cursors')
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'differing',
+      limit: 1,
+      snapshot: true,
+      cursor: sessions.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'needle',
+      limit: 1,
+      snapshot: false,
+      cursor: sessions.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
+
+    const legacy = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1 })
+    if (legacy.nextCursor === undefined) throw new Error('expected a legacy cursor')
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+      cursor: legacy.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: target.id,
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+      cursor: sessions.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
+  })
+
+  it('expires snapshot cursors after their lifetime while the corpus stays unchanged', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
+      const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+      ctx.sessions.create(SessionId('snap-expire-one'), { seed: messageEvents('needle alpha', 10) })
+      ctx.sessions.create(SessionId('snap-expire-two'), { seed: messageEvents('needle beta', 20) })
+
+      const first = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, snapshot: true })
+      if (first.nextCursor === undefined) throw new Error('expected a snapshot cursor')
+      const target = ctx.sessions.create(SessionId('snap-expire-events'), {
+        seed: [
+          ...messageEvents('needle one', 10),
+          { ...messageEvents('needle two', 11)[0]!, seq: SessionSeq(1) },
+        ],
+      })
+      const eventFirst = await ctx.sessionQuery.searchEvents({
+        sessionId: target.id,
+        query: 'needle',
+        limit: 1,
+        snapshot: true,
+      })
+      if (eventFirst.nextCursor === undefined) throw new Error('expected a snapshot cursor')
+
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z').getTime() + SESSION_QUERY_SNAPSHOT_TTL_MS + 1)
+
+      await expect(ctx.sessionQuery.searchSessions({
+        query: 'needle',
+        limit: 1,
+        snapshot: true,
+        cursor: first.nextCursor,
+      })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+      await expect(ctx.sessionQuery.searchEvents({
+        sessionId: target.id,
+        query: 'needle',
+        limit: 1,
+        snapshot: true,
+        cursor: eventFirst.nextCursor,
+      })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to a generation cursor when an event capture would exceed its row cap', async () => {
+    const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+    const target = ctx.sessions.create(SessionId('snap-event-cap'), {
+      seed: Array.from({ length: SESSION_QUERY_SNAPSHOT_MAX_ROWS + 1 }, (_, index) => ({
+        ...messageEvents(`needle ${index}`, index + 1)[0]!,
+        seq: SessionSeq(index),
+      })),
+    })
+
+    const first = await ctx.sessionQuery.searchEvents({
+      sessionId: target.id,
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+    })
+    if (first.nextCursor === undefined) throw new Error('expected a cursor')
+
+    target.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'needle late' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: target.id,
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+      cursor: first.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+  })
+
+  it('rejects a snapshot cursor whose binding was altered', async () => {
+    const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+    ctx.sessions.create(SessionId('snap-tamper-one'), { seed: messageEvents('needle alpha', 10) })
+    ctx.sessions.create(SessionId('snap-tamper-two'), { seed: messageEvents('needle beta', 20) })
+
+    const first = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, snapshot: true })
+    if (first.nextCursor === undefined) throw new Error('expected a snapshot cursor')
+
+    for (const patch of [
+      { instance: 'another-instance' },
+      { scope: 'events' },
+      { snapshot: 42 },
+      { offset: '1' },
+      { offset: 1.5 },
+      { offset: -1 },
+    ]) {
+      await expect(ctx.sessionQuery.searchSessions({
+        query: 'needle',
+        limit: 1,
+        snapshot: true,
+        cursor: mutateCursor(first.nextCursor, patch),
+      })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
+    }
+
+    const second = await ctx.sessionQuery.searchSessions({
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+      cursor: first.nextCursor,
+    })
+    expect(second.items).toHaveLength(1)
+    expect(second.items[0]!.header.id).not.toBe(first.items[0]!.header.id)
+  })
+
+  it('falls back to a generation cursor when a capture would exceed its row cap', async () => {
+    const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
+    for (let index = 0; index <= SESSION_QUERY_SNAPSHOT_MAX_ROWS; index += 1) {
+      ctx.sessions.create(SessionId(`snap-cap-${index}`), {
+        seed: messageEvents(`needle ${index}`, index + 1),
+        meta: { createdAt: index },
+      })
+    }
+
+    const first = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, snapshot: true })
+    if (first.nextCursor === undefined) throw new Error('expected a cursor')
+
+    ctx.sessions.create(SessionId('snap-cap-late'), { seed: messageEvents('needle late', 10_000) })
+
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+      cursor: first.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+  })
+
   it('invalidates session cursors after transient persistence topology changes', async () => {
     TestPersistence.reset()
     const ctx = await liveContext({ path: ':memory:', defaultLimit: 1, maxLimit: 5 })
-    ctx.sessions.create(brandString<SessionId>('first'), { seed: messageEvents('needle first') })
-    ctx.sessions.create(brandString<SessionId>('second'), { seed: messageEvents('needle second') })
+    ctx.sessions.create(SessionId('first'), { seed: messageEvents('needle first') })
+    ctx.sessions.create(SessionId('second'), { seed: messageEvents('needle second') })
     const page = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1 })
     if (page.nextCursor === undefined) throw new Error('expected cursor')
 
@@ -666,7 +953,7 @@ describe('SQLite session search', () => {
 
   it('rejects invalid requests, filters, cursors, and direct config', async () => {
     const ctx = await liveContext({ path: ':memory:', defaultLimit: 2, maxLimit: 3 })
-    const session = ctx.sessions.create(brandString<SessionId>('valid'), { seed: messageEvents('needle') })
+    const session = ctx.sessions.create(SessionId('valid'), { seed: messageEvents('needle') })
     for (const request of [
       { sessionId: session.id, query: '' },
       { sessionId: session.id, query: 'needle', limit: 0 },
@@ -697,10 +984,16 @@ describe('SQLite session search', () => {
     await expect(ctx.sessionQuery.searchEvents({
       sessionId: session.id,
       query: 'needle',
-      cursor: brandString<SessionSearchCursor>('not-json'),
+      cursor: SessionSearchCursor('not-json'),
     }))
       .rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
-    await expect(ctx.sessionQuery.searchEvents({ sessionId: brandString<SessionId>('absent'), query: 'needle' }))
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: session.id,
+      query: 'needle',
+      cursor: SessionSearchCursor(Buffer.from('null', 'utf8').toString('base64url')),
+    }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_INVALID_CURSOR'))
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: SessionId('absent'), query: 'needle' }))
       .rejects.toThrow(expectCode('SESSION_QUERY_SESSION_NOT_FOUND'))
 
     for (const config of [
@@ -729,13 +1022,13 @@ describe('SQLite session search', () => {
 
   it('rejects aggregate filter bindings above SQLite\'s portable variable limit', async () => {
     const ctx = await liveContext()
-    const session = ctx.sessions.create(brandString<SessionId>('binding-limit'), { seed: messageEvents('needle') })
+    const session = ctx.sessions.create(SessionId('binding-limit'), { seed: messageEvents('needle') })
     // Each clause is below the ceiling; combined with its sibling and fixed
     // query bindings, the complete statement is not portable.
     const halfPortableLimit = 16_383
     const ids = Array.from(
       { length: halfPortableLimit },
-      (_, index) => brandString<SessionId>(`binding-${index}`),
+      (_, index) => SessionId(`binding-${index}`),
     )
     const types = Array.from({ length: halfPortableLimit }, () => 'user/message' as const)
     const surfaces = Array.from({ length: halfPortableLimit }, () => 'current' as const)
@@ -759,7 +1052,7 @@ describe('SQLite session search', () => {
     const ctx = await liveContext()
     const ids = Array.from(
       { length: 125_000 },
-      (_, index) => brandString<SessionId>(`oversized-binding-${index}`),
+      (_, index) => SessionId(`oversized-binding-${index}`),
     )
 
     await expect(ctx.sessionQuery.searchSessions({
@@ -861,17 +1154,173 @@ describe('SQLite reconciliation and source lifecycle', () => {
     await persistence.dispose()
   })
 
+  it('searches live and cold history during live revision churn and reloads fresh history on detach', async () => {
+    const shared = header('churning-live', 10)
+    const cold = header('unrelated-cold')
+    TestPersistence.reset([
+      { meta: shared, events: messageEvents('obsolete needle') },
+      { meta: cold, events: messageEvents('cold needle') },
+    ])
+    const ctx = await liveContext()
+    const persistence = await ctx.plugin(TestPersistence)
+    await ctx.sessionQuery.searchSessions({ query: 'obsolete' })
+    const live = ctx.sessions.prepare(shared.id, {
+      seed: messageEvents('live needle'),
+      meta: { createdAt: shared.createdAt },
+    })
+    const detach = ctx.sessions.enter(live)
+    ctx.sessions.announce(live)
+    let lists = 0
+    TestPersistence.listEffect = () => {
+      lists += 1
+      TestPersistence.set({ meta: shared, events: messageEvents('fresh needle') })
+    }
+
+    const page = await ctx.sessionQuery.searchSessions({ query: 'needle' })
+    expect(page.items).toHaveLength(2)
+    expect(page.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ header: shared, live: true, persisted: true }),
+      expect.objectContaining({ header: cold, live: false, persisted: true }),
+    ]))
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: shared.id, query: 'live' }))
+      .resolves.toMatchObject({ items: [{ sessionId: shared.id }] })
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: cold.id, query: 'cold' }))
+      .resolves.toMatchObject({ items: [{ sessionId: cold.id }] })
+    expect(lists).toBe(6)
+    expect(TestPersistence.reads.get(shared.id)).toBe(1)
+    expect(TestPersistence.reads.get(cold.id)).toBe(1)
+
+    TestPersistence.listEffect = undefined
+    detach()
+    await expect(ctx.sessionQuery.searchSessions({ query: 'fresh' }))
+      .resolves.toMatchObject({ items: [{ header: shared, live: false, persisted: true }] })
+    await expect(ctx.sessionQuery.searchSessions({ query: 'obsolete' })).resolves.toEqual({ items: [] })
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: shared.id, query: 'fresh' }))
+      .resolves.toMatchObject({ items: [{ sessionId: shared.id }] })
+    expect(TestPersistence.reads.get(shared.id)).toBe(2)
+    await persistence.dispose()
+  })
+
+  it('fails after one retry when same-ID live owners keep replacing each other', async () => {
+    const shared = header('replaced-live', 10)
+    TestPersistence.reset([{ meta: shared, events: messageEvents('persisted needle') }])
+    const ctx = await liveContext()
+    await ctx.plugin(TestPersistence)
+    const prepare = () => ctx.sessions.prepare(shared.id, {
+      seed: messageEvents('live needle'),
+      meta: { createdAt: shared.createdAt },
+    })
+    let detach = ctx.sessions.enter(prepare())
+    let lists = 0
+    TestPersistence.listEffect = () => {
+      lists += 1
+      detach()
+      detach = ctx.sessions.enter(prepare())
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_PERSISTENCE_FAILED'))
+    expect(lists).toBe(4)
+    detach()
+  })
+
+  it.each(['cold revision', 'persisted header', 'persisted population'] as const)(
+    'does not exempt changing %s during live revision churn', async (change) => {
+      const shared = header('live-with-unstable-source', 10)
+      const cold = header('unstable-cold')
+      const added = header('unstable-population')
+      TestPersistence.reset([
+        { meta: shared, events: messageEvents('persisted needle') },
+        { meta: cold, events: messageEvents('cold needle') },
+      ])
+      const ctx = await liveContext()
+      await ctx.plugin(TestPersistence)
+      ctx.sessions.create(shared.id, {
+        seed: messageEvents('live needle'), meta: { createdAt: shared.createdAt },
+      })
+      let lists = 0
+      TestPersistence.listEffect = () => {
+        lists += 1
+        TestPersistence.set({ meta: shared, events: messageEvents('persisted needle') })
+        if (change === 'cold revision') {
+          TestPersistence.set({ meta: cold, events: messageEvents(`cold needle ${lists}`) })
+        } else if (change === 'persisted header') {
+          TestPersistence.set({ meta: { ...shared, cwd: `/changed-${lists}` }, events: messageEvents('needle') })
+        } else if (lists % 2 === 1) {
+          TestPersistence.set({ meta: added, events: messageEvents('added needle') })
+        } else {
+          TestPersistence.entries.delete(added.id)
+        }
+      }
+
+      await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
+        .rejects.toThrow(expectCode('SESSION_QUERY_PERSISTENCE_FAILED'))
+      expect(lists).toBe(4)
+    },
+  )
+
+  it('reloads cold history when a live owner disappears during revision churn', async () => {
+    const shared = header('disappearing-live', 10)
+    TestPersistence.reset([{ meta: shared, events: messageEvents('obsolete needle') }])
+    const ctx = await liveContext()
+    await ctx.plugin(TestPersistence)
+    const live = ctx.sessions.prepare(shared.id, {
+      seed: messageEvents('live needle'), meta: { createdAt: shared.createdAt },
+    })
+    const detach = ctx.sessions.enter(live)
+    TestPersistence.listEffect = () => {
+      TestPersistence.listEffect = undefined
+      TestPersistence.set({ meta: shared, events: messageEvents('fresh needle') })
+      detach()
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'fresh' }))
+      .resolves.toMatchObject({ items: [{ header: shared, live: false, persisted: true }] })
+    expect(TestPersistence.listSignals).toHaveLength(4)
+    expect(TestPersistence.reads.get(shared.id)).toBe(1)
+  })
+
+  it('retries a persistence replacement despite live revision churn', async () => {
+    const shared = header('live-across-binding-change', 10)
+    const cold = header('cold-across-binding-change')
+    TestPersistence.reset([
+      { meta: shared, events: messageEvents('persisted needle') },
+      { meta: cold, events: messageEvents('obsolete needle') },
+    ])
+    const ctx = await liveContext()
+    let persistence = await ctx.plugin(TestPersistence)
+    ctx.sessions.create(shared.id, {
+      seed: messageEvents('live needle'), meta: { createdAt: shared.createdAt },
+    })
+    let lists = 0
+    TestPersistence.listEffect = async () => {
+      lists += 1
+      TestPersistence.set({ meta: shared, events: messageEvents('persisted needle') })
+      if (lists !== 2) return
+      await persistence.dispose()
+      TestPersistence.set({ meta: cold, events: messageEvents('replacement needle') })
+      persistence = await ctx.plugin(TestPersistence)
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'replacement' }))
+      .resolves.toMatchObject({ items: [{ header: cold, live: false, persisted: true }] })
+    expect(lists).toBe(4)
+    expect(TestPersistence.reads.get(cold.id)).toBe(2)
+    expect(TestPersistence.reads.get(shared.id)).toBeUndefined()
+    await persistence.dispose()
+  })
+
   it('retries when a live owner attaches during persistence observation', async () => {
     TestPersistence.reset()
     const ctx = await liveContext()
     await ctx.plugin(TestPersistence)
     TestPersistence.listEffect = () => {
       TestPersistence.listEffect = undefined
-      ctx.sessions.create(brandString<SessionId>('attached'), { seed: messageEvents('attached needle') })
+      ctx.sessions.create(SessionId('attached'), { seed: messageEvents('attached needle') })
     }
 
     await expect(ctx.sessionQuery.searchSessions({ query: 'attached' }))
-      .resolves.toMatchObject({ items: [{ header: { id: brandString<SessionId>('attached') } }] })
+      .resolves.toMatchObject({ items: [{ header: { id: SessionId('attached') } }] })
   })
 
   it('prefers a live owner that attaches during a persisted read and never mutates the store', async () => {
@@ -896,18 +1345,18 @@ describe('SQLite reconciliation and source lifecycle', () => {
   it('retries when one live owner replaces another during persistence observation', async () => {
     TestPersistence.reset()
     const ctx = await liveContext()
-    const first = ctx.sessions.prepare(brandString<SessionId>('first'), { seed: messageEvents('first needle') })
+    const first = ctx.sessions.prepare(SessionId('first'), { seed: messageEvents('first needle') })
     const detachFirst = ctx.sessions.enter(first)
     ctx.sessions.announce(first)
     await ctx.plugin(TestPersistence)
     TestPersistence.listEffect = () => {
       TestPersistence.listEffect = undefined
       detachFirst()
-      ctx.sessions.create(brandString<SessionId>('second'), { seed: messageEvents('second needle') })
+      ctx.sessions.create(SessionId('second'), { seed: messageEvents('second needle') })
     }
 
     await expect(ctx.sessionQuery.searchSessions({ query: 'second' }))
-      .resolves.toMatchObject({ items: [{ header: { id: brandString<SessionId>('second') } }] })
+      .resolves.toMatchObject({ items: [{ header: { id: SessionId('second') } }] })
   })
 
   it('uses the reconciled persistence binding through the query boundary', async () => {
@@ -1058,7 +1507,7 @@ describe('SQLite reconciliation and source lifecycle', () => {
     expect(lists).toBe(4)
   })
 
-  it('retries if the persistence binding changes while live sessions are observed', async () => {
+  it.each([1, 2])('retries if the persistence binding changes at live snapshot %s', async (snapshotList) => {
     const durable = header('live-boundary-retry')
     TestPersistence.reset([{ meta: durable, events: messageEvents('durable needle') }])
     const ctx = await liveContext()
@@ -1067,10 +1516,9 @@ describe('SQLite reconciliation and source lifecycle', () => {
       _persistenceBinding: { identity: symbol; service?: SessionPersistence }
     }
     const originalList = ctx.sessions.list.bind(ctx.sessions)
-    let bumped = false
+    let lists = 0
     const list = vi.spyOn(ctx.sessions, 'list').mockImplementation(() => {
-      if (!bumped) {
-        bumped = true
+      if (++lists === snapshotList) {
         internals._persistenceBinding = {
           ...internals._persistenceBinding,
           identity: Symbol(),
@@ -1098,8 +1546,8 @@ describe('SQLite reconciliation and source lifecycle', () => {
     await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
       .rejects.toThrow(expectCode('SESSION_QUERY_PERSISTENCE_FAILED'))
     TestPersistence.listOverride = () => [
-      { header: durable, revision: brandString<SessionPersistenceRevision>('duplicate:1') },
-      { header: durable, revision: brandString<SessionPersistenceRevision>('duplicate:2') },
+      { header: durable, revision: SessionPersistenceRevision('duplicate:1') },
+      { header: durable, revision: SessionPersistenceRevision('duplicate:2') },
     ]
     await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
       .rejects.toThrow(expectCode('SESSION_QUERY_PERSISTENCE_FAILED'))
@@ -1243,7 +1691,7 @@ describe('SQLite reconciliation and source lifecycle', () => {
     TestPersistence.failure = undefined
     await expect(ctx.sessionQuery.searchSessions({ query: 'needle' })).resolves.toMatchObject({ items: [{}] })
 
-    const live = ctx.sessions.create(brandString<SessionId>('live'), { seed: messageEvents('base') })
+    const live = ctx.sessions.create(SessionId('live'), { seed: messageEvents('base') })
     await ctx.sessionQuery.searchEvents({ sessionId: live.id, query: 'base' })
     const db = (ctx.sessionQuery as unknown as { _db: DatabaseSync })._db
     db.exec('PRAGMA query_only = ON')
@@ -1321,7 +1769,7 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
     stale.exec(`PRAGMA user_version = ${SESSION_QUERY_SQLITE_SCHEMA_VERSION - 1}`)
     stale.close()
     const staleCtx = await liveContext({ path: stalePath })
-    staleCtx.sessions.create(brandString<SessionId>('live'), { seed: messageEvents('needle') })
+    staleCtx.sessions.create(SessionId('live'), { seed: messageEvents('needle') })
     await staleCtx.sessionQuery.searchSessions({ query: 'needle' })
     await (staleCtx.sessionQuery as SqliteSessionQueryEngine).close()
     const rebuilt = new DatabaseSync(stalePath)
@@ -1695,7 +2143,7 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
     const db = (ctx.sessionQuery as unknown as { _db: DatabaseSync })._db
     expect(db.prepare('SELECT COUNT(*) AS count FROM persisted_sessions').get()).toEqual({ count: 0 })
     await expect(ctx.sessionQuery.searchSessions({ query: 'needle' }))
-      .resolves.toMatchObject({ items: [{ header: { id: brandString<SessionId>('uncommitted') } }] })
+      .resolves.toMatchObject({ items: [{ header: { id: SessionId('uncommitted') } }] })
   })
 
   it.each([
@@ -1818,7 +2266,7 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
       .resolves.toMatchObject({ items: [{ header: meta, persisted: true, live: false }] })
     await expect(ctx.sessionQuery.searchEvents({ sessionId: meta.id, query: 'JSONL needle' }))
       .resolves.toMatchObject({ session: meta, items: [{ sessionId: meta.id, seq: SessionSeq(0) }] })
-    await expect(ctx.sessionQuery.searchEvents({ sessionId: brandString<SessionId>('absent'), query: 'needle' }))
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: SessionId('absent'), query: 'needle' }))
       .rejects.toThrow(expectCode('SESSION_QUERY_SESSION_NOT_FOUND'))
     await search.dispose()
     const reader = await ctx.sessionPersistence.open(meta.id, 'read')

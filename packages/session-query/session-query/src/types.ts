@@ -276,6 +276,12 @@ export interface SessionSearchRequest {
   limit?: number
   /** Opaque cursor returned for the identical normalized request. */
   cursor?: SessionSearchCursor
+  /**
+   * Capture the complete ranking on the first page so later pages read the
+   * same results while the corpus keeps changing. Providers that cannot
+   * capture fall back to generation-bound cursors.
+   */
+  snapshot?: boolean
 }
 
 /** Within-session full-text search request. */
@@ -290,6 +296,12 @@ export interface SessionEventSearchRequest {
   limit?: number
   /** Opaque cursor returned for the identical normalized request. */
   cursor?: SessionSearchCursor
+  /**
+   * Capture the complete ranking on the first page so later pages read the
+   * same results while the session keeps appending. Providers that cannot
+   * capture fall back to generation-bound cursors.
+   */
+  snapshot?: boolean
 }
 
 /** One event full-text search hit with a bounded plain-text excerpt. */

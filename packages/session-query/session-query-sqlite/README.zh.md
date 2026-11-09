@@ -60,6 +60,8 @@ kind: "package-reference"
 
 排序是确定性的：实际 FTS5 高亮匹配 span 更多的在前，然后文档更短的在前，事件时间、会话 id 与 seq 打破平局。结果携带按 `snippetChars` 个 Unicode 码点截断的纯文本摘录，没有提供方专用数值分数。分页通过不透明 `SessionSearchCursor` 延续，游标绑定到规范化后的确切请求；相关语料库变化时游标变为陈旧（`SESSION_QUERY_STALE_CURSOR`），会话内游标可在不相关会话变化后延续，跨会话游标则不能。
 
+需要在其他会话持续写入时读取多页的调用方可以传 `snapshot: true`。第一页会捕获完整排序（最多 500 条命中）并返回快照游标，后续页读取该捕获，并发写入不再让余下搜索失效。捕获在 2 分钟内可继续读取，每个范围最多保留 8 份捕获与 32 MiB 命中；过期或被淘汰的捕获与语料库变化一样返回 `SESSION_QUERY_STALE_CURSOR`。超过上限的结果集回退到世代绑定游标，不会静默截断。
+
 `unicode61` tokenizer 匹配 token 与短语，而非任意子字符串：`AI` 不匹配 token `BRAID`。需要执行字面、空白灵活的字符串子串扫描时，使用带 `text` 子句的 `ctx.sessionQuery.filterEvents()`。
 
 ### 何时推迟或关闭搜索
@@ -68,7 +70,7 @@ kind: "package-reference"
 
 ### 失败与恢复
 
-带类型的 `SessionQueryError` 失败携带稳定代码：搜索配置为关闭时 `SESSION_QUERY_SEARCH_DISABLED`；索引无法打开或对账时 `SESSION_QUERY_INDEX_FAILED`；搜索目标不存在时 `SESSION_QUERY_SESSION_NOT_FOUND`；语料库在分页之间变化时 `SESSION_QUERY_STALE_CURSOR`——请重试完整的搜索调用；游标不属于该请求时 `SESSION_QUERY_INVALID_CURSOR`。取消在同步 SQLite 调用之间被尊重；已在 JavaScript 线程上执行的语句无法被中断。
+带类型的 `SessionQueryError` 失败携带稳定代码：搜索配置为关闭时 `SESSION_QUERY_SEARCH_DISABLED`；索引无法打开或对账时 `SESSION_QUERY_INDEX_FAILED`；搜索目标不存在时 `SESSION_QUERY_SESSION_NOT_FOUND`；语料库在分页之间变化或捕获过期时 `SESSION_QUERY_STALE_CURSOR`——请重试完整的搜索调用；游标不属于该请求时 `SESSION_QUERY_INVALID_CURSOR`。取消在同步 SQLite 调用之间被尊重；已在 JavaScript 线程上执行的语句无法被中断。
 
 -----
 
@@ -87,6 +89,7 @@ kind: "package-reference"
 - **派生索引，绝不动源存储。** FTS 行存放在专用可丢弃数据库中；这里的代码从不打开 session-persistence 数据库。
 - **实时优先的观察。** 一个串行化状态机比较持久化快照修订，只通过短生命周期读取句柄读取新增或已更改日志，并在一个事务中对账，因此搜索反映最新的稳定状态。
 - **世代绑定的游标。** 每次语料库变化都会递增世代；游标携带其创建时的世代，宁可陈旧失败也不返回偏移后的页面。
+- **可选的捕获分页。** 传入 `snapshot: true` 的搜索只捕获一次排序，读取多页的调用方不会被其他地方写入打断；捕获受时限、数量与字节数约束，超大的结果集保留世代绑定行为。
 - **字面短语即数据。** 调用方查询文本被引成一个 FTS5 短语，查询语法保持惰性；保留高亮标记在索引前从文档中剥离。
 
 设计历史记录在 [SQLite FTS5 会话搜索笔记](../../../.agents/notes/archived/feature/2026-07-10-sqlite-session-query-provider.md)与[统一服务决策](../../../.agents/notes/archived/architecture/2026-07-23-unified-session-query-service.md)中。
@@ -143,6 +146,7 @@ kind: "package-reference"
 - **无调用方授权**——这是上下文范围内的可信服务；模型工具或 UI 必须强制执行自己的访问策略。
 - **同步查询执行**——`DatabaseSync` 在 MATCH 执行期间会阻塞 JavaScript 线程，且无法中断已运行的语句。
 - **Token 召回，而非任意子字符串**——`unicode61` tokenizer 不会匹配更大 token 中的子字符串；对字面扫描使用 `filterEvents()`。
+- **捕获分页是进程内且有界的**——捕获不跨进程或重启共享，2 分钟后过期，最多保存 500 条命中；更宽的结果集仍使用世代绑定游标。
 - **单一所有者的派生索引**——每个索引路径必须仅归一个进程中的一个服务所有；不支持外部写入者与多进程共享。
 
 <a id="dev-note"></a>
