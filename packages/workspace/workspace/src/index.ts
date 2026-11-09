@@ -200,6 +200,7 @@ export class WorkspaceRegistry extends Service {
   private readonly host: WorkspaceEntityHost = {
     table: () => this.requireTable(),
     candidateMatches: (id, path) => this.sessionPaths.get(id) === path || this.missingSessionPaths.has(id),
+    candidateUnlisted: id => !this.headers.has(id),
     readSessionHeader: id => this.readSessionHeader(id),
     sessionHeader: (id) => {
       const header = this.headers.get(id)
@@ -877,11 +878,17 @@ export class WorkspaceRegistry extends Service {
       const record = this.requireTable().get(entity.id) as WorkspaceRecord
       for (const sessionId of record.sessionIds) {
         if (this.host.candidateMatches(sessionId, record.path)) continue
+        if (!this.headers.has(sessionId)) {
+          // The account outlives an absent header: a store the process is not
+          // listing (or has not listed yet) must not erase durable membership.
+          this.ctx.logger.debug(
+            `workspace '${entity.id}' keeps session '${sessionId}' accounted without a listed header`,
+          )
+          continue
+        }
         const path = this.sessionPaths.get(sessionId)
         const reason = this.invalidSessionPaths.get(sessionId)
-          ?? (this.headers.has(sessionId)
-            ? `canonical cwd '${path}' differs from workspace path '${record.path}'`
-            : 'session header is missing')
+          ?? `canonical cwd '${path}' differs from workspace path '${record.path}'`
         this.ctx.logger.warn(
           `workspace '${entity.id}' filtered session '${sessionId}' from membership: ${reason}`,
         )

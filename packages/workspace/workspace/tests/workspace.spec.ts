@@ -886,7 +886,7 @@ describe('header-validated membership projection', () => {
     expect(storedRecord(pool, id).sessionIds).toEqual([])
   })
 
-  it('filters absent headers and invalid cwd facts while retaining only missing-directory candidates', async () => {
+  it('filters invalid cwd facts while retaining missing-directory and unlisted accounts', async () => {
     const dir = await makeDir('candidate-validation')
     const elsewhere = await makeDir('candidate-elsewhere')
     const missing = join(base, 'candidate-missing')
@@ -909,7 +909,22 @@ describe('header-validated membership projection', () => {
     expect(workspace.sessionIds).toEqual(['missing-dir'])
     expect(workspace.getSessionHeaders()).toEqual([header('missing-dir', missing)])
     await workspace.setTitle('Validated')
-    expect(storedRecord(pool, id).sessionIds).toEqual(['missing-dir'])
+    expect(storedRecord(pool, id).sessionIds).toEqual(['missing-dir', 'no-header'])
+  })
+
+  it('keeps an unlisted candidate accounted and lists it again once the store returns its header', async () => {
+    const dir = await makeDir('unlisted-return')
+    const id = WorkspaceId('unlisted-return')
+    const pool = storedPool([[id, record(dir, ['unlisted'])]], { initialized: true, workspaceIds: [id] })
+    const result = await harness({ pool, sessions: [] })
+    onTestFinished(() => result.ctx.fiber.dispose())
+    const workspace = result.registry.get(id)!
+    expect(workspace.sessionIds).toEqual([])
+    await workspace.setTitle('Retained')
+    expect(storedRecord(pool, id).sessionIds).toEqual(['unlisted'])
+    result.setSessions([header('unlisted', dir)])
+    await result.registry.pinSession(SessionId('unlisted'))
+    expect(workspace.sessionIds).toEqual(['unlisted'])
   })
 
   it('can detach and reattach a missing-directory candidate after the directory is restored', async () => {
@@ -951,7 +966,7 @@ describe('header-validated membership projection', () => {
     expect(storedRecord(pool, id).sessionIds).toEqual(['good', 'mismatch', 'missing'])
 
     await workspace.setTitle('pruned')
-    expect(storedRecord(pool, id).sessionIds).toEqual(['good'])
+    expect(storedRecord(pool, id).sessionIds).toEqual(['good', 'missing'])
     expect(workspace.sessionIds).not.toContain('cwd-only')
   })
 

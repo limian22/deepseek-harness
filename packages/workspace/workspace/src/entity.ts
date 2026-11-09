@@ -49,6 +49,16 @@ export interface WorkspaceEntityHost {
   candidateMatches(id: SessionId, path: string): boolean
 
   /**
+   * Whether the current header index holds no entry for an accounted session.
+   * The active session store may not list a session that still exists — a
+   * switched store root, or a listing that has not caught up — so absence is
+   * not evidence that its recorded cwd disagrees with the Workspace.
+   * @param id - Session already present in this workspace's candidate account.
+   * @returns whether the session is absent from the current index.
+   */
+  candidateUnlisted(id: SessionId): boolean
+
+  /**
    * Read one stored session header for attach validation.
    * @param id - The session whose header to read.
    * @returns the header; rejects when session persistence is absent or holds
@@ -203,9 +213,13 @@ export class WorkspaceEntity implements Workspace {
 
   /**
    * The single write path: run `fn` on the domain write chain via
-   * `table.update`, stamping `updatedAt` and pruning candidates that no
-   * longer pass the candidate membership check, then swap the
-   * snapshot.
+   * `table.update`, stamping `updatedAt` and pruning candidates whose indexed
+   * header contradicts the Workspace path, then swap the snapshot.
+   *
+   * A candidate the current header index does not list keeps its durable
+   * account: the session may exist in a store this process is not listing
+   * yet, so absence must not erase membership. The `sessionIds` projection
+   * still hides it until a header resolves.
    *
    * `fn` sees the value current at its chain slot, so membership decisions
    * (attach/detach idempotence) are race-free against queued writes; a fn
@@ -219,7 +233,7 @@ export class WorkspaceEntity implements Workspace {
       next = await this.host.table().update(this.id, (current) => {
         const changed = fn(current)
         const sessionIds = changed.sessionIds.filter(
-          id => this.host.candidateMatches(id, changed.path),
+          id => this.host.candidateMatches(id, changed.path) || this.host.candidateUnlisted(id),
         )
         if (changed === current && sessionIds.length === current.sessionIds.length) {
           throw unchangedSentinel
