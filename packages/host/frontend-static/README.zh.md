@@ -45,7 +45,7 @@ kind: "package-reference"
 
 回退的同步 `auth` 选择器对根路径与配置 index 请求要求 `required`，其余文件声明 `anonymous`。WebServer 在文件服务前通过 Connection 集中准入；匿名资源免凭据验证，但仍执行 Connection 来源策略。resource 直接接收准入 Peer 并供 index 渲染闭包使用，不重复认证。Token 中间件在路由前处理根路径 Cookie 交换。读取 index 内容后，渲染检查请求与 Peer 均仍存活。
 
-除 index 外，所有提供的文件都由浏览器重新验证。这类响应携带 `cache-control: no-cache` 和由文件内容 SHA-1 生成的弱 ETag，因此文件内容变化后即使名字不变也会得到新的 ETag；`If-None-Match` 等于当前 ETag 的请求得到空的 304。渲染出的 index 不带缓存头。
+`/assets/` 或 `/assets/langs/` 下不带查询参数、文件名以八字符 Vite hash 和 `.js` 或 `.css` 结尾的脚本与样式携带 `cache-control: private, max-age=31536000, immutable`；生成方必须在文件字节变化时更换 URL。其他文件以及非规范或带查询参数的资源请求携带 `no-cache`，包括 source map、静态 HTML、manifest 和图标。所有静态文件都携带弱 SHA-1 ETag，匹配 `If-None-Match` 时返回带相同缓存策略的空 304。渲染出的 index 携带 `no-store`，因为其启动数据属于准入的 Peer。代理必须为符合条件的静态资源保留私有缓存，但不得允许共享缓存或放宽认证。
 
 ### 可观察的失败
 

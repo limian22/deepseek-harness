@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-11-09-static-cache-tuning.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/plans/2026-11-09-static-cache-tuning.md
+/static-resource-cache-tuning-implementation-plan:
+  en: e9b73c18d56ada0d
+  zh: 916e2a29933cc49c
+/static-resource-cache-tuning-implementation-plan/scope-and-measurement:
+  en: 1b182ffe8c5780bf
+  zh: db433fa499e169f6
+/static-resource-cache-tuning-implementation-plan/task-1-frontend-static-response-policy:
+  en: 57b5190bdef5a8a2
+  zh: 1d87cb5f9cec0860
+/static-resource-cache-tuning-implementation-plan/task-2-offline-proxy-candidate:
+  en: 6ef6551b985e1201
+  zh: 72391a8bb7195ae1
+/static-resource-cache-tuning-implementation-plan/task-3-review-and-handoff:
+  en: 81c60bc4d2453281
+  zh: 701611cbe73b621e
