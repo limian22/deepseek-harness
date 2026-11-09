@@ -3176,7 +3176,7 @@ export type JsonlCompression = 'zstd' | 'none'
 ## `@deepseek-ai/dsh-session-projection-cache`
 
 - `inject`: `storageDomain` · `sessionProjections` · `sessions`
-- `source`: [`packages/session/session-projection-cache/src/index.ts:76`](../packages/session/session-projection-cache/src/index.ts)
+- `source`: [`packages/session/session-projection-cache/src/index.ts:93`](../packages/session/session-projection-cache/src/index.ts)
 
 ```ts config-catalog
 /**
@@ -3202,7 +3202,7 @@ export interface Config {
 
 - `inject`: `sessions`
 - `refs`: [`SessionQueryConfig`](../packages/session-query/session-query/src/index.ts)
-- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:92`](../packages/session-query/session-query-sqlite/src/index.ts)
+- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:104`](../packages/session-query/session-query-sqlite/src/index.ts)
 
 ```ts config-catalog
 /** Combined session-query configuration backed by SQLite full-text search. */
@@ -3655,7 +3655,7 @@ export type JournalMode = 'wal' | 'delete' | 'truncate' | 'persist'
 
 - `inject`: `workingDirectory` · `sessionProjections`
 - `refs`: `Volatile` (`@deepseek-ai/cordis`)
-- `source`: [`packages/subagent/subagent/src/index.ts:186`](../packages/subagent/subagent/src/index.ts)
+- `source`: [`packages/subagent/subagent/src/index.ts:204`](../packages/subagent/subagent/src/index.ts)
 
 ```ts config-catalog
 /** Host configuration for continuable subagent capacity. */

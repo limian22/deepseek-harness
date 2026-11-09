@@ -965,18 +965,19 @@ export type SessionEvent<T extends SessionEventType = SessionEventType> = {
 
 ```ts persistence-catalog
 /**
- * Records this Session’s authorized child provider/model routes. Appended
- * before the first model request; absence restricts explicit selection
- * to the current parent route. Log-only: it carries
- * no `surfaceOp` and never enters model history.
+ * Records this Session's authorized child provider/model routes. Appended
+ * before the first model request; absence keeps the existing parent-route
+ * fallback. When present, both explicit selection and an omitted route
+ * must resolve inside this list. Log-only: it carries no `surfaceOp` and
+ * never enters model history.
  */
 'subagent/model-selection-policy': {
-  /** Exact routes this Session may select explicitly for a child. */
+  /** Exact routes this Session authorizes for child LLM selection, explicit or implicit. */
   allowedModels: AllowedModelRoute[]
 }
 ```
 
-来源：[`packages/subagent/tool-subagent/src/model-selection-state.ts:17`](../packages/subagent/tool-subagent/src/model-selection-state.ts)
+来源：[`packages/subagent/subagent/src/model-selection.ts:123`](../packages/subagent/subagent/src/model-selection.ts)
 
 ### `system/*`
 
@@ -4737,7 +4738,7 @@ SHA-256: `ae097fc8586099e91bcda99cf9de95a53b2f16ced6031b4febe20e08888f284a`
 
 <a id="persistence-type-packagessessionsession-titlesrctypestssessiontitlemodelidentity"></a>
 
-<a id="persistence-type-packagessubagenttool-subagentsrcmodel-selectiontsallowedmodelroute"></a>
+<a id="persistence-type-packagessubagentsubagentsrcmodel-selectiontsallowedmodelroute"></a>
 
 <a id="persistence-type-sessiontitlemodelidentity"></a>
 
@@ -4745,7 +4746,7 @@ SHA-256: `ae097fc8586099e91bcda99cf9de95a53b2f16ced6031b4febe20e08888f284a`
 
 SHA-256: `07e1a58c58b593f507b8e7f25723bb0aa42baae6e00f5ecfddf28cb1e64d3235`
 
-来源：[`packages/session/session-title/src/types.ts:20`](../packages/session/session-title/src/types.ts) · [`packages/subagent/tool-subagent/src/model-selection.ts:9`](../packages/subagent/tool-subagent/src/model-selection.ts)
+来源：[`packages/session/session-title/src/types.ts:20`](../packages/session/session-title/src/types.ts) · [`packages/subagent/subagent/src/model-selection.ts:15`](../packages/subagent/subagent/src/model-selection.ts)
 
 | 属性 | 存在性 | 类型 |
 |---|---|---|
@@ -5904,7 +5905,7 @@ SHA-256: `6e52dd55a1d48954ed5464ec46fe34d9eb65f709baabc9561e7a279910b0c406`
 
 SHA-256: `0d47a8f3d847243c4488e755ad4cab7a04ac5d4621b9c81865524cf3f4d8536f`
 
-来源：[`packages/subagent/tool-subagent/src/model-selection-state.ts:17`](../packages/subagent/tool-subagent/src/model-selection-state.ts)
+来源：[`packages/subagent/subagent/src/model-selection.ts:123`](../packages/subagent/subagent/src/model-selection.ts)
 
 | 属性 | 存在性 | 类型 |
 |---|---|---|

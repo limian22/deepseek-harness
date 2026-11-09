@@ -1120,6 +1120,7 @@ export const TYPE_LINK_EXEMPTIONS: Readonly<Record<string, string>> = {
   RecommendationDetails: 'packages/extensions/plugin-recommendations/README.md',
   DeepseekChatImportLimits: 'upload limits returned to the browser are owned by packages/experimental/deepseek-chat-import/src/types.ts',
   ProductEvent: 'Desktop event fields are owned by packages/client/product-analytics/README.md and src/events.ts',
+  ColdSnapshotDurableOptions: 'durable cold-checkpoint guards are owned by packages/session/session-projection-cache/src/index.ts',
   ConnectionFetchHandler: 'shared Fetch dispatch is owned by packages/client/connection/src/rpc.ts',
   ConnectionTrustRequest: 'transport authentication input is owned by packages/client/connection/src/rpc.ts',
   PeerAdmission: 'Peer admission outcome is owned by packages/client/connection/src/rpc.ts',
