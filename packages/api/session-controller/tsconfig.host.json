@@ -24,6 +24,7 @@
     "src/state/listener.ts",
     "src/web/controller.ts",
     "src/list.ts",
+    "src/title-backfill.ts",
     "src/media-references.ts",
     "src/archived-session-gate.ts",
     "src/skill-catalog.ts",

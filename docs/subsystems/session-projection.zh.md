@@ -323,9 +323,47 @@ async write(session: Session): Promise<void>
  * @returns the projection cut at the log end.
  */
 coldSnapshot( meta: SessionHeader, inheritedEventCount: SessionLogOffset, events: readonly SessionEvent[], ): ProjectionSnapshot
+
+/**
+ * Durably checkpoint one cold-read prefix while refusing to overtake a
+ * newer writer.
+ *
+ * The caller must supply a prefix that is contiguous from seq `0` and ends
+ * exactly at {@link durableThroughSeq}; the method therefore cannot write a
+ * row beyond the caller-declared durable watermark. The caller owns the
+ * proof that the prefix is durable (for example a stored read whose artifact
+ * revision held still); this face only enforces the structural watermark and
+ * the cache's own write-order guards:
+ *
+ * - `guard` is rechecked after the fold (a live appender may have appeared);
+ * - the session must not be live in the store;
+ * - no other checkpoint may have been put since the fold began (per-session
+ *   write epoch), so a queued live checkpoint always wins;
+ * - an identity-matching record already holding a newer row is never
+ *   replaced by an older cut.
+ *
+ * Only the backfill's own keys (title and list metadata) are folded, so an
+ * unrelated projection never pays a whole-log fold for a title recovery.
+ * The refreshed rows are merged over the identity-matching record's other
+ * rows, which are preserved verbatim: a recovery never drops projections it
+ * did not fold, and in particular never blanks the list metadata's
+ * recency/blankness row. A record from another lifecycle is replaced (its
+ * rows could not seed this fold).
+ *
+ * Unlike {@link coldSnapshot}, the write is awaited and failures reject;
+ * background callers contain them. `undefined` means a guard refused the
+ * replacement and nothing was written.
+ * @param meta - the stored session header (identity witness).
+ * @param inheritedEventCount - exact inherited prefix length for identity.
+ * @param durableThroughSeq - inclusive last seq the caller proved durable.
+ * @param events - stored events from seq 0 through `durableThroughSeq`.
+ * @param options - optional pre-put recheck.
+ * @returns the title/list-metadata cut after durability, or `undefined` when a guard refused it.
+ */
+async coldSnapshotDurable( meta: SessionHeader, inheritedEventCount: SessionLogOffset, durableThroughSeq: SessionSeqCursor, events: readonly SessionEvent[], options: ColdSnapshotDurableOptions = {}, ): Promise<ProjectionSnapshot | undefined>
 ```
 
-Types: [Session](session.zh.md) · [SessionEvent](session.zh.md) · [SessionHeader](persistence.zh.md) · [SessionLogOffset](session.zh.md)
+Types: [Session](session.zh.md) · [SessionEvent](session.zh.md) · [SessionHeader](persistence.zh.md) · [SessionLogOffset](session.zh.md) · [SessionSeqCursor](session.zh.md)
 
 Source: [`packages/session/session-projection-cache/src/index.ts`](../../packages/session/session-projection-cache/src/index.ts)
 
@@ -466,18 +504,26 @@ viewCheckpoint( checkpoint: ProjectionCheckpoint, keys?: ProjectionKeySelection,
  * log, so a discarded row with `baseSeq > 0` throws (the caller re-reads
  * from seq 0, e.g. after a crash-repair truncation shrank the log below
  * a row's watermark).
+ *
+ * A key selection narrows the fold: only live units whose key is selected
+ * are validated, folded, viewed, and returned as refreshed rows. An
+ * unselected unit therefore costs nothing, and its checkpoint row is left
+ * for the caller to keep — the refreshed checkpoint covers the selected
+ * keys only, so a write-back must merge it with the rows it preserves.
+ * Omitted keys fold every live unit, the original contract.
  * @param checkpoint - persisted rows for one session (possibly stale or empty).
  * @param events - the stored events with `seq >= baseSeq`, in seq order.
  * @param baseSeq - the seq `events` starts at (its first event's seq when non-empty).
  * @param header - immutable metadata for the Session being restored.
  * @param inheritedEventCount - exact fork-inherited prefix length supplied to unit initialization.
+ * @param keys - optional keys to fold; omitted folds every live unit.
  * @returns the snapshot cut at the supplied log end (`asOfSeq` is the last
  *   supplied event's seq, `baseSeq - 1` for an empty tail) plus the
  *   refreshed checkpoint rows at that cut, ready for a durable write-back.
- *   The rows cover live units only: a released unit has no cell for a log
- *   folded without a live `Session`, so a write-back of them omits it.
+ *   The rows cover the selected live units only: omitted keys and released
+ *   units contribute no row.
  */
-restore( checkpoint: ProjectionCheckpoint, events: readonly SessionEvent[], baseSeq: SessionLogOffset, header: SessionHeader, inheritedEventCount: SessionLogOffset, ): { snapshot: ProjectionSnapshot; checkpoint: ProjectionCheckpoint }
+restore( checkpoint: ProjectionCheckpoint, events: readonly SessionEvent[], baseSeq: SessionLogOffset, header: SessionHeader, inheritedEventCount: SessionLogOffset, keys?: ProjectionKeySelection, ): { snapshot: ProjectionSnapshot; checkpoint: ProjectionCheckpoint }
 
 /**
  * Restore an exact cut and install its states on the supplied prepared Session.
