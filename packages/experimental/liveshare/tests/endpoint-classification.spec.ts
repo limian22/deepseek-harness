@@ -11,10 +11,6 @@ import { VIEWER_ENDPOINT_CLASSES, assertSameViewerActions } from '../src/endpoin
 const CLASSIFIED = Object.keys(VIEWER_ENDPOINT_CLASSES)
 
 describe('viewer endpoint classification', () => {
-  it('keeps development source preparation restricted to the owner', () => {
-    expect(VIEWER_ENDPOINT_CLASSES['pluginMarket/prepareDevelopment']).toBe('owner-only')
-  })
-
   it('reports the endpoint a classification is missing', () => {
     const incomplete = Object.fromEntries(
       Object.entries(VIEWER_ENDPOINT_CLASSES).filter(([endpoint]) => endpoint !== 'session/prompt'),

@@ -178,7 +178,6 @@ export const VIEWER_ENDPOINT_CLASSES = {
   'pluginManager/updateBundle': 'owner-only', // owner plugin management
   'pluginManager/waitForInstall': 'owner-only', // owner plugin management
   'pluginMarket/listIndexes': 'owner-only', // owner plugin market
-  'pluginMarket/prepareDevelopment': 'owner-only', // owner creates persistent development checkouts
   'pluginMarket/readEntryDetail': 'owner-only', // owner plugin market
   'pluginMarket/search': 'owner-only', // owner plugin market
   'pluginMarket/setIndexes': 'owner-only', // owner plugin market
