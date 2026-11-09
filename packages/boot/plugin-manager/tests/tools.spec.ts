@@ -61,6 +61,37 @@ it.each(['read-only', 'workspace-write'] as const)('denies every management acti
   for (const method of Object.values(manager)) expect(method).not.toHaveBeenCalled()
 })
 
+it.each(['set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'set_version_exemption'])('refuses IM %s before approval or manager reconciliation', async (action) => {
+  const { ctx, manager, call } = await fixture('workspace-write', 'ask')
+  const prompted = vi.fn(async () => 'allowed-once' as const)
+  ctx.on('approval/request', prompted)
+  const id = SessionId('dsh-im-session-self-reload')
+  const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })
+  const agent = { session } as unknown as Agent
+  const result = await call({ action, target: 'unrelated@1.0.0', enabled: true, runtimeVersion: 'test' }, agent)
+  expect(result.isError).toBe(true)
+  expect(JSON.stringify(result.content)).toContain('self-unload deadlocks')
+  expect(prompted).not.toHaveBeenCalled()
+  for (const method of Object.values(manager)) expect(method).not.toHaveBeenCalled()
+})
+
+it.each(['list_plugins', 'list_bundles', 'list_version_exemptions'])('keeps IM %s available under existing permissions', async (action) => {
+  const { call } = await fixture()
+  const id = SessionId('dsh-im-session-read-only-management')
+  const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })
+  expect((await call({ action }, { session } as unknown as Agent)).isError).toBe(false)
+})
+
+it('refuses a child whose IM parent is not attached', async () => {
+  const { call, manager } = await fixture()
+  const id = SessionId('self-reload-child')
+  const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false,
+    parentSession: SessionId('dsh-im-session-unloaded-parent'), origin: 'subagent' })
+  const result = await call({ action: 'set_bundle', target: 'unrelated', enabled: true }, { session } as unknown as Agent)
+  expect(result.isError).toBe(true)
+  expect(manager.setBundleEnabled).not.toHaveBeenCalled()
+})
+
 it('preserves selected bundle load errors in the agent list result', async () => {
   const { manager, call } = await fixture()
   const bundles = [{
