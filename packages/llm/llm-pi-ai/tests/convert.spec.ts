@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment'
+import { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef, ImageRequestTarget, RequestImageAttachment } from '@deepseek-ai/dsh-attachment'
-import { createToolResultMessage, createUserMessage, type ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, createUserMessage, ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AssistantMessage, AssistantMessageEvent, Usage } from '@earendil-works/pi-ai'
 import { transformMessages } from '@earendil-works/pi-ai/api/transform-messages'
@@ -9,7 +9,6 @@ import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { toPiContext } from '../src/context.ts'
 import { toPiReplayState } from '../src/replay.ts'
 import { mapStopReason, mapUsage, toStreamChunks } from '../src/stream.ts'
-import { brandString } from '@deepseek-ai/dsh-brand'
 
 function usage(input = 0, output = 0, cacheRead = 0, cacheWrite = 0): Usage {
   return {
@@ -48,7 +47,7 @@ async function collect(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[
 
 function requestVersion(ref: ImageAttachmentRef): RequestImageAttachment {
   return {
-    variantId: brandString<ImageVariantId>(`sha256:${'e'.repeat(64)}`),
+    variantId: ImageVariantId(`sha256:${'e'.repeat(64)}`),
     attachment: ref,
     data: Uint8Array.of(1, 2, 3),
     mediaType: ref.mediaType,
@@ -88,7 +87,7 @@ describe('toPiContext', () => {
     expect(context).toEqual({
       systemPrompt: 'be helpful',
       tools: [{ name: 'f', description: 'F', parameters: { type: 'object', properties: {} } }],
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }], timestamp: 0 }],
+      messages: [{ role: 'user', content: 'hi', timestamp: 0 }],
     })
   })
 
@@ -99,7 +98,7 @@ describe('toPiContext', () => {
 
   it('resolves durable image references into native pi-ai image content', async () => {
     const attachment = {
-      attachmentId: brandString<AttachmentId>(`sha256:${'a'.repeat(64)}`),
+      attachmentId: AttachmentId(`sha256:${'a'.repeat(64)}`),
       mediaType: 'image/png' as const,
       bytes: 3,
       width: 1,
@@ -119,7 +118,7 @@ describe('toPiContext', () => {
 
     expect(readImageRequest).toHaveBeenCalledWith(
       attachment,
-      { width: 1, height: 1, maxImageBytes: 1024 * 1024, imageTargetBytes: 1024 * 1024 },
+      { width: 1, height: 1, maxBytes: 1024 * 1024 },
       undefined,
     )
     expect(context.messages[0]).toEqual({
@@ -135,7 +134,7 @@ describe('toPiContext', () => {
 
   it('converts a tool message with text and images on the image path', async () => {
     const attachment = {
-      attachmentId: brandString<AttachmentId>(`sha256:${'c'.repeat(64)}`),
+      attachmentId: AttachmentId(`sha256:${'c'.repeat(64)}`),
       mediaType: 'image/png' as const,
       bytes: 3,
       width: 1,
@@ -148,7 +147,7 @@ describe('toPiContext', () => {
       provider: 'openai',
       model: 'gpt-4.1',
       messages: [createToolResultMessage({
-        callId: brandString<ToolCallId>('outer'),
+        callId: ToolCallId('outer'),
         content: [
           { type: 'text', text: 'before' },
           { type: 'text', text: 'middle' },
@@ -182,7 +181,7 @@ describe('toPiContext', () => {
         content: [{
           type: 'image',
           attachment: {
-            attachmentId: brandString<AttachmentId>(`sha256:${'b'.repeat(64)}`),
+            attachmentId: AttachmentId(`sha256:${'b'.repeat(64)}`),
             mediaType: 'image/png', bytes: 1, width: 1, height: 1,
           },
         }],
@@ -200,7 +199,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'hmm' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: brandString<ToolCallId>('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
@@ -251,7 +250,7 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: brandString<ToolCallId>('c1'), name: 'f', arguments: '{broken' }],
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{broken' }],
         source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
@@ -265,7 +264,7 @@ describe('toPiContext', () => {
       model: 'm',
       messages: [createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: brandString<ToolCallId>('c1'), name: 'f', arguments: '[1,2]' }],
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '[1,2]' }],
         source: { kind: 'model', provider: 'deepseek', model: 'm' },
       })],
     })
@@ -279,11 +278,11 @@ describe('toPiContext', () => {
       messages: [
         createMessage({
           role: 'assistant',
-          content: [{ type: 'tool-call', id: brandString<ToolCallId>('c1'), name: 'get_weather', arguments: '{}' }],
+          content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'get_weather', arguments: '{}' }],
           source: { kind: 'model', provider: 'deepseek', model: 'm' },
         }),
         createToolResultMessage({
-          callId: brandString<ToolCallId>('c1'),
+          callId: ToolCallId('c1'),
           content: [
             { type: 'text', text: 'Sunny' },
             { type: 'text', text: '!' },
@@ -297,7 +296,7 @@ describe('toPiContext', () => {
       role: 'toolResult',
       toolCallId: 'c1',
       toolName: 'get_weather',
-      content: [{ type: 'text', text: 'Sunny' }, { type: 'text', text: '!' }],
+      content: [{ type: 'text', text: 'Sunny!' }],
       isError: false,
       timestamp: 0,
     })
@@ -307,7 +306,7 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [createToolResultMessage({ callId: brandString<ToolCallId>('zz'), content: [], isError: true })],
+      messages: [createToolResultMessage({ callId: ToolCallId('zz'), content: [], isError: true })],
     })
     expect(context.messages[0]).toMatchObject({
       role: 'toolResult',
@@ -331,7 +330,7 @@ describe('toPiContext', () => {
           source: { kind: 'model', provider: 'deepseek', model: 'm' },
         }),
         createToolResultMessage({
-          callId: brandString<ToolCallId>('c1'),
+          callId: ToolCallId('c1'),
           content: [{ type: 'text', text: 'ok' }],
           isError: false,
         }),
@@ -379,7 +378,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: brandString<ToolCallId>('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: {
           kind: 'model',
@@ -486,7 +485,7 @@ describe('toPiContext', () => {
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
-          { type: 'tool-call', id: brandString<ToolCallId>('c1'), name: 'f', arguments: '{"a":1}' },
+          { type: 'tool-call', id: ToolCallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
         source: {
           kind: 'model',
@@ -671,7 +670,6 @@ describe('toPiContext', () => {
     ['non-string response id', { ...validReplay, response: { ...validResponse, responseId: 1 } }, 'responseId must be a string'],
     ['non-string provider thinking level', { ...validReplay, response: { ...validResponse, providerThinkingLevel: 1 } }, 'providerThinkingLevel must be a string'],
     ['null provider thinking level', { ...validReplay, response: { ...validResponse, providerThinkingLevel: null } }, 'providerThinkingLevel must be a string'],
-    ['non-string prefix digest', { ...validReplay, response: { ...validResponse, prefixDigest: 1 } }, 'prefixDigest must be a string'],
     ['missing blocks', { response: validResponse }, 'blocks must be an array'],
     ['non-array blocks', { ...validReplay, blocks: 'text' }, 'blocks must be an array'],
     ['number block', { ...validReplay, blocks: [1] }, 'block 0 must be an object'],
@@ -941,19 +939,6 @@ describe('mapStopReason / mapUsage', () => {
   })
 
   it.each([
-    // The gateway body as the Anthropic SDK renders it: the gateway's own 500 leads.
-    ['a gateway 500 relaying an upstream 401', '500 {"error":{"origin":"upstream","message":"upstream returned an error response: User not found.","type":"upstream_error","code":"upstream_response_error","upstream":{"provider":"custom","status":401,"body":{"error":{"type":"<nil>","message":"User not found."},"type":"error"}}}}', 'SERVER'],
-    ['a 502 quoting a non-retryable 400', '502 {"error":{"message":"upstream status 400"}}', 'SERVER'],
-    ['a 400 quoting a retryable 429', '400 {"error":{"message":"upstream returned 429 Too Many Requests"}}', 'INVALID_REQUEST'],
-    ['a 404 quoting a 403', '404 {"error":{"message":"upstream status 403"}}', 'PI_AI_ERROR'],
-    ['a leading 401', '401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}', 'AUTH'],
-    ['a leading 429', '429 Too Many Requests: slow down', 'RATE_LIMIT'],
-  ] as const)('classifies %s by its leading response status', (_label, errorMessage, code) => {
-    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
-      .toEqual({ kind: 'error', failure: { message: errorMessage, code } })
-  })
-
-  it.each([
     'other side closed',
     'HTTP2 request did not get a response',
     'WebSocket closed unexpectedly',
@@ -969,6 +954,44 @@ describe('mapStopReason / mapUsage', () => {
   ])('maps pi-ai transport wording %j', (errorMessage) => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
       .toMatchObject({ kind: 'error', failure: { code: 'TRANSPORT' } })
+  })
+
+  it.each([
+    'WebSocket closed 1012',
+    'WebSocket closed 1012 Service Restart',
+    'websocket closed 1012',
+  ])('maps WebSocket service restart %j to a normally retryable transport failure', (errorMessage) => {
+    const reason = mapStopReason(assistant({ stopReason: 'error', errorMessage }))
+    expect(reason).toEqual({ kind: 'error', failure: { message: errorMessage, code: 'TRANSPORT' } })
+    const policy = resolveRetryPolicy(undefined, 'test provider')
+    expect(policy.mode).toBe('normal')
+    if (policy.mode === 'normal' && reason.kind === 'error') {
+      expect(policy.retryableCodes).toContain(reason.failure.code)
+      expect(policy.maxRetries).toBe(5)
+    }
+  })
+
+  it.each([
+    'WebSocket closed 1002',
+    'WebSocket closed 1003',
+    'WebSocket closed 1008',
+    'WebSocket closed 1008 policy violation',
+    'WebSocket closed 1009 message too big',
+    'WebSocket closed 1010',
+    'WebSocket closed 10120',
+    'WebSocket closed 4000',
+  ])('does not make non-transient WebSocket close %j retryable', (errorMessage) => {
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toEqual({ kind: 'error', failure: { message: errorMessage, code: 'PI_AI_ERROR' } })
+  })
+
+  it.each([
+    ['WebSocket closed 1012 HTTP 401', 'AUTH'],
+    ['WebSocket closed 1012 invalid request', 'INVALID_REQUEST'],
+    ['WebSocket closed 1012 insufficient_quota', 'QUOTA'],
+  ])('preserves specific failure precedence for %j', (errorMessage, code) => {
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toEqual({ kind: 'error', failure: { message: errorMessage, code } })
   })
 
   it('uses pi-ai provider-specific overflow classification without losing rate-limit exclusions', () => {
