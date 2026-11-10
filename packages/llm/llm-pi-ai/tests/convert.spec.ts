@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { AttachmentId, ImageVariantId } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef, ImageRequestTarget, RequestImageAttachment } from '@deepseek-ai/dsh-attachment'
-import { createToolResultMessage, createUserMessage, type ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, createUserMessage, type ToolCallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, createMessage, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AssistantMessage, AssistantMessageEvent, Usage } from '@earendil-works/pi-ai'
 import { transformMessages } from '@earendil-works/pi-ai/api/transform-messages'
@@ -969,6 +969,44 @@ describe('mapStopReason / mapUsage', () => {
   ])('maps pi-ai transport wording %j', (errorMessage) => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
       .toMatchObject({ kind: 'error', failure: { code: 'TRANSPORT' } })
+  })
+
+  it.each([
+    'WebSocket closed 1012',
+    'WebSocket closed 1012 Service Restart',
+    'websocket closed 1012',
+  ])('maps WebSocket service restart %j to a normally retryable transport failure', (errorMessage) => {
+    const reason = mapStopReason(assistant({ stopReason: 'error', errorMessage }))
+    expect(reason).toEqual({ kind: 'error', failure: { message: errorMessage, code: 'TRANSPORT' } })
+    const policy = resolveRetryPolicy(undefined, 'test provider')
+    expect(policy.mode).toBe('normal')
+    if (policy.mode === 'normal' && reason.kind === 'error') {
+      expect(policy.retryableCodes).toContain(reason.failure.code)
+      expect(policy.maxRetries).toBe(5)
+    }
+  })
+
+  it.each([
+    'WebSocket closed 1002',
+    'WebSocket closed 1003',
+    'WebSocket closed 1008',
+    'WebSocket closed 1008 policy violation',
+    'WebSocket closed 1009 message too big',
+    'WebSocket closed 1010',
+    'WebSocket closed 10120',
+    'WebSocket closed 4000',
+  ])('does not make non-transient WebSocket close %j retryable', (errorMessage) => {
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toEqual({ kind: 'error', failure: { message: errorMessage, code: 'PI_AI_ERROR' } })
+  })
+
+  it.each([
+    ['WebSocket closed 1012 HTTP 401', 'AUTH'],
+    ['WebSocket closed 1012 invalid request', 'INVALID_REQUEST'],
+    ['WebSocket closed 1012 insufficient_quota', 'QUOTA'],
+  ])('preserves specific failure precedence for %j', (errorMessage, code) => {
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toEqual({ kind: 'error', failure: { message: errorMessage, code } })
   })
 
   it('uses pi-ai provider-specific overflow classification without losing rate-limit exclusions', () => {
