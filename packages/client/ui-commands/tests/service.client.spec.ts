@@ -356,6 +356,24 @@ describe('candidates', () => {
     await expect(source.candidates(proj('s1'), req(''))).rejects.toThrow('collides with a host command')
   })
 
+  it('accepts literal label/description copy and isolates a contribution that throws', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { command, source } = await bench()
+    // Third-party contributions sometimes pass plain strings instead of getters.
+    command.register(themeContribution({ label: 'Theme', description: 'literal copy' }))
+    command.register({
+      name: 'broken',
+      available: () => { throw new Error('boom') },
+      ui: { kind: 'action', run: () => {} },
+    })
+    const rows = await source.candidates(proj('s1'), req(''))
+    expect(rows.find(row => row.name === 'theme')).toMatchObject({ label: 'Theme', description: 'literal copy' })
+    // The throwing contribution is skipped; the rest of the menu survives.
+    expect(rows.find(row => row.name === 'broken')).toBeUndefined()
+    expect(rows.map(row => row.name)).toEqual(['goal', 'plan', 'theme'])
+    error.mockRestore()
+  })
+
   describe('menu presentation (design doc for #3567)', () => {
     /** First-party definitions plus an unrelated command, in Host registration order. */
     const SHIPPED: CommandDescriptor[] = [
