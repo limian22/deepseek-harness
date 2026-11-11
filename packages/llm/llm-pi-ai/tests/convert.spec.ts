@@ -833,7 +833,7 @@ describe('toStreamChunks', () => {
     )))
     expect(chunks).toEqual([
       { type: 'usage', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
-      { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'PI_AI_ERROR' } } },
+      { type: 'finish', reason: { kind: 'error', failure: { message: expect.stringContaining('boom\npi-ai diagnostics: '), code: 'PI_AI_ERROR' } } },
     ])
   })
 
@@ -896,7 +896,7 @@ describe('mapStopReason / mapUsage', () => {
 
   it('defaults the error message when pi-ai omits it', () => {
     expect(mapStopReason(assistant({ stopReason: 'error' })))
-      .toEqual({ kind: 'error', failure: { message: 'pi-ai stream error', code: 'PI_AI_ERROR' } })
+      .toEqual({ kind: 'error', failure: { message: expect.stringContaining('pi-ai stream error\npi-ai diagnostics: '), code: 'PI_AI_ERROR' } })
   })
 
   it('maps routable HTTP-ish error messages to stable codes', () => {
@@ -949,8 +949,9 @@ describe('mapStopReason / mapUsage', () => {
     ['a leading 401', '401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}', 'AUTH'],
     ['a leading 429', '429 Too Many Requests: slow down', 'RATE_LIMIT'],
   ] as const)('classifies %s by its leading response status', (_label, errorMessage, code) => {
+    const message = code === 'PI_AI_ERROR' ? expect.stringContaining(`${errorMessage}\npi-ai diagnostics: `) : errorMessage
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
-      .toEqual({ kind: 'error', failure: { message: errorMessage, code } })
+      .toEqual({ kind: 'error', failure: { message, code } })
   })
 
   it.each([
@@ -997,7 +998,7 @@ describe('mapStopReason / mapUsage', () => {
     'WebSocket closed 4000',
   ])('does not make non-transient WebSocket close %j retryable', (errorMessage) => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
-      .toEqual({ kind: 'error', failure: { message: errorMessage, code: 'PI_AI_ERROR' } })
+      .toEqual({ kind: 'error', failure: { message: expect.stringContaining(`${errorMessage}\npi-ai diagnostics: `), code: 'PI_AI_ERROR' } })
   })
 
   it.each([
