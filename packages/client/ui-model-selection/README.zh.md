@@ -75,7 +75,7 @@ composer 菜单中的模型名称和推理等级均使用 400（regular）字重
 
 composer 的 `ModelSelect` 与 `/model` 选项构建器共用[提供方排序](src/client/provider-order.ts)，两个搜索框均在每个提供方内使用共享的[文本搜索](../../util/text-search/README.zh.md)。命令通过 [popupSelect API](../ui-commands/README.zh.md#use-this-package) 提供可选分组；两个入口均使用 `MenuGroup`，并在渲染分组变化时重建其吸顶观察器。命令弹窗撑满 composer 浮层，按钮则保留紧凑菜单。
 
-两个入口共用一份由 `ModelDirectoryResolver`（`ctx.modelDirectories`）持有的会话级目录：`/model` popupSelect 贡献项（经 `ctx.commandUi` 注册）与 composer 的具名 `conversation.input.model` 位都经 `session.models` 加载会话的可用目录、经 `session.selectModel` 通过同一个 `ModelDirectory` 实例提交，因此任一入口所做的切换正是另一个入口接下来显示的。目录加载与选择共享一个代次计数器，旧响应不会覆盖新结果。目录把最近一次提交的选择发布为 `pending`，直到它完成或被连接重置作废；连接重置丢弃所有常驻投影，并在显示前重新拉取 Host 恢复的选择。目录按会话惰性解析，随会话作用域一并 dispose（资源释放）；已寻址 subagent 会话不公开任一入口。每份常驻目录都会直接在转发的 `llm/adapters-updated`、`llm/models-updated`、`settings/document-updated` 与凭据更新事件上重拉。
+两个入口共用一份由 `ModelDirectoryResolver`（`ctx.modelDirectories`）持有的会话级目录：`/model` popupSelect 贡献项（经 `ctx.commandUi` 注册）与 composer 的具名 `conversation.input.model` 位都经 `session.models` 加载会话的可用目录、经 `session.selectModel` 通过同一个 `ModelDirectory` 实例提交，因此任一入口所做的切换正是另一个入口接下来显示的。目录加载与选择共享一个代次计数器，旧响应不会覆盖新结果。目录把最近一次提交的选择发布为 `pending`，直到它完成或被连接重置作废；连接重置丢弃所有常驻投影，并在显示前重新拉取 Host 恢复的选择。目录按会话惰性解析，随会话作用域一并 dispose（资源释放）；已寻址 subagent 会话会公开两个入口，在那里选择只记录该会话自己的路由并传 `persistDefault: false`，不改动为新会话保存的默认值。每份常驻目录都会直接在转发的 `llm/adapters-updated`、`llm/models-updated`、`settings/document-updated` 与凭据更新事件上重拉。
 
 </details>
 
@@ -108,7 +108,7 @@ composer 的 `ModelSelect` 与 `/model` 选项构建器共用[提供方排序](s
 
 这些限制界定了当前模型选择界面。它们是当前包约束，不是通用模型路由器对比或任务积压。
 
-- **无创建期或已寻址 subagent 选择**——两个入口都要求既有普通会话的 agent（智能体）；没有可纳入会话创建的草稿阶段模型选择，subagent 继续执行也有意不公开独立的模型选择约定。
+- **无创建期选择**——两个入口都要求既有会话的 agent（智能体）；没有可纳入会话创建的草稿阶段模型选择。已寻址的 subagent 页面只改自己会话的路由，不改部署默认值。
 - **目录名仅供呈现**——选择与持久化使用提供方／模型／推理强度 id；目录查询或确切模型元数据查询失败的提供方以不可选失败行列出，重新加载前保持原样。
 - **不能任意输入推理强度**——composer 仅提供确切模型由适配器公布的推理强度；适配器没有推理元数据时不显示 Effort 行。
 - **角标只出现在 composer 模型位**——`/model` 弹窗各行、触发按钮的无障碍名称及其提示仍只显示目录名称。
