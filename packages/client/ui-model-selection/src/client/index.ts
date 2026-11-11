@@ -12,9 +12,10 @@
  */
 // Type-only: the carrier types, the forwarded Host-event face and the ctx.remote merge.
 import type { ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelCatalogModel, ModelProviderGroup } from '@deepseek-ai/dsh-api-session-controller/types'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
-import type { CommandUiContract, SelectOption } from '@deepseek-ai/dsh-client-ui-commands/client'
+import type { CommandUiContract, SelectOption, SelectOptionAction } from '@deepseek-ai/dsh-client-ui-commands/client'
 // Type-only: pulls the ui-conversation SlotMap merge (the input.model seat).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
@@ -25,6 +26,7 @@ import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconDataOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ModelDirectoryState } from './directory.ts'
 import { ModelDirectoryResolver } from './service.ts'
+import { FAVORITES_GROUP_ID, ModelFavorites, favoriteKey } from './favorites.ts'
 import type { ModelSelectInjected } from './slots.ts'
 import { ModelSelect } from './ModelSelect.tsx'
 import { en, ja, es, fr, de, ru, pt, zh, type ModelKey } from './locales.ts'
@@ -33,7 +35,10 @@ import { orderModelProviders } from './provider-order.ts'
 export { ModelDirectory } from './directory.ts'
 export type { ModelDirectoryState } from './directory.ts'
 export { ModelDirectoryResolver } from './service.ts'
-export type { ModelLabelOwner, ModelSelectInjected } from './slots.ts'
+export { ModelFavorites, favoriteKey, MODEL_FAVORITES_NS } from './favorites.ts'
+export type { ModelFavoritesState, ModelFavoritesSection } from './favorites.ts'
+export type { ModelFavorite } from '../types.ts'
+export type { ModelLabelOwner, ModelSelectInjected, ModelFavoritesFace } from './slots.ts'
 export type { ModelKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -48,20 +53,68 @@ function rowId(providerId: string, modelId: string): string {
   return `${providerId}/${modelId}`
 }
 
-/** Flatten the directory into popup rows; failure rows are listed for visibility but never selectable. */
-function optionsOf(directory: ModelDirectoryState, t: TranslateNS<'model'>): SelectOption[] {
+/** Provider heading text, localizing the DeepSeek account group. */
+function providerLabel(group: ModelProviderGroup, t: TranslateNS<'model'>): string {
+  return group.id === 'deepseek-account' ? t('provider.account') : group.name
+}
+
+/** The star action attached to one model row: toggles its pinned entry in place. */
+function favoriteAction(
+  group: ModelProviderGroup, model: ModelCatalogModel, favorited: boolean,
+  t: TranslateNS<'model'>, favorites: ModelFavorites,
+): SelectOptionAction {
+  return {
+    label: t(favorited ? 'favorites.remove' : 'favorites.add', { model: model.name }),
+    pressed: favorited,
+    invoke: () => favorites.toggle(group.id, model.id).then(() => { /* reload carries the result */ }),
+  }
+}
+
+/**
+ * Flatten the directory into popup rows; failure rows are listed for visibility
+ * but never selectable. When the Host serves a favorites namespace, pinned
+ * models form a top group (in pin order) and are omitted from their provider
+ * groups, and every model row carries a star action. Without the namespace the
+ * rows are unchanged.
+ */
+function optionsOf(directory: ModelDirectoryState, t: TranslateNS<'model'>, favorites: ModelFavorites): SelectOption[] {
   const rows: SelectOption[] = []
-  for (const group of orderModelProviders(directory.groups)) {
-    const name = group.id === 'deepseek-account' ? t('provider.account') : group.name
+  const favoriteState = favorites.getSnapshot()
+  const favoritesEnabled = favoriteState.status === 'ready'
+  const favoritePairs = favoritesEnabled ? favoriteState.favorites : []
+  const favoriteKeys = new Set(favoritePairs.map(fav => favoriteKey(fav.provider, fav.model)))
+  const ordered = orderModelProviders(directory.groups)
+  const byKey = new Map<string, { group: ModelProviderGroup; model: ModelCatalogModel }>()
+  for (const group of ordered) {
+    for (const model of group.models) byKey.set(rowId(group.id, model.id), { group, model })
+  }
+  const activeOf = (provider: string, model: string): { active?: true } =>
+    directory.current !== null && directory.current.provider === provider && directory.current.model === model
+      ? { active: true } : {}
+  if (favoritePairs.length > 0) {
+    const groupName = FAVORITES_GROUP_ID
+    for (const fav of favoritePairs) {
+      const found = byKey.get(rowId(fav.provider, fav.model))
+      if (found === undefined) continue
+      rows.push({
+        id: rowId(found.group.id, found.model.id),
+        label: found.model.name,
+        group: { name: groupName, label: t('favorites.group') },
+        ...activeOf(found.group.id, found.model.id),
+        ...favoritesEnabled ? { action: favoriteAction(found.group, found.model, true, t, favorites) } : {},
+      })
+    }
+  }
+  for (const group of ordered) {
+    const name = providerLabel(group, t)
     for (const model of group.models) {
+      if (favoriteKeys.has(rowId(group.id, model.id))) continue
       rows.push({
         id: rowId(group.id, model.id),
         label: model.name,
         group: { name: group.id, label: name },
-        ...(directory.current !== null
-          && directory.current.provider === group.id
-          && directory.current.model === model.id
-          ? { active: true } : {}),
+        ...activeOf(group.id, model.id),
+        ...favoritesEnabled ? { action: favoriteAction(group, model, false, t, favorites) } : {},
       })
     }
   }
@@ -103,8 +156,8 @@ function selectionOf(state: ModelDirectoryState, id: string): ModelSelection | u
 /** Dictionary namespace owned by this plugin. */
 const NS = 'model'
 
-/** Required services: the contribution registry, the seat's slot registry, locale, and the service's own faces. */
-export const inject = ['commandUi', 'locale', 'sessions', 'slots', 'remote', 'remote.session']
+/** Required services: the contribution registry, the seat's slot registry, locale, settings forms, and the service's own faces. */
+export const inject = ['commandUi', 'locale', 'sessions', 'slots', 'remote', 'remote.session', 'configForms']
 
 /**
  * Client plugin body: mount ModelDirectoryResolver, register the `model` dictionaries,
@@ -118,6 +171,10 @@ export function apply(ctx: ClientContext): void {
   // Non-slot faces (the command description, the popup option builder) read
   // through the bound translate; the seat component reads the standard seat.
   const t = ctx.locale.bind(NS)
+
+  // One Host-persisted pinned list shared by both entries; disposed with the plugin.
+  const favorites = new ModelFavorites(ctx)
+  ctx.effect(() => () => favorites.dispose(), 'ui-model-selection: favorites')
 
   ctx.plugin(ModelDirectoryResolver)
 
@@ -143,7 +200,7 @@ export function apply(ctx: ClientContext): void {
           if (sessions.subagentAddress(session.sessionId) !== undefined) {
             throw new Error('model selection is unavailable for addressed subagent sessions')
           }
-          return optionsOf(await models.directoryFor(session.sessionId).load(), t)
+          return optionsOf(await models.directoryFor(session.sessionId).load(), t, favorites)
         },
         onSelect: async (option, session) => {
           if (sessions.subagentAddress(session.sessionId) !== undefined) {
@@ -185,6 +242,7 @@ export function apply(ctx: ClientContext): void {
           load: () => {
             if (available) directory.load().catch(() => { /* surfaced on the store */ })
           },
+          favorites,
           resolveText: text => ctx.locale.resolveText(text),
           select: (selection: ModelSelection) => available
             ? directory.select(selection)

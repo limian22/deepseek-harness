@@ -20,6 +20,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { WeakMapWithValues } from '@deepseek-ai/dsh-util-values'
 import { ModelCatalogDirectory } from './catalog.ts'
 import { ModelDirectory } from './directory.ts'
+import { MODEL_FAVORITES_NS } from './favorites.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -53,7 +54,12 @@ export class ModelDirectoryResolver extends Service {
     })
     ctx.remote.$on('llm/adapters-updated', () => { this.catalog.refresh() })
     ctx.remote.$on('llm/models-updated', () => { this.catalog.refresh() })
-    ctx.remote.$on('settings/document-updated', () => { this.catalog.refresh() })
+    // Pinned-model writes change this namespace only; they never alter the
+    // model catalog, so skip the (wasteful) catalog refresh they would cause.
+    ctx.remote.$on('settings/document-updated', (ns) => {
+      if (ns === MODEL_FAVORITES_NS) return
+      this.catalog.refresh()
+    })
     ctx.remote.$on('credentials/record-updated', () => { this.catalog.refresh() })
     ctx.remote.$on('credentials/reference-updated', () => { this.catalog.refresh() })
   }

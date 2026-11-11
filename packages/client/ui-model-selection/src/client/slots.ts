@@ -4,6 +4,7 @@ import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ModelCatalogModel, ModelProviderGroup } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { ModelDirectoryState } from './directory.ts'
+import type { ModelFavoritesState } from './favorites.ts'
 
 /** Catalog data for a model name inside the composer's existing controls. */
 export interface ModelLabelOwner {
@@ -99,6 +100,11 @@ export interface ModelSelectInjected {
   /** Ensure the shared advisory catalog is loaded (errors land on the store). */
   load: () => void
   /**
+   * Pinned-model face, absent when the Host serves no favorites namespace so
+   * the seat simply hides the star affordance.
+   */
+  favorites?: ModelFavoritesFace
+  /**
    * Choose a catalog badge's provider-authored text for the active locale.
    * @param text - the badge's literal text or translations.
    * @returns the text to display.
@@ -110,4 +116,17 @@ export interface ModelSelectInjected {
    * @returns the Host outcome, or undefined when this Session cannot select a model.
    */
   select: (selection: ModelSelection) => Promise<RemoteResult<void> | undefined>
+}
+
+/** Star affordance both entries share: a membership snapshot plus a toggle. */
+export interface ModelFavoritesFace {
+  /** Render snapshot both entries subscribe to. */
+  store: SnapshotStore<ModelFavoritesState>
+  /**
+   * Toggle one provider/model pair.
+   * @param provider - provider (catalog group) id.
+   * @param model - provider-owned model id.
+   * @returns whether the Host accepted the write.
+   */
+  toggle: (provider: string, model: string) => Promise<boolean>
 }

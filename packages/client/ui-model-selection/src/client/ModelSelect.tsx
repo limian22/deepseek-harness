@@ -29,41 +29,65 @@
  */
 import { MenuGroup, MenuSurface, observeStickyMenuGroups } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
-  useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
+  Fragment, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
   type CSSProperties, type KeyboardEvent, type FocusEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
 import clsx from 'clsx'
 import type { ModelReasoningEffort, ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ModelCatalogModel } from '@deepseek-ai/dsh-api-session-controller/types'
 import {
   IconCheckOutlineRegular, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconCloseFillRegular,
-  IconDataOutlineRegular, IconWarningOutlineRegular, Input, isMobileDevice, StateDot, Tag, Toast,
+  IconDataOutlineRegular, IconWarningOutlineRegular, Input, isMobileDevice, rankByName, StateDot, Tag, Toast,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRenderSlots, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ModelLabelOwner, ModelMenuControls, ModelMenuPaneRef, ModelSelectInjected } from './slots.ts'
+import type { ModelLabelOwner, ModelSelectInjected } from './slots.ts'
+import { FAVORITES_GROUP_ID, favoriteKey, type ModelFavoritesState } from './favorites.ts'
 import css from './ModelSelect.module.css'
-import { TextSearchIndex } from '@deepseek-ai/dsh-util-text-search'
 import { orderModelProviders } from './provider-order.ts'
 
-/** Which pane the dropdown shows: the root menu, one drilled-in list, or a plugin-owned detail pane. */
-type Pane =
-  | { kind: 'root' }
-  | { kind: 'model' }
-  | { kind: 'effort' }
-  | { kind: 'detail'; pane: ModelMenuPaneRef }
-
-/** Any pane reached by drilling from the root menu. */
-type DrilledPane = Exclude<Pane, { kind: 'root' }>
-
-const ROOT_PANE: Pane = { kind: 'root' }
-const MODEL_PANE: DrilledPane = { kind: 'model' }
-const EFFORT_PANE: DrilledPane = { kind: 'effort' }
+/** Which pane the dropdown shows: the two-row root or one drilled-in list. */
+type Pane = 'root' | 'model' | 'effort'
 
 /** One dynamic effort row; undefined means preserve the provider default. */
 interface EffortChoice {
   key: string
   effort: string | undefined
   label: string
+}
+
+/** One provider/model entry inside a rendered group. */
+interface ModelEntry {
+  provider: { id: string; name: string }
+  model: ModelCatalogModel
+}
+
+/** A rendered group: a provider group, or the synthetic pinned group at the top. */
+interface DisplayGroup {
+  id: string
+  name: string
+  entries: ModelEntry[]
+}
+
+/** Stable id for the synthetic "favorites" group (shared with the popup builder). */
+
+/** Fallback snapshot/ subscription used when no favorites face is injected (tests, older hosts). */
+const EMPTY_FAVORITES: ModelFavoritesState = { status: 'unavailable', favorites: [] }
+const subscribeNever = (): (() => void) => () => {}
+
+/** A star glyph: filled when pinned, outline otherwise (decorative; the button carries the label). */
+function StarGlyph({ filled }: { filled: boolean }) {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path
+        d="M8 1.9l1.86 3.77 4.16.6-3.01 2.94.71 4.14L8 11.4l-3.72 1.95.71-4.14L1.98 6.27l4.16-.6z"
+        fill={filled ? 'currentColor' : 'none'}
+        stroke="currentColor"
+        strokeWidth={filled ? 0 : 1.15}
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
 }
 
 /**
@@ -73,16 +97,25 @@ interface EffortChoice {
  * @returns the trigger and, while open, the two-level menu.
  */
 export function ModelSelect(
-  { locked, available, directory, load, select, resolveText, t, renderSlot }:
+  { locked, available, directory, load, select, favorites, resolveText, t, renderSlot }:
   ModelSelectInjected & Pick<PropsRuntime<'conversation.input.model'>, 'locked'> & PropsLocale<'model'>
-    & Omit<PropsRenderSlots<'conversation.input.model.label' | 'conversation.input.model.options' | 'conversation.input.model.pane'>, 'SessionProvider'>,
+    & Omit<PropsRenderSlots<'conversation.input.model.label' | 'conversation.input.model.options'>, 'SessionProvider'>,
 ) {
   const state = useSyncExternalStore(
     fn => directory.subscribe(fn),
     () => directory.getSnapshot(),
   )
+  const favoriteState = useSyncExternalStore(
+    favorites?.store.subscribe ?? subscribeNever,
+    () => favorites?.store.getSnapshot() ?? EMPTY_FAVORITES,
+  )
+  const favoritesEnabled = favorites !== undefined && favoriteState.status === 'ready'
+  const favoriteKeys = useMemo(
+    () => new Set(favoriteState.favorites.map(fav => favoriteKey(fav.provider, fav.model))),
+    [favoriteState.favorites],
+  )
   const [open, setOpen] = useState(false)
-  const [pane, setPane] = useState<Pane>(ROOT_PANE)
+  const [pane, setPane] = useState<Pane>('root')
   const [query, setQuery] = useState('')
   const [highlightedIndex, setHighlightedIndex] = useState<number | null>(null)
   const [selectionFocus, setSelectionFocus] = useState(false)
@@ -105,34 +138,55 @@ export function ModelSelect(
   }
 
   const accountProviderName = t('provider.account')
-  const groups = useMemo(() => orderModelProviders(state.groups).map(group => ({
-    ...group,
-    provider: {
-      id: group.id,
-      name: group.id === 'deepseek-account' ? accountProviderName : group.name,
-    },
-  })), [state.groups, accountProviderName])
+  const groups = useMemo<readonly DisplayGroup[]>(() => {
+    const base = orderModelProviders(state.groups).map((group) => {
+      const name = group.id === 'deepseek-account' ? accountProviderName : group.name
+      const provider = { id: group.id, name }
+      return {
+        id: group.id,
+        name,
+        entries: group.models.map((model): ModelEntry => ({ provider, model })),
+      }
+    })
+    if (!favoritesEnabled || favoriteState.favorites.length === 0) return base
+    const byKey = new Map<string, ModelEntry>()
+    for (const group of base) {
+      for (const entry of group.entries) byKey.set(favoriteKey(group.id, entry.model.id), entry)
+    }
+    const pinned = favoriteState.favorites
+      .map(fav => byKey.get(favoriteKey(fav.provider, fav.model)))
+      .filter((entry): entry is ModelEntry => entry !== undefined)
+    if (pinned.length === 0) return base
+    const rest = base
+      .map(group => ({
+        ...group,
+        entries: group.entries.filter(entry => !favoriteKeys.has(favoriteKey(group.id, entry.model.id))),
+      }))
+      .filter(group => group.entries.length > 0)
+    return [{ id: FAVORITES_GROUP_ID, name: t('favorites.group'), entries: pinned }, ...rest]
+  }, [state.groups, accountProviderName, favoritesEnabled, favoriteState.favorites, favoriteKeys, t])
   const choices = useMemo(() => groups.flatMap(group =>
-    group.models.map(model => ({
-      group,
-      model,
+    group.entries.map(entry => ({
+      provider: entry.provider,
+      model: entry.model,
       selection: {
-        provider: group.id,
-        model: model.id,
-        ...model.reasoning?.defaultEffort === undefined
+        provider: entry.provider.id,
+        model: entry.model.id,
+        ...entry.model.reasoning?.defaultEffort === undefined
           ? {}
-          : { reasoningEffort: model.reasoning.defaultEffort },
+          : { reasoningEffort: entry.model.reasoning.defaultEffort },
       } satisfies ModelSelection,
     }))), [groups])
   const showSearch = choices.length > 4
-  const groupIndexes = useMemo(() => groups.map(group => ({
-    group, index: new TextSearchIndex(group.models, model => ({ fuzzy: [model.name, model.id], substring: [model.description] })),
-  })), [groups])
-  const filteredGroups = useMemo(() => groupIndexes.map(({ group, index }) => ({
-    ...group, models: index.search(showSearch ? query : ''),
-  })).filter(group => group.models.length > 0), [groupIndexes, query, showSearch])
-  const visibleModels = useMemo(() => filteredGroups.flatMap(group => group.models.map(model => ({
-    provider: group.id, model: model.id,
+  const filteredGroups = useMemo(() => groups.map(group => ({
+    ...group,
+    entries: rankByName(
+      group.entries.map(entry => ({ name: entry.model.name, entry })),
+      showSearch ? query.trim() : '',
+    ).map(row => row.entry),
+  })).filter(group => group.entries.length > 0), [groups, query, showSearch])
+  const visibleModels = useMemo(() => filteredGroups.flatMap(group => group.entries.map(entry => ({
+    provider: entry.provider.id, model: entry.model.id,
   }))), [filteredGroups])
   const currentVisibleIndex = visibleModels.findIndex(model =>
     model.provider === state.current?.provider && model.model === state.current.model)
@@ -178,13 +232,8 @@ export function ModelSelect(
       if (menuRef.current?.contains(event.target as Node) === true) return
       setOpen(false)
     }
-    // WebKit touch taps on non-clickable areas dispatch pointerdown without mousedown.
-    document.addEventListener('pointerdown', closeOutside)
     document.addEventListener('mousedown', closeOutside)
-    return () => {
-      document.removeEventListener('pointerdown', closeOutside)
-      document.removeEventListener('mousedown', closeOutside)
-    }
+    return () => { document.removeEventListener('mousedown', closeOutside) }
   }, [open])
 
   useLayoutEffect(() => {
@@ -196,22 +245,16 @@ export function ModelSelect(
 
   // Pane switches unmount the focused row; restore focus inside the menu so
   // keyboard navigation remains available.
-  const paneFocus = useRef<'drill' | DrilledPane | null>(null)
+  const paneFocus = useRef<'drill' | 'model' | 'effort' | null>(null)
   const previousShowSearch = useRef(showSearch)
   useEffect(() => {
     const changedSearchMode = previousShowSearch.current !== showSearch
     previousShowSearch.current = showSearch
-    const intent = paneFocus.current ?? (changedSearchMode && pane.kind === 'model' ? 'drill' : null)
+    const intent = paneFocus.current ?? (changedSearchMode && pane === 'model' ? 'drill' : null)
     paneFocus.current = null
     if (!open || intent === null) return
     if (intent === 'drill') {
-      if (pane.kind === 'detail') {
-        // A detail pane places its own initial focus (autoFocus commits before
-        // this effect); otherwise the surface keeps the menu's keys reachable.
-        if (menuRef.current?.contains(document.activeElement) !== true) (menuRef.current ?? triggerRef.current)?.focus()
-        return
-      }
-      if (pane.kind === 'model' && showSearch && !isMobileDevice()) {
+      if (pane === 'model' && showSearch && !isMobileDevice()) {
         searchRef.current?.focus()
         return
       }
@@ -224,10 +267,7 @@ export function ModelSelect(
       ;(target ?? triggerRef.current)?.focus()
       return
     }
-    const cell = intent.kind === 'detail'
-      ? Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[data-model-menu-pane]') ?? [])
-        .find(button => button.dataset.modelMenuPane === intent.pane.key)
-      : itemRefs.current[intent.kind === 'effort' ? 1 : 0]
+    const cell = itemRefs.current[intent === 'effort' ? 1 : 0]
     ;(cell !== null && cell !== undefined && !cell.disabled ? cell : triggerRef.current)?.focus()
   }, [open, pane, showSearch])
 
@@ -238,7 +278,7 @@ export function ModelSelect(
   }, [available, open, pane, filteredGroups])
 
   useLayoutEffect(() => {
-    if (open && pane.kind === 'model' && activeModelIndex >= 0) {
+    if (open && pane === 'model' && activeModelIndex >= 0) {
       itemRefs.current[activeModelIndex]?.scrollIntoView({ block: 'nearest' })
     }
   }, [open, pane, activeModelIndex, visibleModels])
@@ -251,7 +291,7 @@ export function ModelSelect(
     setQuery('')
     setHighlightedIndex(null)
     if (currentChoice === undefined) paneFocus.current = 'drill'
-    setPane(currentChoice === undefined ? MODEL_PANE : ROOT_PANE)
+    setPane(currentChoice === undefined ? 'model' : 'root')
     setOpen(true)
     reload()
   }
@@ -263,7 +303,7 @@ export function ModelSelect(
 
   const close = (restoreFocus = false): void => {
     setOpen(false)
-    setPane(ROOT_PANE)
+    setPane('root')
     if (restoreFocus) queueMicrotask(() => { triggerRef.current?.focus() })
   }
 
@@ -272,7 +312,7 @@ export function ModelSelect(
     close(true)
   }
 
-  const drill = (next: DrilledPane): void => {
+  const drill = (next: Pane): void => {
     setQuery('')
     setHighlightedIndex(null)
     paneFocus.current = 'drill'
@@ -280,18 +320,9 @@ export function ModelSelect(
   }
 
   /** Leave a drilled pane for the root one, handing the keyboard back to its cell. */
-  const back = (from: DrilledPane): void => {
+  const back = (from: Exclude<Pane, 'root'>): void => {
     paneFocus.current = from
-    setPane(ROOT_PANE)
-  }
-
-  const controls: ModelMenuControls = {
-    locked: locked || busy,
-    dismiss: () => {
-      close()
-      triggerRef.current?.focus()
-    },
-    reportFailure: (message) => { setToast({ seq: ++toastSeq.current, text: message }) },
+    setPane('root')
   }
 
   const moveFocus = (offset: number): void => {
@@ -314,17 +345,12 @@ export function ModelSelect(
     if (event.key === 'Escape' && open) {
       event.preventDefault()
       // Escape backs out of a drilled pane first, then closes.
-      if (pane.kind === 'detail' || (pane.kind !== 'root' && currentChoice !== undefined)) back(pane)
+      if (pane !== 'root' && currentChoice !== undefined) back(pane)
       else close(true)
       return
     }
     if (!open) return
-    if (pane.kind === 'detail' && event.key === 'Tab') {
-      event.preventDefault()
-      close(true)
-      return
-    }
-    if (pane.kind === 'model' && showSearch && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+    if (pane === 'model' && showSearch && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
       event.preventDefault()
       if (!busy && visibleModels.length > 0) {
         const direction = event.key === 'ArrowDown' ? 1 : -1
@@ -333,7 +359,7 @@ export function ModelSelect(
       }
       return
     }
-    if (pane.kind === 'model' && showSearch && event.target instanceof HTMLInputElement
+    if (pane === 'model' && showSearch && event.target instanceof HTMLInputElement
       && (event.key === 'Enter' || (event.key === 'Tab' && !event.shiftKey))) {
       if (event.key === 'Tab' && visibleModels.length === 0) return
       event.preventDefault()
@@ -347,7 +373,7 @@ export function ModelSelect(
     if (event.key === 'Tab') {
       if (event.shiftKey) {
         event.preventDefault()
-        if (pane.kind !== 'root' && currentChoice !== undefined) back(pane)
+        if (pane !== 'root' && currentChoice !== undefined) back(pane)
         else close(true)
         return
       }
@@ -366,7 +392,7 @@ export function ModelSelect(
       }
       if (focused !== triggerRef.current) return
       event.preventDefault()
-      if (pane.kind === 'model' && showSearch) {
+      if (pane === 'model' && showSearch) {
         setHighlightedIndex(null)
         searchRef.current?.focus()
         return
@@ -382,8 +408,6 @@ export function ModelSelect(
   }
 
   const onBlur = (event: FocusEvent<HTMLDivElement>): void => {
-    // Clicking explanation text can clear focus without leaving its page.
-    if (pane.kind === 'detail' && event.relatedTarget === null) return
     if (event.relatedTarget instanceof Node && (
       rootRef.current?.contains(event.relatedTarget) === true
       || menuRef.current?.contains(event.relatedTarget) === true
@@ -482,18 +506,8 @@ export function ModelSelect(
       onKeyDown={onRootKeyDown}
       onBlur={onBlur}
       onMouseDown={(event) => {
-        // WebKit blurs a focused row before click unless the button's mousedown
-        // keeps focus. Pressing non-focusable card content (a provider heading,
-        // padding, status text) would move focus to the body and close the card
-        // through onBlur; other focusable controls, which plugin options may
-        // render, keep their default focus, and a detail pane keeps the default
-        // so its prose stays selectable.
-        const { target } = event
-        if (target instanceof Element && (
-          target.closest('button') !== null
-          || (pane.kind !== 'detail' && menuRef.current?.contains(target) === true
-            && target.closest('a[href], input, select, textarea, [role="button"], [contenteditable], [tabindex]') === null)
-        )) event.preventDefault()
+        // WebKit blurs a focused row before click unless the button's mousedown keeps focus.
+        if (event.target instanceof Element && event.target.closest('button') !== null) event.preventDefault()
       }}
     >
       <button
@@ -520,7 +534,7 @@ export function ModelSelect(
       >
         <IconDataOutlineRegular className={css.triggerIcon} size={16} />
         <span className={css.triggerLabel}>
-          {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.group.provider, currentChoice.model, 'trigger', true)}
+          {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.provider, currentChoice.model, 'trigger', true)}
         </span>
         {effortLabel !== undefined && <span className={css.triggerEffort}>{effortLabel}</span>}
         {busy
@@ -534,37 +548,41 @@ export function ModelSelect(
       {open && createPortal(
         <MenuSurface
           ref={menuRef}
-          data-model-menu=""
-          tabIndex={pane.kind === 'detail' ? -1 : undefined}
           id={`${id}-menu`}
-          className={clsx(css.menu, (pane.kind === 'root' || pane.kind === 'detail') && css.settingsMenu)}
+          className={css.menu}
           style={anchorStyle}
-          // A detail pane holds plugin controls and prose, not menu items.
-          role={pane.kind === 'model' || pane.kind === 'detail' ? 'group' : 'menu'}
-          aria-label={pane.kind === 'detail' ? pane.pane.title : t('menu.aria')}
+          role={pane === 'model' ? 'group' : 'menu'}
+          aria-label={t('menu.aria')}
           aria-busy={state.status === 'loading' || busy}
         >
-          {pane.kind === 'root' && (
+          {pane === 'root' && (
             <>
-              <button ref={itemRef()} type="button" role="menuitem" className={css.cell} onClick={() => { drill(MODEL_PANE) }}>
+              <button ref={itemRef()} type="button" role="menuitem" className={css.cell} onClick={() => { drill('model') }}>
                 <span className={css.cellLabel}>{t('menu.model')}</span>
                 <span className={css.cellValue}>
-                  {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.group.provider, currentChoice.model, 'menu', true)}
+                  {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.provider, currentChoice.model, 'menu', true)}
                 </span>
                 <IconChevronRightOutlineRegular className={css.cellChevron} />
               </button>
               {reasoning !== undefined && (
-                <button ref={itemRef()} type="button" role="menuitem" className={css.cell} onClick={() => { drill(EFFORT_PANE) }}>
+                <button ref={itemRef()} type="button" role="menuitem" className={css.cell} onClick={() => { drill('effort') }}>
                   <span className={css.cellLabel}>{t('menu.effort')}</span>
                   <span className={css.cellValue}>{effortLabel}</span>
                   <IconChevronRightOutlineRegular className={css.cellChevron} />
                 </button>
               )}
-              {renderSlot('conversation.input.model.options', { ...controls, openPane: (pane) => { drill({ kind: 'detail', pane }) } })}
+              {renderSlot('conversation.input.model.options', {
+                locked: locked || busy,
+                dismiss: () => {
+                  close()
+                  triggerRef.current?.focus()
+                },
+                reportFailure: (message) => { setToast({ seq: ++toastSeq.current, text: message }) },
+              })}
             </>
           )}
 
-          {pane.kind === 'model' && (
+          {pane === 'model' && (
             <>
               {showSearch && <div className={css.searchRow}>
                 <Input
@@ -620,11 +638,14 @@ export function ModelSelect(
               >
                 {filteredGroups.map((group) => {
                   return (
-                    <MenuGroup key={group.id} label={group.provider.name}>
-                      {group.models.map((model) => {
+                    <MenuGroup key={group.id} label={group.name}>
+                      {group.entries.map((entry) => {
+                        const model = entry.model
+                        const provider = entry.provider
                         const index = modelIndex++
-                        const selected = state.current?.provider === group.id && state.current.model === model.id
-                        return (
+                        const selected = state.current?.provider === provider.id && state.current.model === model.id
+                        const favorited = favoriteKeys.has(favoriteKey(provider.id, model.id))
+                        const button = (
                           <button
                             ref={itemRef()}
                             type="button"
@@ -641,20 +662,49 @@ export function ModelSelect(
                               if (showSearch) setHighlightedIndex(index)
                               else itemRefs.current[index]?.focus()
                             }}
-                            key={model.id}
                             title={model.name}
                             disabled={busy}
-                            onClick={() => { choose({ provider: group.id, model: model.id }) }}
+                            onClick={() => { choose({ provider: provider.id, model: model.id }) }}
                           >
                             <span className={css.optionCopy}>
-                              <span className={css.modelName}>{renderModelLabel(group.provider, model, 'option', selected)}</span>
+                              <span className={css.modelName}>{renderModelLabel(provider, model, 'option', selected)}</span>
                             </span>
                             <span className={css.check}>
-                              {pending?.provider === group.id && pending.model === model.id
+                              {pending?.provider === provider.id && pending.model === model.id
                                 ? <StateDot state="ongoing" />
                                 : selected ? <IconCheckOutlineRegular /> : null}
                             </span>
                           </button>
+                        )
+                        // Without a favorites face (or before it resolves) rows stay
+                        // bare buttons, exactly as before the feature existed.
+                        if (favorites === undefined || !favoritesEnabled) {
+                          return <Fragment key={favoriteKey(provider.id, model.id)}>{button}</Fragment>
+                        }
+                        return (
+                          <div className={css.modelRow} key={favoriteKey(provider.id, model.id)}>
+                            {button}
+                            <button
+                              type="button"
+                              className={clsx(css.star, favorited && css.starOn)}
+                              aria-label={t(favorited ? 'favorites.remove' : 'favorites.add', { model: model.name })}
+                              aria-pressed={favorited}
+                              tabIndex={-1}
+                              disabled={busy}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void favorites.toggle(provider.id, model.id).catch((error: unknown) => {
+                                  toastSeq.current += 1
+                                  setToast({
+                                    seq: toastSeq.current,
+                                    text: t('error.action', { message: error instanceof Error ? error.message : String(error) }),
+                                  })
+                                })
+                              }}
+                            >
+                              <StarGlyph filled={favorited} />
+                            </button>
+                          </div>
                         )
                       })}
                     </MenuGroup>
@@ -667,7 +717,7 @@ export function ModelSelect(
             </>
           )}
 
-          {pane.kind === 'effort' && (
+          {pane === 'effort' && (
             <>
               {state.error !== null && lastActionRef.current === 'load' && (
                 <div className={css.error}>
@@ -702,11 +752,6 @@ export function ModelSelect(
                   ))}
               </div>
             </>
-          )}
-          {pane.kind === 'detail' && (
-            <div className={clsx(css.groups, 'scrollable')}>
-              {renderSlot('conversation.input.model.pane', controls, { entryKey: pane.pane.key })}
-            </div>
           )}
         </MenuSurface>,
         document.body,

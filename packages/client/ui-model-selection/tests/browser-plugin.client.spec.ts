@@ -21,6 +21,7 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ReasoningEffortId } from '@deepseek-ai/dsh-llm/types'
 import type { CommandContribution, PopupSelectSpec, SelectOption } from '@deepseek-ai/dsh-client-ui-commands/client'
 import type { ModelSelectInjected } from '../src/client/slots.ts'
+import type { ModelFavorite } from '../src/client/types.ts'
 import { apply, inject } from '../src/client/index.ts'
 import { zh } from '../src/client/locales.ts'
 
@@ -158,6 +159,35 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
   })
   const track = vi.fn()
   ctx.provide('productAnalytics', { enabled: true, track } as never)
+  // Host-persisted favorites: a stateful fake settings form backing the
+  // `ui-model-selection` namespace so the plugin's configForms injection resolves.
+  const favoritesDoc = createSnapshotStore<{ favorites: ModelFavorite[] }>({ favorites: [] })
+  const configForm = {
+    getSnapshot: () => ({
+      status: 'ready' as const,
+      value: favoritesDoc.getSnapshot(),
+      base: undefined,
+      user: undefined,
+      revision: 0,
+      writable: true,
+    }),
+    subscribe: (fn: () => void) => favoritesDoc.subscribe(fn),
+    set: (_field: string, value: ModelFavorite[]) => {
+      favoritesDoc.set({ favorites: value })
+      return Promise.resolve(true)
+    },
+    mutate: () => Promise.resolve(true),
+    unset: () => Promise.resolve(true),
+  }
+  ctx.provide('configForms', {
+    get: () => configForm,
+    describe: () => ({
+      ensure: () => Promise.resolve(),
+      getSnapshot: () => ({ status: 'ready' as const, view: { namespaces: [], writable: true, hasDocument: false }, error: null }),
+      subscribe: () => () => {},
+      acceptView: () => {},
+    }),
+  } as never)
   const fiber = ctx.plugin({ inject: [...inject], apply })
   await fiber.await()
   await ctx.plugin(function probe() {}).await()
@@ -566,6 +596,30 @@ describe('ui-model-selection dual entry', () => {
     b.ctx.emit('connection/reset')
     await Promise.resolve()
     expect(b.calls).toEqual({ models: 2, select: 0 })
+  })
+
+  it('pins favorited models into a leading group and exposes a star action on every row', async () => {
+    const b = await bench()
+    b.mint('s1')
+    const before = await b.popup().options(projection('s1'), new AbortController().signal)
+    expect(before.every(option => option.action !== undefined)).toBe(true)
+    expect(before.some(option => option.group?.label === zh['favorites.group'])).toBe(false)
+    const flash = before.find(option => option.label === 'DeepSeek-V4-Flash')!
+    expect(flash.action?.pressed).toBe(false)
+
+    await flash.action!.invoke(projection('s1'))
+    const after = await b.popup().options(projection('s1'), new AbortController().signal)
+    expect(after[0]?.group?.label).toBe(zh['favorites.group'])
+    expect(after[0]?.label).toBe('DeepSeek-V4-Flash')
+    expect(after[0]?.action?.pressed).toBe(true)
+    // Exclusive: the pinned model is not duplicated in its provider group.
+    expect(after.filter(option => option.label === 'DeepSeek-V4-Flash')).toHaveLength(1)
+
+    // Unpin returns it to its provider group.
+    await after[0]!.action!.invoke(projection('s1'))
+    const restored = await b.popup().options(projection('s1'), new AbortController().signal)
+    expect(restored.some(option => option.group?.label === zh['favorites.group'])).toBe(false)
+    expect(restored.filter(option => option.label === 'DeepSeek-V4-Flash')).toHaveLength(1)
   })
 })
 

@@ -100,6 +100,34 @@
   height: 14px;
 }
 
+/* Optional trailing control (e.g. a favorite toggle) at the row's right edge.
+   Borderless icon button: muted at rest, label-primary when on. */
+.action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.action:hover,
+.action:focus-visible {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.actionPressed {
+  color: var(--dsw-alias-label-primary);
+}
+
 .status {
   padding: 7px 8px;
   font-size: 12px;

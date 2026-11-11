@@ -392,3 +392,67 @@
   height: 12px;
   color: var(--dsw-alias-label-tertiary);
 }
+
+/* A model row and its star toggle sit side by side; the option button keeps the
+   whole row's click target while the star is a separate trailing control. */
+.modelRow {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.modelRow .option {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.star {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-alias-label-caption);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 100ms ease, color 100ms ease;
+}
+
+/* Reveal the star on row hover, while focused, and whenever the model is pinned. */
+.modelRow:hover .star,
+.star:focus-visible,
+.starOn {
+  opacity: 1;
+}
+
+.starOn {
+  color: var(--dsw-alias-label-primary);
+}
+
+.star svg {
+  width: 14px;
+  height: 14px;
+}
+
+.star:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+@media (hover: hover) {
+  .star:hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover);
+    color: var(--dsw-alias-label-secondary);
+  }
+}
+
+@media (hover: none) {
+  .star {
+    opacity: 1;
+  }
+}

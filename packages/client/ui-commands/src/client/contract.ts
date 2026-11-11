@@ -23,6 +23,23 @@ export interface SelectOptionGroup {
   readonly label: string
 }
 
+/** Search behavior selected by the popup owner. */
+export type PopupSearchMode = 'substring' | 'fuzzy-label'
+
+/** One optional trailing control on an option row; the shell owns its click. */
+export interface SelectOptionAction {
+  /** Localized accessible label, e.g. "Add to favorites" / "Remove from favorites". */
+  readonly label: string
+  /** Whether the control is currently on; purely presentational (filled vs outline). */
+  readonly pressed?: boolean
+  /**
+   * Run the action for the clicked row. The shell awaits it, then reloads the
+   * option list, so business state changes (pressed/grouping) appear without
+   * closing the popup. Invoking an action never selects the row.
+   */
+  invoke(context: ClientSessionContext): void | Promise<void>
+}
+
 /** One option row of a popupSelect shell. */
 export interface SelectOption {
   readonly id: string
@@ -41,6 +58,8 @@ export interface SelectOption {
   readonly active?: boolean
   /** Optional in-page risk gate owned by the shared popup shell. */
   readonly confirmation?: SelectConfirmation
+  /** Optional trailing control (e.g. a favorite toggle) rendered at the row's right edge. */
+  readonly action?: SelectOptionAction
 }
 
 /** Command-owned search copy, resolved when its popup opens. */
@@ -60,6 +79,8 @@ export interface PopupSearchLabels {
  */
 export interface PopupSelectSpec {
   readonly kind: 'popupSelect'
+  /** Defaults to substring search; fuzzy-label ranks names within each group. */
+  readonly searchMode?: PopupSearchMode
   /**
    * Supply localized search copy for this opening; omitted uses the shell's generic copy.
    * @returns search placeholder and empty-state labels.
