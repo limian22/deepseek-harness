@@ -149,6 +149,17 @@ export function PopupSelectView({ popup, t }: PopupSelectViewProps) {
       </span>
       {option.detail !== undefined && <span className={css.detail}>{option.detail}</span>}
       {option.active === true && <span className={css.check}><IconCheckOutlineRegular /></span>}
+      {option.action !== undefined && (
+        <button
+          type="button"
+          className={clsx(css.action, option.action.pressed === true && css.actionPressed)}
+          aria-label={option.action.label}
+          aria-pressed={option.action.pressed === true}
+          onClick={(ev) => { ev.stopPropagation(); void popup.invokeAction(index) }}
+        >
+          {option.action.pressed === true ? '★' : '☆'}
+        </button>
+      )}
     </div>
   )
   let optionIndex = 0

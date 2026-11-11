@@ -10,7 +10,7 @@
     { "path": "../../team/agent-team" },
     { "path": "../../api/session-controller/tsconfig.client.json" },
     { "path": "../../api/remotes/tsconfig.client.json" },
-    { "path": "../ui-model-selection" },
+    { "path": "../ui-model-selection/tsconfig.client.json" },
     { "path": "../ui-layout" },
     { "path": "../../core/agent" },
     { "path": "../ui-subagent" },

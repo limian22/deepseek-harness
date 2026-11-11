@@ -298,6 +298,37 @@ describe('PopupSelectView', () => {
     expect(view.container.childElementCount).toBe(0)
   })
 
+  it('renders an option action as a toggle button; clicking it invokes the action, not select', async () => {
+    const invoke = vi.fn()
+    const actionOptions: SelectOption[] = [{
+      id: 'gpt',
+      label: 'GPT',
+      action: { label: 'Add to favorites', pressed: false, invoke },
+    }]
+    const { popup } = await mountOpen({ options: () => Promise.resolve(actionOptions) })
+    const invokeAction = vi.spyOn(popup, 'invokeAction').mockResolvedValue(undefined)
+    const select = vi.spyOn(popup, 'select')
+    const button = screen.getByRole('button', { name: 'Add to favorites' })
+    expect(button.getAttribute('aria-pressed')).toBe('false')
+    await act(async () => { fireEvent.click(button) })
+    expect(invokeAction).toHaveBeenCalledExactlyOnceWith(0)
+    expect(select).not.toHaveBeenCalled()
+    expect(invoke).not.toHaveBeenCalled() // the injected controller owns the click
+  })
+
+  it('reflects action.pressed as aria-pressed and the filled glyph', async () => {
+    await mountOpen({
+      options: () => Promise.resolve([{
+        id: 'gpt',
+        label: 'GPT',
+        action: { label: 'Remove from favorites', pressed: true, invoke: () => undefined },
+      }]),
+    })
+    const button = screen.getByRole('button', { name: 'Remove from favorites' })
+    expect(button.getAttribute('aria-pressed')).toBe('true')
+    expect(button.textContent).toBe('★')
+  })
+
   it('renders a gated option as an in-page modal and requires the checkbox before onSelect', async () => {
     const onSelect = vi.fn()
     const { popup, consume } = await mountOpen({

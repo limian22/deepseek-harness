@@ -422,6 +422,70 @@ describe('select', () => {
   })
 })
 
+describe('invokeAction', () => {
+  it('runs the row action without selecting, awaits it, then reloads and reflects pressed', async () => {
+    let pressed = false
+    const rows = (): readonly SelectOption[] => [{
+      id: 'dark',
+      label: 'Dark',
+      action: { label: 'Add to favorites', pressed, invoke: () => { pressed = true } },
+    }]
+    const options = vi.fn(() => Promise.resolve(rows()))
+    const onSelect = vi.fn()
+    const deps = makeDeps()
+    const popup = new PopupSelectController<Ctx>(deps)
+    popup.open('theme', spec({ options, onSelect }), CTX_A, SEGMENT)
+    await Promise.resolve()
+    expect(options).toHaveBeenCalledTimes(1)
+    expect(popup.state.getSnapshot().options[0]?.action?.pressed).toBe(false)
+
+    await popup.invokeAction(0)
+
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(deps.consume).not.toHaveBeenCalled()
+    expect(options).toHaveBeenCalledTimes(2)
+    expect(popup.state.getSnapshot()).toMatchObject({ open: true, status: 'ready', error: null })
+    expect(popup.state.getSnapshot().options[0]?.action?.pressed).toBe(true)
+  })
+
+  it('awaits the action before reloading the options', async () => {
+    let release!: () => void
+    const invoke = vi.fn(() => new Promise<void>((resolve) => { release = resolve }))
+    const options = vi.fn(() => Promise.resolve<readonly SelectOption[]>([
+      { id: 'a', label: 'A', action: { label: 'Toggle', invoke } },
+    ]))
+    const popup = new PopupSelectController<Ctx>(makeDeps())
+    popup.open('theme', spec({ options }), CTX_A, SEGMENT)
+    await Promise.resolve()
+    expect(options).toHaveBeenCalledTimes(1)
+
+    const running = popup.invokeAction(0)
+    await Promise.resolve()
+    expect(invoke).toHaveBeenCalledTimes(1)
+    expect(options).toHaveBeenCalledTimes(1) // the reload waits for the action to settle
+
+    release()
+    await running
+    expect(options).toHaveBeenCalledTimes(2)
+  })
+
+  it('a throwing action keeps the shell open and surfaces the error', async () => {
+    const options = vi.fn(() => Promise.resolve<readonly SelectOption[]>([
+      { id: 'a', label: 'A', action: { label: 'Toggle', invoke: () => Promise.reject(new Error('toggle failed')) } },
+    ]))
+    const deps = makeDeps()
+    const popup = new PopupSelectController<Ctx>(deps)
+    popup.open('theme', spec({ options }), CTX_A, SEGMENT)
+    await Promise.resolve()
+
+    await popup.invokeAction(0)
+
+    expect(popup.state.getSnapshot()).toMatchObject({ open: true, status: 'ready', error: 'toggle failed' })
+    expect(options).toHaveBeenCalledTimes(1) // no reload after a failed action
+    expect(deps.consume).not.toHaveBeenCalled()
+  })
+})
+
 describe('dismiss / dispose', () => {
   it('dismiss closes, aborts the flying fetch, and is a no-op when already closed', async () => {
     const deps = makeDeps()

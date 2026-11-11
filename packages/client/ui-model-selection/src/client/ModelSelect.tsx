@@ -29,18 +29,20 @@
  */
 import { MenuGroup, MenuSurface, observeStickyMenuGroups } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
-  useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
+  Fragment, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
   type CSSProperties, type KeyboardEvent, type FocusEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
 import clsx from 'clsx'
 import type { ModelReasoningEffort, ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ModelCatalogModel } from '@deepseek-ai/dsh-api-session-controller/types'
 import {
   IconCheckOutlineRegular, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconCloseFillRegular,
   IconDataOutlineRegular, IconWarningOutlineRegular, Input, isMobileDevice, rankByName, StateDot, Tag, Toast,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRenderSlots, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ModelLabelOwner, ModelSelectInjected } from './slots.ts'
+import { FAVORITES_GROUP_ID, favoriteKey, type ModelFavoritesState } from './favorites.ts'
 import css from './ModelSelect.module.css'
 import { orderModelProviders } from './provider-order.ts'
 
@@ -54,6 +56,40 @@ interface EffortChoice {
   label: string
 }
 
+/** One provider/model entry inside a rendered group. */
+interface ModelEntry {
+  provider: { id: string; name: string }
+  model: ModelCatalogModel
+}
+
+/** A rendered group: a provider group, or the synthetic pinned group at the top. */
+interface DisplayGroup {
+  id: string
+  name: string
+  entries: ModelEntry[]
+}
+
+/** Stable id for the synthetic "favorites" group (shared with the popup builder). */
+
+/** Fallback snapshot/ subscription used when no favorites face is injected (tests, older hosts). */
+const EMPTY_FAVORITES: ModelFavoritesState = { status: 'unavailable', favorites: [] }
+const subscribeNever = (): (() => void) => () => {}
+
+/** A star glyph: filled when pinned, outline otherwise (decorative; the button carries the label). */
+function StarGlyph({ filled }: { filled: boolean }) {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path
+        d="M8 1.9l1.86 3.77 4.16.6-3.01 2.94.71 4.14L8 11.4l-3.72 1.95.71-4.14L1.98 6.27l4.16-.6z"
+        fill={filled ? 'currentColor' : 'none'}
+        stroke="currentColor"
+        strokeWidth={filled ? 0 : 1.15}
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 /**
  * Render the composer model seat.
  * @param props - owner share (locked) + injected face (shared directory
@@ -61,13 +97,22 @@ interface EffortChoice {
  * @returns the trigger and, while open, the two-level menu.
  */
 export function ModelSelect(
-  { locked, available, directory, load, select, resolveText, t, renderSlot }:
+  { locked, available, directory, load, select, favorites, resolveText, t, renderSlot }:
   ModelSelectInjected & Pick<PropsRuntime<'conversation.input.model'>, 'locked'> & PropsLocale<'model'>
     & Omit<PropsRenderSlots<'conversation.input.model.label' | 'conversation.input.model.options'>, 'SessionProvider'>,
 ) {
   const state = useSyncExternalStore(
     fn => directory.subscribe(fn),
     () => directory.getSnapshot(),
+  )
+  const favoriteState = useSyncExternalStore(
+    favorites?.store.subscribe ?? subscribeNever,
+    () => favorites?.store.getSnapshot() ?? EMPTY_FAVORITES,
+  )
+  const favoritesEnabled = favorites !== undefined && favoriteState.status === 'ready'
+  const favoriteKeys = useMemo(
+    () => new Set(favoriteState.favorites.map(fav => favoriteKey(fav.provider, fav.model))),
+    [favoriteState.favorites],
   )
   const [open, setOpen] = useState(false)
   const [pane, setPane] = useState<Pane>('root')
@@ -93,31 +138,55 @@ export function ModelSelect(
   }
 
   const accountProviderName = t('provider.account')
-  const groups = useMemo(() => orderModelProviders(state.groups).map(group => ({
-    ...group,
-    provider: {
-      id: group.id,
-      name: group.id === 'deepseek-account' ? accountProviderName : group.name,
-    },
-  })), [state.groups, accountProviderName])
+  const groups = useMemo<readonly DisplayGroup[]>(() => {
+    const base = orderModelProviders(state.groups).map((group) => {
+      const name = group.id === 'deepseek-account' ? accountProviderName : group.name
+      const provider = { id: group.id, name }
+      return {
+        id: group.id,
+        name,
+        entries: group.models.map((model): ModelEntry => ({ provider, model })),
+      }
+    })
+    if (!favoritesEnabled || favoriteState.favorites.length === 0) return base
+    const byKey = new Map<string, ModelEntry>()
+    for (const group of base) {
+      for (const entry of group.entries) byKey.set(favoriteKey(group.id, entry.model.id), entry)
+    }
+    const pinned = favoriteState.favorites
+      .map(fav => byKey.get(favoriteKey(fav.provider, fav.model)))
+      .filter((entry): entry is ModelEntry => entry !== undefined)
+    if (pinned.length === 0) return base
+    const rest = base
+      .map(group => ({
+        ...group,
+        entries: group.entries.filter(entry => !favoriteKeys.has(favoriteKey(group.id, entry.model.id))),
+      }))
+      .filter(group => group.entries.length > 0)
+    return [{ id: FAVORITES_GROUP_ID, name: t('favorites.group'), entries: pinned }, ...rest]
+  }, [state.groups, accountProviderName, favoritesEnabled, favoriteState.favorites, favoriteKeys, t])
   const choices = useMemo(() => groups.flatMap(group =>
-    group.models.map(model => ({
-      group,
-      model,
+    group.entries.map(entry => ({
+      provider: entry.provider,
+      model: entry.model,
       selection: {
-        provider: group.id,
-        model: model.id,
-        ...model.reasoning?.defaultEffort === undefined
+        provider: entry.provider.id,
+        model: entry.model.id,
+        ...entry.model.reasoning?.defaultEffort === undefined
           ? {}
-          : { reasoningEffort: model.reasoning.defaultEffort },
+          : { reasoningEffort: entry.model.reasoning.defaultEffort },
       } satisfies ModelSelection,
     }))), [groups])
   const showSearch = choices.length > 4
   const filteredGroups = useMemo(() => groups.map(group => ({
-    ...group, models: rankByName(group.models, showSearch ? query.trim() : ''),
-  })).filter(group => group.models.length > 0), [groups, query, showSearch])
-  const visibleModels = useMemo(() => filteredGroups.flatMap(group => group.models.map(model => ({
-    provider: group.id, model: model.id,
+    ...group,
+    entries: rankByName(
+      group.entries.map(entry => ({ name: entry.model.name, entry })),
+      showSearch ? query.trim() : '',
+    ).map(row => row.entry),
+  })).filter(group => group.entries.length > 0), [groups, query, showSearch])
+  const visibleModels = useMemo(() => filteredGroups.flatMap(group => group.entries.map(entry => ({
+    provider: entry.provider.id, model: entry.model.id,
   }))), [filteredGroups])
   const currentVisibleIndex = visibleModels.findIndex(model =>
     model.provider === state.current?.provider && model.model === state.current.model)
@@ -465,7 +534,7 @@ export function ModelSelect(
       >
         <IconDataOutlineRegular className={css.triggerIcon} size={16} />
         <span className={css.triggerLabel}>
-          {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.group.provider, currentChoice.model, 'trigger', true)}
+          {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.provider, currentChoice.model, 'trigger', true)}
         </span>
         {effortLabel !== undefined && <span className={css.triggerEffort}>{effortLabel}</span>}
         {busy
@@ -491,7 +560,7 @@ export function ModelSelect(
               <button ref={itemRef()} type="button" role="menuitem" className={css.cell} onClick={() => { drill('model') }}>
                 <span className={css.cellLabel}>{t('menu.model')}</span>
                 <span className={css.cellValue}>
-                  {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.group.provider, currentChoice.model, 'menu', true)}
+                  {currentChoice === undefined ? modelLabel : renderModelLabel(currentChoice.provider, currentChoice.model, 'menu', true)}
                 </span>
                 <IconChevronRightOutlineRegular className={css.cellChevron} />
               </button>
@@ -569,11 +638,14 @@ export function ModelSelect(
               >
                 {filteredGroups.map((group) => {
                   return (
-                    <MenuGroup key={group.id} label={group.provider.name}>
-                      {group.models.map((model) => {
+                    <MenuGroup key={group.id} label={group.name}>
+                      {group.entries.map((entry) => {
+                        const model = entry.model
+                        const provider = entry.provider
                         const index = modelIndex++
-                        const selected = state.current?.provider === group.id && state.current.model === model.id
-                        return (
+                        const selected = state.current?.provider === provider.id && state.current.model === model.id
+                        const favorited = favoriteKeys.has(favoriteKey(provider.id, model.id))
+                        const button = (
                           <button
                             ref={itemRef()}
                             type="button"
@@ -590,20 +662,49 @@ export function ModelSelect(
                               if (showSearch) setHighlightedIndex(index)
                               else itemRefs.current[index]?.focus()
                             }}
-                            key={model.id}
                             title={model.name}
                             disabled={busy}
-                            onClick={() => { choose({ provider: group.id, model: model.id }) }}
+                            onClick={() => { choose({ provider: provider.id, model: model.id }) }}
                           >
                             <span className={css.optionCopy}>
-                              <span className={css.modelName}>{renderModelLabel(group.provider, model, 'option', selected)}</span>
+                              <span className={css.modelName}>{renderModelLabel(provider, model, 'option', selected)}</span>
                             </span>
                             <span className={css.check}>
-                              {pending?.provider === group.id && pending.model === model.id
+                              {pending?.provider === provider.id && pending.model === model.id
                                 ? <StateDot state="ongoing" />
                                 : selected ? <IconCheckOutlineRegular /> : null}
                             </span>
                           </button>
+                        )
+                        // Without a favorites face (or before it resolves) rows stay
+                        // bare buttons, exactly as before the feature existed.
+                        if (favorites === undefined || !favoritesEnabled) {
+                          return <Fragment key={favoriteKey(provider.id, model.id)}>{button}</Fragment>
+                        }
+                        return (
+                          <div className={css.modelRow} key={favoriteKey(provider.id, model.id)}>
+                            {button}
+                            <button
+                              type="button"
+                              className={clsx(css.star, favorited && css.starOn)}
+                              aria-label={t(favorited ? 'favorites.remove' : 'favorites.add', { model: model.name })}
+                              aria-pressed={favorited}
+                              tabIndex={-1}
+                              disabled={busy}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void favorites.toggle(provider.id, model.id).catch((error: unknown) => {
+                                  toastSeq.current += 1
+                                  setToast({
+                                    seq: toastSeq.current,
+                                    text: t('error.action', { message: error instanceof Error ? error.message : String(error) }),
+                                  })
+                                })
+                              }}
+                            >
+                              <StarGlyph filled={favorited} />
+                            </button>
+                          </div>
                         )
                       })}
                     </MenuGroup>

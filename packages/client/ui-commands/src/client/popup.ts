@@ -11,7 +11,7 @@
  */
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
-import type { TokenSpan } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import type { ClientSessionContext, TokenSpan } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { PopupSearchLabels, PopupSearchMode, PopupSelectSpec, SelectOption } from './contract.ts'
 import { rankByName } from '@deepseek-ai/dsh-client-ui-primitives'
 import { groupOptions } from './option-groups.ts'
@@ -193,6 +193,31 @@ export class PopupSelectController<TCtx = unknown> {
     )
   }
 
+  /**
+   * Re-fetch the open binding's rows in place, keeping the live search text and
+   * re-parking the highlight. Used after a row action so business state changes
+   * (pressed/grouping) appear without closing the shell.
+   * @param binding - the binding that owns the refresh; a superseded binding writes nothing.
+   * @param preferId - the acted-on row to keep highlighted when the refreshed list still shows it.
+   */
+  private async reload(binding: OpenBinding<TCtx>, preferId?: string): Promise<void> {
+    let options: readonly SelectOption[]
+    try {
+      options = await binding.spec.options(binding.context, binding.abort.signal)
+    } catch (error) {
+      console.error(`[ui-commands] popupSelect options reload failed for /${binding.command}:`, error)
+      if (this.binding !== binding) return
+      this.state.set({ ...this.state.getSnapshot(), status: 'failed', options: [], active: 0, error: errorText(error) })
+      return
+    }
+    if (this.binding !== binding) return
+    const current = this.state.getSnapshot()
+    const rows = filterOptions(options, current.search, current.searchMode)
+    const preferred = preferId === undefined ? -1 : rows.findIndex(option => option.id === preferId)
+    const active = preferred === -1 ? currentIndex(options, current.search, current.searchMode) : preferred
+    this.state.set({ ...current, status: 'ready', options, active, error: null })
+  }
+
   /** Re-run a failed options fetch (search survives; no-op unless status is 'failed'). */
   retry(): void {
     const binding = this.binding
@@ -261,6 +286,35 @@ export class PopupSelectController<TCtx = unknown> {
       return
     }
     await this.settle(binding, option)
+  }
+
+  /**
+   * Run one row's trailing control without selecting it: await the business
+   * action, then reload the option list in place so pressed/grouping changes
+   * appear without closing the popup. A failure keeps the shell open with the
+   * search/highlight intact and surfaces the error; no token is consumed.
+   * @param index - filtered-row index of the row whose control was clicked.
+   */
+  async invokeAction(index: number): Promise<void> {
+    const binding = this.binding
+    const s = this.state.getSnapshot()
+    if (binding === null || !s.open || s.status !== 'ready' || s.submitting || s.confirming !== null) return
+    const option = filterOptions(s.options, s.search, s.searchMode)[index]
+    if (option === undefined || option.action === undefined) return
+    const action = option.action
+    // The session wiring opens every shell with the contract's context
+    // projection; TCtx stays generic only so tests can pass fakes.
+    const context = binding.context as TCtx & ClientSessionContext
+    try {
+      await action.invoke(context)
+    } catch (error) {
+      console.error(`[ui-commands] popupSelect action failed for /${binding.command}:`, error)
+      if (this.binding !== binding) return // dismissed/reopened/disposed while the action flew
+      this.state.set({ ...this.state.getSnapshot(), error: errorText(error) })
+      return
+    }
+    if (this.binding !== binding) return // late success: no state write
+    await this.reload(binding, option.id)
   }
 
   /**
