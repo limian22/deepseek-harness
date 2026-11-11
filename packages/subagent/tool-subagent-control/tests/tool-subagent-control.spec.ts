@@ -527,16 +527,18 @@ describe('dsh-tool-subagent-control', () => {
     await reloaded.dispose()
   })
 
-  it('defaults interruption on and rejects non-boolean configuration', () => {
-    expect(tool.Config({})).toEqual({ interrupt: true })
-    expect(tool.Config({ interrupt: false })).toEqual({ interrupt: false })
+  it('defaults interruption and model routing on and rejects non-boolean configuration', () => {
+    expect(tool.Config({})).toEqual({ interrupt: true, model: true })
+    expect(tool.Config({ interrupt: false })).toEqual({ interrupt: false, model: true })
+    expect(tool.Config({ model: false })).toEqual({ interrupt: true, model: false })
     expect(() => tool.Config({ interrupt: 'false' } as never)).toThrow()
+    expect(() => tool.Config({ model: 'false' } as never)).toThrow()
   })
 
   it('has the namespace-plugin export shape (no stray default)', () => {
     expect('default' in tool).toBe(false)
     expect(tool.name).toBe('tool-subagent-control')
-    expect(tool.inject).toEqual(['tools', 'subagents', 'agents', 'systemPrompt'])
+    expect(tool.inject).toEqual(['tools', 'subagents', 'agents', 'systemPrompt', 'llm', 'sessionProjections'])
     expect(typeof tool.apply).toBe('function')
   })
 })

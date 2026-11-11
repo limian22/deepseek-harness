@@ -279,6 +279,12 @@ export interface SessionCreateValue {
 /** Session model-selection request. */
 export interface SessionSelectModelRequest extends ModelSelection {
   readonly sessionId: SessionId
+  /**
+   * Whether this selection also becomes the default for new Sessions. Subagent
+   * sessions pass `false`: their page selects the model of that delegated
+   * Session only, without rewriting the user's default. Defaults to `true`.
+   */
+  readonly persistDefault?: boolean
 }
 
 /** Accepted model selection after Host resolution. */

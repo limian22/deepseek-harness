@@ -7,8 +7,9 @@
  * A switch made in either entry is what the other shows next. Failures
  * ride each entry's own retry surface (popup shell error/retry; seat menu
  * inline error) without forking the state. Addressed subagent sessions expose
- * neither entry because those Agent-bound RPCs would activate persisted
- * history outside the direct-parent continuation path.
+ * both entries so a delegated Session can be re-routed from its own page; a
+ * selection there records that Session's model only and never rewrites the
+ * default for new Sessions.
  */
 // Type-only: the carrier types, the forwarded Host-event face and the ctx.remote merge.
 import type { ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
@@ -182,13 +183,12 @@ export function apply(ctx: ClientContext): void {
   ctx.inject(['commandUi', 'modelDirectories'], (scope: ClientContext) => {
     const command = scope.get('commandUi') as CommandUiContract
     const models = scope.modelDirectories
-    const sessions = scope.sessions
     scope.effect(() => command.register({
       name: 'model',
       label: () => t('command.label'),
       description: () => t('command.description'),
       icon: IconDataOutlineRegular,
-      available: session => sessions.subagentAddress(session.sessionId) === undefined,
+      available: () => true,
       ui: {
         kind: 'popupSelect',
         searchLabels: () => ({
@@ -196,16 +196,8 @@ export function apply(ctx: ClientContext): void {
           empty: t('empty.models'),
           noResults: t('search.empty'),
         }),
-        options: async (session) => {
-          if (sessions.subagentAddress(session.sessionId) !== undefined) {
-            throw new Error('model selection is unavailable for addressed subagent sessions')
-          }
-          return optionsOf(await models.directoryFor(session.sessionId).load(), t, favorites)
-        },
+        options: async session => optionsOf(await models.directoryFor(session.sessionId).load(), t, favorites),
         onSelect: async (option, session) => {
-          if (sessions.subagentAddress(session.sessionId) !== undefined) {
-            throw new Error('model selection is unavailable for addressed subagent sessions')
-          }
           const directory = models.directoryFor(session.sessionId)
           const selection = selectionOf(directory.store.getSnapshot(), option.id)
           if (selection === undefined) {
@@ -224,7 +216,6 @@ export function apply(ctx: ClientContext): void {
   // Entry 2: the composer's named model seat over the SAME directory.
   ctx.inject(['slots', 'modelDirectories'], (scope: ClientContext) => {
     const models = scope.modelDirectories
-    const sessions = scope.sessions
     scope.slots.inject('conversation.input.model', () => scope.slots.register({
       name: 'conversation.input.model',
       locale: NS,
@@ -235,18 +226,15 @@ export function apply(ctx: ClientContext): void {
       },
       inject: (sessionId): ModelSelectInjected => {
         const directory = models.directoryFor(sessionId)
-        const available = sessions.subagentAddress(sessionId) === undefined
         return {
-          available,
+          available: true,
           directory: directory.store,
           load: () => {
-            if (available) directory.load().catch(() => { /* surfaced on the store */ })
+            directory.load().catch(() => { /* surfaced on the store */ })
           },
           favorites,
           resolveText: text => ctx.locale.resolveText(text),
-          select: (selection: ModelSelection) => available
-            ? directory.select(selection)
-            : Promise.resolve(undefined),
+          select: (selection: ModelSelection) => directory.select(selection),
         }
       },
     }, ModelSelect))

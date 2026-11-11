@@ -68,12 +68,22 @@ const GROUPS = [{
   }],
 }]
 
+/** One recorded `session.selectModel` call, including whether it also persists the default. */
+interface SelectModelPayload {
+  sessionId: SessionId
+  provider: string
+  model: string
+  reasoningEffort?: string
+  persistDefault?: boolean
+}
+
 /** Boot the plugin over fake faces + a stateful fake host (current moves on selectModel). */
 async function bench(locale: 'zh' | 'en' = 'zh') {
   const ctx = new Context()
   let defaultSelection: ModelSelection = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
   let selected = defaultSelection
   const calls = { models: 0, select: 0 }
+  let lastSelect: SelectModelPayload | undefined
   const projections = new Map<SessionId, SnapshotStore<ModelSelectionProjection | undefined>>()
   // Whether the Host advertises available models for the current route.
   let routable = true
@@ -94,8 +104,9 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
         },
       })
     },
-    selectModel: (payload: { sessionId: SessionId; provider: string; model: string; reasoningEffort?: string }) => {
+    selectModel: (payload: SelectModelPayload) => {
       calls.select += 1
+      lastSelect = payload
       if (selectionFailure !== undefined) return Promise.resolve({ ok: false as const, error: selectionFailure })
       selected = {
         provider: payload.provider,
@@ -213,6 +224,7 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
   }
   return {
     ctx, fiber, mint, calls, remote, track,
+    lastSelect: () => lastSelect,
     contribution: () => contribution!,
     popup: (): PopupSelectSpec => {
       const ui = contribution!.ui
@@ -572,30 +584,24 @@ describe('ui-model-selection dual entry', () => {
     expect(() => b.seat().inject!(sid('ghost'))).toThrow(/resolved no scope/)
   })
 
-  it('withholds both model entries from addressed subagent sessions without Agent-bound RPCs', async () => {
+  it('exposes both model entries to addressed subagent sessions and keeps the default untouched', async () => {
     const b = await bench()
     b.mint('child')
     b.address(sid('child'))
 
-    expect(b.contribution().available(projection('child'))).toBe(false)
-    await expect(b.popup().options(
-      projection('child'),
-      new AbortController().signal,
-    )).rejects.toThrow(/unavailable for addressed subagent/)
+    expect(b.contribution().available(projection('child'))).toBe(true)
+    expect(await b.popup().options(projection('child'), new AbortController().signal)).not.toHaveLength(0)
 
     const face = b.seat().inject!(sid('child'))
-    expect(face.available).toBe(false)
+    expect(face.available).toBe(true)
     face.load()
-    await expect(face.select({ provider: 'deepseek', model: 'deepseek-v4-pro' })).resolves.toBeUndefined()
-    await expect(b.ctx.modelDirectories.directoryFor(sid('child')).load())
-      .rejects.toThrow(/unavailable for addressed subagent/)
-    await expect(b.ctx.modelDirectories.directoryFor(sid('child')).select({
+    await expect(face.select({ provider: 'deepseek', model: 'deepseek-v4-pro' })).resolves.toEqual({ ok: true })
+    expect(b.lastSelect()).toEqual({
+      sessionId: sid('child'),
       provider: 'deepseek',
       model: 'deepseek-v4-pro',
-    })).rejects.toThrow(/unavailable for addressed subagent/)
-    b.ctx.emit('connection/reset')
-    await Promise.resolve()
-    expect(b.calls).toEqual({ models: 2, select: 0 })
+      persistDefault: false,
+    })
   })
 
   it('pins favorited models into a leading group and exposes a star action on every row', async () => {

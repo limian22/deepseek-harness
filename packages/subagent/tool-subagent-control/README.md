@@ -40,7 +40,7 @@ With the required services available, load the subagent service, a backend, the 
 - name: '@deepseek-ai/dsh-tool-subagent-control'
 ```
 
-Set `config.interrupt: false` to omit `interrupt_agent`. The default is `true`. The other three tools and `ctx.subagents.interrupt()` remain available. See the generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-tool-subagent-control).
+Set `config.interrupt: false` to omit `interrupt_agent`, and `config.model: false` to omit `set_subagent_model`. Both default to `true`. The remaining tools and `ctx.subagents.interrupt()` stay available. See the generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-tool-subagent-control).
 
 ### send_message
 
@@ -49,6 +49,10 @@ Sends a message to another agent in the same subagent tree. `agent` takes a name
 ### interrupt_agent
 
 `agent` names a descendant the same way `send_message` names its target. External executions stop permanently and cannot receive follow-ups. Local targets stop only their current turn: queued messages stay parked until a later `send_message`, descendants keep running, and the child stays available for follow-ups. The call returns when the stop request is accepted, not when the target is quiet; interrupting an already-finished agent is an accepted no-op, and self, sibling, stale, and non-ancestor callers get errored results.
+
+### set_subagent_model
+
+Changes the model a live descendant uses from its next turn on. `agent` names the target the same way `send_message` does. `provider` and `model` must name a route the target Session authorizes for children; when that Session records an allowlist, a route outside it is refused and the allowed routes are named in the error. `reasoning_effort` is optional. The change is appended as that Session's own `model/selection`, so it survives restart, applies to that Session alone, and never rewrites the deployment default for new Sessions. Work already in progress finishes first; the target must still have a live Agent, so resume it with `send_message` before changing its model.
 
 <a id="wait_agent"></a>
 ### wait_agent

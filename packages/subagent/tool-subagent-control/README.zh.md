@@ -40,7 +40,7 @@ kind: "package-reference"
 - name: '@deepseek-ai/dsh-tool-subagent-control'
 ```
 
-设置 `config.interrupt: false` 可省略 `interrupt_agent`。默认值为 `true`。其余三个工具和 `ctx.subagents.interrupt()` 仍然可用。参见生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tool-subagent-control)。
+设置 `config.interrupt: false` 可省略 `interrupt_agent`，设置 `config.model: false` 可省略 `set_subagent_model`。两者默认均为 `true`。其余工具和 `ctx.subagents.interrupt()` 仍然可用。参见生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tool-subagent-control)。
 
 ### send_message
 
@@ -49,6 +49,10 @@ kind: "package-reference"
 ### interrupt_agent
 
 `agent` 指定后代的方式与 `send_message` 指定目标的方式相同。外部执行永久停止，不能接收后续消息。本地目标只停止当前轮次：排队消息保留到后续 `send_message`，后代继续运行，子级仍可接受后续任务。调用在停止请求被接受时返回，不等待目标静止；中断已结束代理是成功的空操作，自身、同级、过期或非祖先调用方会收到错误。
+
+### set_subagent_model
+
+更改在线后代从下一轮起使用的模型。`agent` 指定目标的方式与 `send_message` 相同。`provider` 与 `model` 必须是目标 Session 为其子级授权的路由；当该 Session 记录了白名单时，白名单外的路由会被拒绝，并在错误中列出允许的路由。`reasoning_effort` 可选。改动以该 Session 自己的 `model/selection` 追加，因此重启后仍生效、只影响该 Session，且不会改写部署为新 Session 使用的默认模型。进行中的工作先完成；目标必须仍有在线 Agent，需要时先用 `send_message` 恢复它再改模型。
 
 <a id="wait_agent"></a>
 ### wait_agent

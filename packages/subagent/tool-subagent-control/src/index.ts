@@ -16,20 +16,24 @@ import { ROOT_AGENT_NAME } from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-agent-team'
 import { registerListAgents } from './list-agents.ts'
+import { registerSetSubagentModel } from './set-model.ts'
 import { registerWaitAgent } from './wait-agent.ts'
 
 export const name = 'tool-subagent-control'
-export const inject = ['tools', 'subagents', 'agents', 'systemPrompt']
+export const inject = ['tools', 'subagents', 'agents', 'systemPrompt', 'llm', 'sessionProjections']
 
 /** Optional subagent control tools. */
 export interface Config {
   /** Register `interrupt_agent`. Defaults to true; false leaves the service API available. */
   interrupt?: boolean
+  /** Register `set_subagent_model`. Defaults to true. */
+  model?: boolean
 }
 
 /** Loader schema for optional subagent control tools. */
 export const Config: z<Config> = z.object({
   interrupt: z.boolean().default(true),
+  model: z.boolean().default(true),
 })
 
 /**
@@ -40,6 +44,7 @@ export const Config: z<Config> = z.object({
 export function apply(ctx: Context, config: Config = {}): void {
   const interrupt = config.interrupt !== false
   const listAgents = registerListAgents(ctx)
+  if (config.model !== false) registerSetSubagentModel(ctx)
   registerWaitAgent(ctx)
   const sendMessage = defineTool({
     name: 'send_message',

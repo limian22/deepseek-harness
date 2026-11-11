@@ -82,6 +82,7 @@ export class ModelDirectoryResolver extends Service {
     const directory = new ModelDirectory(
       this.ctx.remote.session,
       sessionId,
+      () => true,
       () => sessions.subagentAddress(sessionId) === undefined,
       this.catalog,
       binding.session.projections.faceOf('modelSelection'),

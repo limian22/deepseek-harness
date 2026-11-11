@@ -52,6 +52,7 @@ export class ModelDirectory {
    * @param sessions - the session wire face (captured from the plugin's root connection).
    * @param sessionId - the owning session.
    * @param available - whether this session may use Agent-bound model RPCs.
+   * @param persistDefault - whether a selection here also becomes the default for new Sessions.
    * @param catalog - Host-generation catalog shared by every Session.
    * @param projected - durable model selection projected from Session history.
    * @param isBlank - whether this Session has no first message yet.
@@ -61,6 +62,7 @@ export class ModelDirectory {
     private readonly sessions: Pick<TypertClientRemote['session'], 'selectModel'>,
     private readonly sessionId: SessionId,
     private readonly available: () => boolean,
+    private readonly persistDefault: () => boolean,
     private readonly catalog: ModelCatalogDirectory,
     private readonly projected: ObservableSnapshot<unknown>,
     private readonly isBlank: () => boolean,
@@ -103,6 +105,7 @@ export class ModelDirectory {
       ...selection.reasoningEffort === undefined
         ? {}
         : { reasoningEffort: selection.reasoningEffort },
+      ...this.persistDefault() ? {} : { persistDefault: false },
     })
     if (this.disposed || generation !== this.generation) {
       return result.ok ? { ok: true, value: undefined } : result

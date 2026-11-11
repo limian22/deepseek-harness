@@ -18,14 +18,17 @@
   en: f486d856fd8e392c
   zh: 6ddbc59dd08d3c49
 /deepseek-ai-dsh-tool-subagent-control/use-this-package/minimal-configuration:
-  en: d224de77b41ed4e4
-  zh: f1e94f9cc9e04384
+  en: 851307fc777a29c8
+  zh: 8253f2286aff5e1c
 /deepseek-ai-dsh-tool-subagent-control/use-this-package/send-message:
   en: fa4b7d45c45e172f
   zh: d74e402d32b48b1c
 /deepseek-ai-dsh-tool-subagent-control/use-this-package/interrupt-agent:
-  en: ac4cfa54d61e96a7
-  zh: 367e4109549eac31
+  en: 7ae4e4fc141f888c
+  zh: c8cc9068b46ef1ce
+/deepseek-ai-dsh-tool-subagent-control/use-this-package/set-subagent-model:
+  en: 6414ef770707f44f
+  zh: b0d4db241aacdb1e
 /deepseek-ai-dsh-tool-subagent-control/use-this-package/wait-agent:
   en: a7d5ecc38bd7a94b
   zh: 732c5e0ef5abc2a0
