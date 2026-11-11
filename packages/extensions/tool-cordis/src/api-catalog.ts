@@ -3056,13 +3056,13 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         signature: 'abstract searchSessions( request: SessionSearchRequest, exec?: SessionSearchExecContext, ): Promise<SessionSearchPage<SessionSearchHit>>',
         description: 'Search the live-preferred logical corpus and group by session.',
         parameters: [{ name: 'request', description: 'query text, metadata filters, page size, and cursor.' }, { name: 'exec', description: 'optional cancellation control.' }],
-        returns: 'session hits ranked by their strongest matching event.',
+        returns: 'session hits ranked by their strongest matching event. Asynchronous providers include scoped coverage and may return partial indexed history.',
       },
       {
         signature: 'abstract searchEvents( request: SessionEventSearchRequest, exec?: SessionSearchExecContext, ): Promise<SessionEventSearchPage>',
         description: 'Search events within one live-preferred logical session.',
         parameters: [{ name: 'request', description: 'target session, query text, filters, page size, and cursor.' }, { name: 'exec', description: 'optional cancellation control.' }],
-        returns: 'matching event hits and their target header from one indexed generation.',
+        returns: 'matching event hits and their target header from one indexed generation. Asynchronous providers include coverage when indexing is pending or incomplete.',
       },
       {
         signature: 'listSessions(signal?: AbortSignal): Promise<SessionRecord[]>',
@@ -8753,6 +8753,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface SessionResultRange {\n    from?: number;\n    to?: number;\n}',
   },
   {
+    name: 'SessionSearchCoverage',
+    declaration: 'export interface SessionSearchCoverage {\n    state: \'initializing\' | \'syncing\' | \'ready\' | \'degraded\';\n    checkedAt?: number;\n    indexedSessions?: number;\n    pendingSessions?: number;\n    failedSessions?: number;\n}',
+  },
+  {
     name: 'SessionSearchCursor',
     declaration: 'export type SessionSearchCursor = Branded<\'SessionSearchCursor\'>;',
   },
@@ -8770,7 +8774,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SessionSearchPage',
-    declaration: 'export interface SessionSearchPage<T> {\n    items: readonly T[];\n    nextCursor?: SessionSearchCursor;\n}',
+    declaration: 'export interface SessionSearchPage<T> {\n    items: readonly T[];\n    nextCursor?: SessionSearchCursor;\n    coverage?: SessionSearchCoverage;\n}',
   },
   {
     name: 'SessionSearchValue',

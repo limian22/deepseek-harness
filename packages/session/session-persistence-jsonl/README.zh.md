@@ -47,6 +47,7 @@ kind: "package-reference"
 | `root` | 必填 | 所有会话文件的根目录 |
 | `compression` | `'zstd'` | 物理编码：`'zstd'` 带校验和帧，或 `'none'` 换行分隔 UTF-8 文本 |
 | `listConcurrency` | `3` | 同时进行的目录、header 与 stat 读取上限，由该后端所有并发的列举共用 |
+| `readWorker` | `false` | 在单个长驻 Worker Thread 中解码并校验当前 generation 的冷 `read` open，而不是在发起线程；历史 generation 仍在进程内处理 |
 
 JSONL fork 创建会把提供的子会话历史复制到子文件，再返回写句柄；它不读取父会话文件。读取打开会等待本进程中正在关闭的写者排空后，再读取该会话历史；排空失败会停止打开。
 
@@ -94,6 +95,14 @@ JSONL fork 创建会把提供的子会话历史复制到子文件，再返回写
 
 历史格式的 `stat` 与 `list` 修订号需要与根目录 Session 数量成正比的元数据工作。首次正文准备扫描所有所选 header 并解码直属子正文；复用准备缓存仍扫描成员集合并检查修订。只读访问从不发布升级，因此冷进程与被淘汰的准备缓存会重复这些工作。当前 V4 正文读取和修订号避开历史全库扫描。见[实测成本与诊断命令](../../../.agents/notes/implemented/architecture/2026-08-31-released-session-format-migrations.zh.md#catalog-scan-measurements)。
 
+### 工作线程冷读
+
+启用 `readWorker: true` 后，对所选当前 generation 的冷 `open(id, 'read')` 会在一个长驻 Worker Thread 中完成解码与校验，而不是在发起线程。该 worker 以禁用卸载的配置在同一根目录上启动同一后端，并且只调用 `open(id, 'read')`、`read()` 与 `close()`——它从不打开写句柄、发布迁移、获取租约或写入产物。公开的 `SessionPersistence` 句柄 API 与返回值不变：调用方仍会收到与进程内读取相同且已校验的 header、inherited 计数、冻结共享状态和事件。
+
+适用范围是明确的。历史 generation、产物缺失、未来格式以及 `readWorker: false`（默认值）都使用既有的进程内路径。只有调用方已选定当前 generation 并取得其由 stat 推导的修订号之后才进入 worker 路径；worker 在解码前后各复查该修订号，调用方在结果到达后再检查一次。并发追加导致的修订号变化最多重试三个来源修订，随后交给既有的稳定读取路径——它返回的已提交前缀与进程内 open 完全一致。
+
+worker 的启动、传输、协议或退出失败会让该 `open` 以保留 cause 的 typed worker 失败被拒绝；后端会终止失败的 worker，下一次 open 会重建替代者。它绝不会静默改在调用线程解码，因此坏 worker 无法伪装成成功的进程内读取，也无法掩盖 CPU 回退。卸载后端会等待 worker 终止。解析、解码与格式校验在调用线程之外执行；结果的结构化克隆传递、逐事件的采纳与深度冻结，以及冷日志 memo 化仍在调用线程上执行。工作线程读取快照不包含物理尾部修复元数据；后续写入打开会丢弃该缓存，在写入租约保护下重新构建修复状态后再追加。
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -106,7 +115,7 @@ JSONL fork 创建会把提供的子会话历史复制到子文件，再返回写
 
 ### 设计理念
 
-该后端拥有自己完整的存储运行时（`src/storage.ts`）：`JsonlSessionHandle` 承载逐句柄修改链、带固定批处理窗口与 single-flight 排空的已路由实时事件缓冲、单调读取与幂等 close；一个 tracker 持有进程内单写者认领、teardown 清扫所遍历的打开句柄集合，以及后端自己的会话监听器所路由进的已创建但未实体化待定会话。历史正文读取共享每个 Session 唯一的一次 Decode/Migrate preparation，按 revision 为键的有界 memo 让紧接的观察到恢复交接复用该解析；backend 在 memo 化前只对每个 event graph 深度冻结一次，因此后续 handle read 无需复制或再次冻结。只有写 open 才发布准备好的后继。本包暴露插件导出与配置类型——具体类是私有的，因此消费方只耦合 `ctx.sessionPersistence`，其可观察行为由共享 seam 测试套件（`runPersistenceContract`/`runLiveWritePathContract`）钉住。物理修订号组合 device、inode、size 与纳秒时间戳，供准备缓存、稳定读取重试及发布检查使用。历史格式的公开修订号还加入所选路径排序后及其物理修订号的 SHA-256 指纹；锁文件与保留但未被选中的代际不参与计算。
+该后端拥有自己完整的存储运行时（`src/storage.ts`）：`JsonlSessionHandle` 承载逐句柄修改链、带固定批处理窗口与 single-flight 排空的已路由实时事件缓冲、单调读取与幂等 close；一个 tracker 持有进程内单写者认领、teardown 清扫所遍历的打开句柄集合，以及后端自己的会话监听器所路由进的已创建但未实体化待定会话。历史正文读取共享每个 Session 唯一的一次 Decode/Migrate preparation，按 revision 为键的有界 memo 让紧接的观察到恢复交接复用该解析；backend 在 memo 化前只对每个 event graph 深度冻结一次，因此后续 handle read 无需复制或再次冻结。只有写 open 才发布准备好的后继。可选的读 worker（`src/read-worker-client.ts`）在有界队列后最多同时执行一个解码：它在首次符合条件的冷读时懒创建、校验每条边界消息，并在后端 dispose 时终止；`src/read-worker.ts` 在同一根目录上启动第二个禁用卸载的 provider 实例，并且只打开读句柄。本包暴露插件导出与配置类型——具体类是私有的，因此消费方只耦合 `ctx.sessionPersistence`，其可观察行为由共享 seam 测试套件（`runPersistenceContract`/`runLiveWritePathContract`）钉住。物理修订号组合 device、inode、size 与纳秒时间戳，供准备缓存、稳定读取重试、发布检查与 worker 快照一致性检查（`src/revision.ts`）使用。历史格式的公开修订号还加入所选路径排序后及其物理修订号的 SHA-256 指纹；锁文件与保留但未被选中的代际不参与计算。
 
 ### 物理编码
 
@@ -121,6 +130,10 @@ JSONL fork 创建会把提供的子会话历史复制到子文件，再返回写
 | [`src/format.ts`](src/format.ts) | 日志路径派生、header 编码与当前记录扫描 |
 | [`src/generation.ts`](src/generation.ts) | 单遍历史还原、有界 stage 编码、源 revision 检查与排他后继发布 |
 | [`src/migration-verifier.ts`](src/migration-verifier.ts) | stage 与竞争 generation 校验的 Worker 生命周期 |
+| [`src/read-worker-client.ts`](src/read-worker-client.ts) | 懒创建的读 worker 所有权、single-flight 队列、边界校验与可等待的终止 |
+| [`src/read-worker.ts`](src/read-worker.ts) | 读 worker 入口：同一根目录上的只读 provider 实例 |
+| [`src/read-worker-protocol.ts`](src/read-worker-protocol.ts) | worker 配置、请求、响应与生命周期消息的运行时校验 |
+| [`src/revision.ts`](src/revision.ts) | 后端与其读 worker 共用的、由 stat 推导的修订号令牌 |
 | [`src/zstd.ts`](src/zstd.ts) | Zstandard 帧压缩、解码与帧扫描 |
 | [`src/win32.ts`](src/win32.ts) | Windows write-through 发布与目录创建 |
 
@@ -166,6 +179,7 @@ JSONL 存储不修改实时请求前缀。只有重建历史、当前 envelope �
 - **格式迁移保留已配置编码，且只支持 catalog 中的链**——本 build 把受支持的历史代迁移到当前格式；更改压缩需要独立根，保留的旧版本不提供自动 fallback 或 downgrade 支持。
 - **平铺文件存储布局不加载**——加载前使用独立根，或将预发布产物移入项目/会话目录布局。
 - **压缩文件不能直接按行读取**——使用后端加载；或在写入新根前选择 `compression: 'none'`，供外部行读取方使用。
+- **进程外解码只覆盖当前格式的冷读**——读 worker 在调用线程之外解析、解码并校验所选当前 generation，但结果仍要跨结构化克隆边界，且每个事件都会在调用线程上重新校验与冻结；历史 generation、写入，以及观察到修订号变化的后续读取仍在进程内完成。worker 失败会拒绝该 open 而不是回退，因此调用方必须隔离或重试受影响的会话。
 - **不删除会话文件**——日志在 `root` 下累积，直到外部移除；seam 无删除接口。
 - **每会话一个活动写入方**——写句柄认领在所属后端实例内排除第二个写入方，内核锁（`session.lock` 上的非阻塞 `flock(2)`；Windows 上为由该路径派生的命名内核信号量，零文件系统足迹）排除其他所有实例与进程；锁在以写模式打开既有产物时立即获取，新建会话则仅在首次实体化写入之前获取，因此未实体化的会话不留任何文件系统足迹。崩溃持有者的锁随其进程消亡，会话立即可再写入，而活着但卡死的持有者会阻塞写入方直到其进程退出（POSIX 上删除锁文件即放弃该排他；释放本身从不删除它）。咨询式 `flock` 在部分网络文件系统（NFSv3）上不可靠，Windows 信号量名按登录会话隔离。
 - **根作用域的并发卸载不保证顺序**——Cordis 可能在提供者等待消费者清理前，已将正在卸载的消费者移出注册表。此处的依赖顺序仅覆盖移除该提供者所触发的消费者卸载。

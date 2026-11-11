@@ -138,8 +138,14 @@ async function readTitles(
   caller: Caller,
   ids: readonly SessionIdValue[],
   signal: AbortSignal,
+  readMode: 'exact' | 'deferred' = 'exact',
 ): Promise<CompleteTitleMap> {
   const result = new Map<SessionIdValue, TitleView>()
+  if (readMode === 'deferred') {
+    signal.throwIfAborted()
+    for (const id of ids) result.set(id, { text: 'title not loaded' })
+    return result as CompleteTitleMap
+  }
   const observations = await serviceBoundary.call(ctx, signal, 'title observation', () =>
     ctx.sessionQuery.readTitleSnapshots(ids, signal))
   for (const observation of observations) {
@@ -158,8 +164,9 @@ async function readTitle(
   caller: Caller,
   id: SessionIdValue,
   signal: AbortSignal,
+  readMode: 'exact' | 'deferred' = 'exact',
 ): Promise<TitleView> {
-  return (await readTitles(ctx, caller, [id], signal)).get(id)
+  return (await readTitles(ctx, caller, [id], signal, readMode)).get(id)
 }
 
 function unavailableTitle(

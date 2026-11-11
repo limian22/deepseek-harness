@@ -1,11 +1,12 @@
 /** SQLite schema for the disposable session full-text read model. */
 
 import type { DatabaseSync } from 'node:sqlite'
-import { mkdir, open } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { open } from 'node:fs/promises'
+import { resolve } from 'node:path'
+import { claimIndexOwnership } from './ownership.ts'
 
 /** Current derived-index schema version. Incompatible versions reset in place. */
-export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 8
+export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 9
 
 /** SQLite application id protecting unrelated databases from derived resets. */
 export const SESSION_QUERY_SQLITE_APPLICATION_ID = 0x44534851
@@ -22,6 +23,7 @@ const DERIVED_USER_TABLES = new Set([
   'persisted_docs_content',
   'persisted_docs_docsize',
   'persisted_docs_config',
+  'sync_sessions',
 ])
 
 /**
@@ -37,43 +39,69 @@ async function createDatabaseFile(path: string): Promise<void> {
   }
 }
 
+/** One opened derived index and the cross-process claim that protects its path. */
+export interface OpenedSearchDatabase {
+  /** Initialized database handle owned by the search service. */
+  readonly db: DatabaseSync
+  /**
+   * Close the ownership sidecar, which releases the path for a successor.
+   * Call only after {@link OpenedSearchDatabase.db} is closed. Idempotent.
+   * @returns resolution after the ownership connection is closed.
+   */
+  release(): Promise<void>
+}
+
 /**
  * Open, validate, and initialize persistent and connection-local schemas.
+ *
+ * The index path is claimed before the database is opened, so a second process
+ * or service instance is refused with a diagnosable failure instead of racing
+ * this connection. A filesystem path that cannot be opened releases the claim.
  * @param path - dedicated derived-index path or `:memory:`; missing filesystem paths are created owner-only.
  * @param journalMode - validated SQLite journal mode.
- * @returns initialized database handle owned by the search service.
+ * @returns initialized database handle plus its ownership release.
  */
-export async function openSearchDatabase(path: string, journalMode: JournalMode): Promise<DatabaseSync> {
+export async function openSearchDatabase(
+  path: string,
+  journalMode: JournalMode,
+): Promise<OpenedSearchDatabase> {
   const actual = path === ':memory:' ? path : resolve(path)
-  if (actual !== ':memory:') {
-    await mkdir(dirname(actual), { recursive: true, mode: 0o700 })
-    await createDatabaseFile(actual)
-  }
-  const { DatabaseSync } = await import('node:sqlite')
-  const db = new DatabaseSync(actual)
+  const ownership = await claimIndexOwnership(actual)
   try {
-    const { application_id: applicationId } = db.prepare('PRAGMA application_id').get() as { application_id: number }
-    const { user_version: version } = db.prepare('PRAGMA user_version').get() as { user_version: number }
-    const userTables = listUserTables(db)
-    if (applicationId !== 0 && applicationId !== SESSION_QUERY_SQLITE_APPLICATION_ID) {
-      throw new Error(`session-search database at "${actual}" belongs to another application`)
+    if (actual !== ':memory:') await createDatabaseFile(actual)
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(actual)
+    try {
+      assertRecognizedDatabase(db, actual)
+      // Apply mutating pragmas only after refusing foreign or canonical files.
+      // journalMode is a validated closed union, not caller-controlled SQL.
+      db.exec(`PRAGMA journal_mode = ${journalMode.toUpperCase()}`)
+      ensurePersistentSchema(db)
+      ensureTemporarySchema(db)
+      return { db, release: () => ownership.release() }
+    } catch (error: unknown) {
+      db.close()
+      throw error
     }
-    if (applicationId === 0 && userTables.length > 0) {
-      throw new Error(`session-search database at "${actual}" is not an empty or recognized derived index`)
-    }
-    if (applicationId === SESSION_QUERY_SQLITE_APPLICATION_ID) {
-      assertDerivedUserTables(actual, userTables)
-      if (version !== SESSION_QUERY_SQLITE_SCHEMA_VERSION) resetDerivedSchema(db, userTables)
-    }
-    // Apply mutating pragmas only after refusing foreign or canonical files.
-    // journalMode is a validated closed union, not caller-controlled SQL.
-    db.exec(`PRAGMA journal_mode = ${journalMode.toUpperCase()}`)
-    ensurePersistentSchema(db)
-    ensureTemporarySchema(db)
-    return db
   } catch (error: unknown) {
-    db.close()
+    await ownership.release()
     throw error
+  }
+}
+
+function assertRecognizedDatabase(db: DatabaseSync, actual: string): void {
+  const { application_id: applicationId } = db.prepare('PRAGMA application_id').get() as { application_id: number }
+  const { user_version: version } = db.prepare('PRAGMA user_version').get() as { user_version: number }
+  const userTables = listUserTables(db)
+  if (applicationId !== 0 && applicationId !== SESSION_QUERY_SQLITE_APPLICATION_ID) {
+    throw new Error(`session-search database at "${actual}" belongs to another application`)
+  }
+  if (applicationId === 0 && userTables.length > 0) {
+    throw new Error(`session-search database at "${actual}" is not an empty or recognized derived index`)
+  }
+  if (applicationId === SESSION_QUERY_SQLITE_APPLICATION_ID) {
+    assertDerivedUserTables(actual, userTables)
+    if (version !== SESSION_QUERY_SQLITE_SCHEMA_VERSION) resetDerivedSchema(db, userTables)
   }
 }
 
@@ -134,6 +162,27 @@ function ensurePersistentSchema(db: DatabaseSync): void {
       codepoint_length UNINDEXED,
       tokenize = 'unicode61'
     )
+  `)
+  // Sources known from a completed listing that are not searchable yet: covered
+  // by a live owner, awaiting a read, or failed. Rows remain invisible to MATCH.
+  // `seeded` carries the listed header's fork flag; the exact inherited cut is
+  // only known after the read, so a committed row stores it instead.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sync_sessions (
+      id             TEXT PRIMARY KEY,
+      version        INTEGER NOT NULL,
+      created_at     INTEGER NOT NULL,
+      cwd            TEXT,
+      parent_session TEXT,
+      seeded         INTEGER NOT NULL CHECK (seeded IN (0, 1)),
+      delegation_depth INTEGER,
+      agent_preset   TEXT,
+      revision       TEXT NOT NULL,
+      state          TEXT NOT NULL CHECK (state IN ('live', 'pending', 'failed')),
+      attempts       INTEGER NOT NULL,
+      error          TEXT,
+      observed_at    INTEGER NOT NULL
+    ) STRICT
   `)
   db.exec(`PRAGMA user_version = ${SESSION_QUERY_SQLITE_SCHEMA_VERSION}`)
 }

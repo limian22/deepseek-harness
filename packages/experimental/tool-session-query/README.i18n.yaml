@@ -26,6 +26,9 @@
 /deepseek-ai-dsh-tool-session-query/use-this-package/what-the-model-can-do:
   en: 560d8d66f8301213
   zh: f4f963d61df8d3a4
+/deepseek-ai-dsh-tool-session-query/use-this-package/background-search-coverage:
+  en: 924e2a777d6e47c8
+  zh: 92b2196ae7a0d445
 /deepseek-ai-dsh-tool-session-query/use-this-package/failures-and-recovery:
   en: 58559adb3f089356
   zh: eddd5dd65811901e
@@ -78,8 +81,8 @@
   en: beaabb79f229692a
   zh: 8573891441963be4
 /deepseek-ai-dsh-tool-session-query/model-experience/tool-results/what-the-model-sees:
-  en: 8a5d8fda38ed6940
-  zh: 84c4047bb8127719
+  en: 1b51527afa8f37f3
+  zh: c9ec3fd8cb71c2a4
 /deepseek-ai-dsh-tool-session-query/model-experience/tool-results/token-effect:
   en: 8078153192ce8c6b
   zh: 839e94c31f741241

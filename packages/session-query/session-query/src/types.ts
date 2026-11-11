@@ -244,12 +244,28 @@ export interface SessionEventSearchDocument extends SessionEventRecord {
   text: string
 }
 
+/** Freshness of the authorized session scope represented by a search page. */
+export interface SessionSearchCoverage {
+  /** Initial discovery, pending updates, completed synchronization, or isolated source failures. */
+  state: 'initializing' | 'syncing' | 'ready' | 'degraded'
+  /** Last successful complete source observation, in Unix epoch milliseconds; absent before one completes. */
+  checkedAt?: number
+  /** Valid indexed sessions matching the request's session predicates; omitted when not established. */
+  indexedSessions?: number
+  /** Sessions awaiting synchronization within the request's session predicates; omitted when unknown. */
+  pendingSessions?: number
+  /** Failed sessions within the request's session predicates; omitted when the scope cannot be established. */
+  failedSessions?: number
+}
+
 /** One cursor-paginated result page. */
 export interface SessionSearchPage<T> {
   /** Results for this page in contract-defined order. */
   items: readonly T[]
   /** Opaque continuation cursor, absent on the final page. */
   nextCursor?: SessionSearchCursor
+  /** Indexed coverage for asynchronous providers; absent when the provider reconciles sources before returning. */
+  coverage?: SessionSearchCoverage
 }
 
 /** Event-search results bound to the indexed target-session observation. */

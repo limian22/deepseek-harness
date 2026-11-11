@@ -3,7 +3,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
-import { scheduler } from 'node:timers/promises'
+import { scheduler, setTimeout as delay } from 'node:timers/promises'
 import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
@@ -17,6 +17,7 @@ import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-j
 import SessionProjectionCache, { checkpointRecord, projectionCacheDomainSpec } from '@deepseek-ai/dsh-session-projection-cache'
 import type { CheckpointRecord } from '@deepseek-ai/dsh-session-projection-cache'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
+import type { Config as SearchConfig } from '@deepseek-ai/dsh-session-query-sqlite'
 import * as SessionStatsPlugin from '@deepseek-ai/dsh-session-stats'
 import SessionTitleService from '@deepseek-ai/dsh-session-title'
 import * as SessionTurnOutlinePlugin from '@deepseek-ai/dsh-session-turn-outline'
@@ -93,6 +94,24 @@ export interface SearchReport {
   readonly memory: CorpusMemory
 }
 
+/** Threshold-free provider diagnostic; first response may have incomplete coverage. */
+export interface IndexSearchReport {
+  readonly mode: 'index-search'
+  readonly synchronization: 'on-search' | 'background' | 'background-worker'
+  readonly bootMs: number
+  readonly firstResponseMs: number
+  readonly firstResponseCpuMs: number
+  readonly firstCoverage: string
+  readonly firstItems: number
+  /** Time from first query start until an explicitly complete result, including readiness polling. */
+  readonly completeMs: number
+  readonly completeCpuMs: number
+  readonly completeItems: number
+  readonly warmQueryMs: readonly number[]
+  readonly warmQueryCpuMs: readonly number[]
+  readonly memory: CorpusMemory
+}
+
 /** Fork report: one fork of each requested source, in request order. */
 export interface ForkReport {
   readonly mode: 'fork'
@@ -107,7 +126,7 @@ export interface ForkReport {
 }
 
 /** Any worker report. */
-export type SessionCorpusReport = AnchorsReport | SeedReport | ListReport | SearchReport | ForkReport
+export type SessionCorpusReport = AnchorsReport | SeedReport | ListReport | SearchReport | IndexSearchReport | ForkReport
 
 const BENCH_MODEL = { provider: 'bench', model: 'bench' } as const
 /** Bound on waiting for fire-and-forget projection-cache write-backs after seeding. */
@@ -132,16 +151,20 @@ async function memory(): Promise<CorpusMemory> {
 }
 
 /** Mount the shipped Web Host's Session list, search, and fork dependencies. */
-async function mountHost(root: string): Promise<{ readonly ctx: Context; readonly controller: SessionController }> {
+async function mountHost(
+  root: string,
+  searchConfig?: SearchConfig,
+  readWorker = false,
+): Promise<{ readonly ctx: Context; readonly controller: SessionController }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
-  await ctx.plugin(JsonlSessionPersistence, { root: join(root, 'sessions'), compression: 'zstd' })
+  await ctx.plugin(JsonlSessionPersistence, { root: join(root, 'sessions'), compression: 'zstd', readWorker })
   await ctx.plugin(Storage)
   await ctx.plugin(StorageJson, { root: join(root, 'storages') })
   await ctx.plugin(StorageDomain, { backend: 'json' })
   await ctx.plugin(SessionProjectionCache, { writeEveryEvents: 200, writeIntervalMs: 5_000 })
   // Content search is opt-in; enabled deployments defer the in-memory index to the first search.
-  await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'first-search' })
+  await ctx.plugin(SqliteSessionQueryEngine, searchConfig ?? { path: ':memory:', openAt: 'first-search' })
   await ctx.sessionProjections.register(agentPresetProjectionDefinition)
   await ctx.plugin(SessionTitleService, { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 })
   await ctx.plugin(SessionStatsPlugin)
@@ -337,6 +360,65 @@ async function measureSearch(root: string): Promise<SearchReport> {
   }
 }
 
+async function measureIndexSearch(
+  root: string,
+  synchronization: IndexSearchReport['synchronization'],
+): Promise<IndexSearchReport> {
+  const started = performance.now()
+  const { ctx } = await mountHost(root, {
+    path: join(root, 'storages', `index-${synchronization}.db`),
+    openAt: 'first-search',
+    syncMode: synchronization === 'on-search' ? 'on-search' : 'background',
+  }, synchronization === 'background-worker')
+  try {
+    const booted = performance.now()
+    const request = { query: SEARCH_QUERIES[0], limit: 20, snapshot: true } as const
+    const cpuStarted = cpuMs()
+    const first = await ctx.sessionQuery.searchSessions(request)
+    const firstDone = performance.now()
+    const cpuFirstDone = cpuMs()
+    let complete = first
+    // Poll an observable result state, not an assumed amount of indexing time.
+    while (complete.coverage !== undefined && complete.coverage.state !== 'ready') {
+      if (complete.coverage.state === 'degraded') throw new Error('synthetic index synchronization failed')
+      if (performance.now() - booted > 120_000) throw new Error('synthetic index did not become complete within 120 seconds')
+      await delay(25)
+      complete = await ctx.sessionQuery.searchSessions(request)
+    }
+    const completeDone = performance.now()
+    const cpuCompleteDone = cpuMs()
+    if (complete.items.length === 0) throw new Error('complete index matched no synthetic Session')
+    const warmQueryMs: number[] = []
+    const warmQueryCpuMs: number[] = []
+    for (let sample = 0; sample < 10; sample += 1) {
+      const queryStarted = performance.now()
+      const queryCpuStarted = cpuMs()
+      const query = sample % 2 === 0 ? SEARCH_QUERIES[0] : SEARCH_QUERIES[1]
+      const result = await ctx.sessionQuery.searchSessions({ query, limit: 20 })
+      warmQueryMs.push(performance.now() - queryStarted)
+      warmQueryCpuMs.push(cpuMs() - queryCpuStarted)
+      if (result.items.length === 0) throw new Error('warm index matched no synthetic Session')
+    }
+    return {
+      mode: 'index-search',
+      synchronization,
+      bootMs: booted - started,
+      firstResponseMs: firstDone - booted,
+      firstResponseCpuMs: cpuFirstDone - cpuStarted,
+      firstCoverage: first.coverage?.state ?? 'complete',
+      firstItems: first.items.length,
+      completeMs: completeDone - booted,
+      completeCpuMs: cpuCompleteDone - cpuStarted,
+      completeItems: complete.items.length,
+      warmQueryMs,
+      warmQueryCpuMs,
+      memory: await memory(),
+    }
+  } finally {
+    await ctx.fiber.dispose()
+  }
+}
+
 async function measureFork(root: string, ranks: readonly number[]): Promise<ForkReport> {
   const started = performance.now()
   const { ctx, controller } = await mountHost(root)
@@ -366,7 +448,7 @@ assertBuiltBenchmarkRuntime(import.meta.url, Object.fromEntries([
   '@deepseek-ai/dsh-session-projection-cache',
 ].map(name => [name, import.meta.resolve(name)])))
 
-const USAGE = 'usage: session-corpus.worker.js <root> <anchors anchors...|seed name count|list count|search|fork ranks...>'
+const USAGE = 'usage: session-corpus.worker.js <root> <anchors anchors...|seed name count|list count|search|index-search on-search|background|background-worker|fork ranks...>'
 const [root, mode, ...rest] = process.argv.slice(2)
 if (root === undefined) throw new Error(USAGE)
 
@@ -393,6 +475,14 @@ switch (mode) {
   case 'search':
     report = await measureSearch(root)
     break
+  case 'index-search': {
+    const [synchronization] = rest
+    if (synchronization !== 'on-search' && synchronization !== 'background' && synchronization !== 'background-worker') {
+      throw new Error(USAGE)
+    }
+    report = await measureIndexSearch(root, synchronization)
+    break
+  }
   case 'fork':
     report = await measureFork(root, counts(rest))
     break

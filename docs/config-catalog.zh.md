@@ -3142,10 +3142,10 @@ export type SessionLogCompressionLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
 
 ## `@deepseek-ai/dsh-session-persistence-jsonl`
 
-- `source`: [`packages/session/session-persistence-jsonl/src/index.ts:94`](../packages/session/session-persistence-jsonl/src/index.ts)
+- `source`: [`packages/session/session-persistence-jsonl/src/index.ts:102`](../packages/session/session-persistence-jsonl/src/index.ts)
 
 ```ts config-catalog
-/** Plugin config for the JSONL backend's root, physical encoding, and listing concurrency. */
+/** Plugin config for the JSONL backend's root, physical encoding, listing concurrency, and optional read worker. */
 export interface Config {
   /**
    * Root directory for all session files. Required (no default): a default of
@@ -3163,6 +3163,15 @@ export interface Config {
    * fingerprints). Defaults to 3.
    */
   listConcurrency?: number
+  /**
+   * Decode and validate cold `read` opens of the selected current generation in
+   * one long-lived Worker Thread instead of the opening thread. The worker runs
+   * this same provider over the same root and only opens read handles; the
+   * public `SessionPersistence` handle API is unchanged. Defaults to false, and
+   * a worker failure surfaces to the caller rather than silently returning to
+   * in-process decoding. Historical generations always decode in-process.
+   */
+  readWorker?: boolean
 }
 
 /** Physical encoding selected for JSONL session artifacts. */
@@ -3202,7 +3211,7 @@ export interface Config {
 
 - `inject`: `sessions`
 - `refs`: [`SessionQueryConfig`](../packages/session-query/session-query/src/index.ts)
-- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:104`](../packages/session-query/session-query-sqlite/src/index.ts)
+- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:117`](../packages/session-query/session-query-sqlite/src/index.ts)
 
 ```ts config-catalog
 /** Combined session-query configuration backed by SQLite full-text search. */
@@ -3233,6 +3242,18 @@ export interface Config extends SessionQueryConfig {
   persistedReadConcurrency?: number
   /** Maximum cold prepared-Session observations the inherited reader retains for reuse. Defaults to 5. */
   preparedSessionCacheSize?: number
+  /**
+   * When durable history is reconciled relative to searches. `on-search`
+   * reconciles the complete source inside every search and reports no
+   * coverage. `background` returns indexed history immediately, reconciles on
+   * an owned background job, and reports freshness through `coverage`.
+   * Defaults to `on-search`.
+   */
+  syncMode?: SyncMode
+  /** Interval between background reconciliations in milliseconds. At most 2147483647 (Node's maximum timer delay); defaults to 5000. */
+  syncIntervalMs?: number
+  /** Concurrent cold-log reads in one background reconciliation. At most `Number.MAX_SAFE_INTEGER`; defaults to 2. */
+  syncReadConcurrency?: number
 }
 
 /** SQLite module/handle opening phase; `never` disables full-text search entirely. */
@@ -3240,6 +3261,9 @@ export type OpenAt = 'startup' | 'first-search' | 'never'
 
 /** Supported SQLite journal modes. */
 export type JournalMode = 'wal' | 'delete' | 'truncate' | 'persist'
+
+/** How searches relate to durable source reconciliation. */
+export type SyncMode = 'on-search' | 'background'
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-session-query-sqlite -->
 

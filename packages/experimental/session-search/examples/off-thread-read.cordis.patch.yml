@@ -1,0 +1,18 @@
+# Activation overlay for @deepseek-ai/dsh-experimental-session-search: decode
+# and validate cold JSONL session logs in a reusable read-only worker thread
+# instead of the Host thread.
+#
+# Apply it after the base layer, for example:
+#   dsh --profile web --patch <this file>
+#
+# A patch replaces the targeted row's whole `config`, so this row restates the
+# base session root. A composition that overrides that root must repeat its own
+# value here. `readWorker` decodes current-format cold logs in a long-lived
+# read-only worker thread. A worker that cannot start, crashes, or returns a
+# malformed frame rejects `open(id, 'read')` with a typed worker failure and is
+# rebuilt for the next open instead of reading on the Host thread; historical
+# and future format generations always decode in process.
+- id: session-persistence-jsonl
+  config:
+    root: !!js dshHomePath('sessions')
+    readWorker: true

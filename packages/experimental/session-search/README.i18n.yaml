@@ -15,11 +15,14 @@
   en: d152484eb41ac6b4
   zh: 988e839059414d27
 /deepseek-ai-dsh-experimental-session-search/use-this-package:
-  en: 5ab81c3861e28980
-  zh: da1a615153b4ea4b
+  en: 508518bc70552c4e
+  zh: a8bb3d399b6ab236
+/deepseek-ai-dsh-experimental-session-search/use-this-package/durable-index-and-process-ownership:
+  en: 1ce07a360222c276
+  zh: e275cae26207132e
 /deepseek-ai-dsh-experimental-session-search/understand-the-implementation:
-  en: 7c40cb34ffc89ed4
-  zh: ce6ff516434ba582
+  en: 81a30868bef71aa1
+  zh: b482f125f0162060
 /deepseek-ai-dsh-experimental-session-search/further-exploration:
   en: 3016959b8c0546d0
   zh: a356ef50b3ce9f77
@@ -30,8 +33,8 @@
   en: 25f20eda0e696067
   zh: 378c4a15a5704ba0
 /deepseek-ai-dsh-experimental-session-search/known-limitations-and-deferred-work:
-  en: 5ba4aae8ef1f62d2
-  zh: a7599243880f7482
+  en: a682c463df35e876
+  zh: 9a0a1e62e825d2dc
 /deepseek-ai-dsh-experimental-session-search/known-limitations-and-deferred-work/dev-note:
   en: 279d01435256cd2a
   zh: 83780964e5de2f54

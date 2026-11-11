@@ -52,6 +52,12 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 Workspace authority is conservative: cross-session access requires exact `cwd` equality between target and caller session, and a caller without `cwd` can inspect only itself. Requested parent ids are deduplicated and authority-checked before search; missing and cross-workspace guesses behave identically. Search results are cursor-free: a capped result asks the model to narrow its query, and never exposes provider cursors, offsets, page sizes, or a model-controlled limit. Timestamps at the tool boundary are timezone-qualified ISO 8601 and become inclusive epoch-millisecond filters.
 
+### Background search coverage
+
+When the provider supplies asynchronous coverage, results include `Search coverage: initializing`, `syncing`, `ready`, or `degraded`. Incomplete searches say `Results may be incomplete` even when no indexed matches are available; they never claim that all prior history was searched. A later ready page does not erase an earlier page's incomplete coverage. Source-check timestamps remain in the typed service response, not model-visible result text.
+
+Asynchronously indexed searches display `title not loaded` instead of reading full cold logs for title enrichment. Session ids and excerpts remain available; exact trace/read operations retain normal title observations. Providers without coverage keep complete-search wording and exact title enrichment.
+
 ### Failures and recovery
 
 Every trusted query-service call crosses one error sanitizer: caller cancellation is preserved exactly, corpus and provider diagnostics go to the internal log, and unsafe or unprintable failures fall back to the fixed `SESSION_QUERY_TOOL_FAILED` code and message. Local argument-validation and authorization errors keep their precise tool-owned messages (`SESSION_QUERY_TOOL_UNAUTHORIZED` for a target outside the caller workspace). The package performs no byte or character truncation and does not import a spill backend; deployments that need bounded inline output mount `@deepseek-ai/dsh-spill-policy`, which can replace oversized rendered text while retaining the complete result.
@@ -150,7 +156,7 @@ Prefix-stable while tool visibility and definitions are unchanged.
 
 #### What the model sees
 
-Each successful call emits one plain-text block. Search results include titles and best-match excerpts; traces include all authorized relationships; event reads include unabridged target JSON. The generic spill policy may replace oversized inline text with its preview, opaque locator, and retrieval hint.
+Each successful call emits one plain-text block. Search results include best-match excerpts, coverage when supplied, and titles or an explicit deferred-title marker; traces include all authorized relationships; event reads include unabridged target JSON. The generic spill policy may replace oversized inline text with its preview, opaque locator, and retrieval hint.
 
 #### Token effect
 

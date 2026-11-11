@@ -132,6 +132,7 @@ No direct effect; model requests remain owned by the Agent and LLM packages.
 <a id="known-limitations-and-deferred-work"></a>
 
 - A single summary, the query provider's own enumeration, final sorting, and response serialization can exceed the list work-slice target; it is not a hard Host latency bound.
+- Content search does not carry background-index coverage on the wire, and the current Client does not distinguish incomplete history from an empty result. Keep its provider in `on-search` mode; background-index deployment examples target the isolated model-facing search provider, whose tools report partial coverage.
 - The image byte cap does not validate decoded dimensions or pixel count.
 - A failed follow resumption remains visible to the caller instead of retrying indefinitely.
 - The raw browser upload is one streaming HTTP request without resumable offsets; a retry sends the file again from byte zero.

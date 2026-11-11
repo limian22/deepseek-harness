@@ -45,6 +45,12 @@ kind: "package-reference"
 
 不带正文的记录只公开 `SessionHeader.isSeeded`。返回事件正文的读取（`readSession`、`readSurface`、`readEvent`）与保留的 `SessionObservation` 值还携带精确 `inheritedEventCount`，因此调用方无需从日志推断切点即可区分继承事件与自有事件。
 
+### 搜索覆盖
+
+全文分页结果还可能携带 `coverage`：它说明挂载后端在回答时已校验了授权语料库的多少部分。`state` 在初始发现期间为 `initializing`，仍有待处理更新时为 `syncing`，完成一次完整来源遍历后为 `ready`，部分来源失败并被隔离时为 `degraded`。`checkedAt` 是最近一次完整来源观察的 Unix 纪元毫秒数，`indexedSessions`、`pendingSessions` 与 `failedSessions` 只统计匹配该请求自身会话谓词的会话，因此受限范围的调用方永远不会获知范围之外的语料库总量。
+
+`coverage` 缺失表示后端在回答前已调和其来源，此时空分页是完整答案。存在 `coverage` 且状态不是 `ready` 时，空分页并不完整：只有在 `coverage` 缺失或为 `ready` 时，消费方才能渲染"无匹配"。`coverage` 描述的是已索引语料库而不是返回的命中项，且按分页报告，因此遍历多页的消费方只要收到的任一页不是 `ready`，就把整体结果视为不完整。
+
 ### 过滤器
 
 `SessionResultFilter` 按 id、可空 cwd、创建时间范围、可空父级或来源可用性缩小会话范围；`SessionEventResultFilter` 按 seq/时间范围、事件类型、表层或字面文本缩小事件范围。过滤器数组使用 AND 连接，同一子句内的列表值使用 OR；空列表值不匹配任何内容，范围包含端点，格式错误的范围或未知的封闭联合值以 `SESSION_QUERY_INVALID_FILTER` 失败。
@@ -159,6 +165,7 @@ kind: "package-reference"
 - **无提供方协调器或回退**——服务在搜索上是抽象的，组合必须挂载具体后端；没有搜索提供方注册表或回退实现。
 - **精确读取回放整个日志**——`readSession`、`readSurface`、`filterEvents` 与事件追踪会加载并校验完整逻辑日志，因此非常大的历史每次调用都要付出完整检查；`listSessions` 保持轻量。
 - **字面文本扫描，而非全文搜索**——`text` 过滤器用正则表达式扫描提取出的文档且不提供排名；带排名的搜索需要挂载后端。
+- **覆盖由提供方报告，不经传输层承载**——自身表面不承载 `coverage` 的消费方无法区分不完整的搜索结果页与完整的空结果。
 
 <a id="dev-note"></a>
 ### 开发备注

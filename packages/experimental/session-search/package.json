@@ -28,6 +28,8 @@
     "icon.svg",
     "locale/*.json",
     "docs",
+    "examples/durable-index.cordis.patch.yml",
+    "examples/off-thread-read.cordis.patch.yml",
     "lib/index.js",
     "cordis.patch.yml",
     "lib/types/**/*.d.ts",
