@@ -5,6 +5,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import { scheduler } from 'node:timers/promises'
 import { SESSION_FORMAT_VERSION, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { DatabaseSync } from 'node:sqlite'
 import { Context, Service, type Fiber } from '@deepseek-ai/cordis'
@@ -100,6 +101,8 @@ export const SESSION_QUERY_SQLITE_SNIPPET_CHARS = 240
 export const SESSION_QUERY_SQLITE_DEFAULT_SYNC_INTERVAL_MS = 5000
 /** Default concurrent cold-log reads in background synchronization. */
 export const SESSION_QUERY_SQLITE_DEFAULT_SYNC_READ_CONCURRENCY = 2
+/** Default validated sessions committed per background transaction. */
+export const SESSION_QUERY_SQLITE_DEFAULT_SYNC_BATCH_SESSIONS = 24
 
 // One transient source change gets a retry; repeated churn fails rather than monopolizing the queue.
 const STABLE_OBSERVATION_ATTEMPTS = 2
@@ -153,6 +156,13 @@ export interface Config extends SessionQueryConfig {
   syncIntervalMs?: number
   /** Concurrent cold-log reads in one background reconciliation. At most `Number.MAX_SAFE_INTEGER`; defaults to 2. */
   syncReadConcurrency?: number
+  /**
+   * Validated sessions committed per background transaction. Larger batches cut
+   * commit/fsync overhead on a large first index; each batch still verifies every
+   * session's source revision before publishing, and an interrupted batch is
+   * simply re-read on the next pass. Defaults to 24.
+   */
+  syncBatchSessions?: number
 }
 
 interface ResolvedConfig {
@@ -168,6 +178,7 @@ interface ResolvedConfig {
   syncMode: SyncMode
   syncIntervalMs: number
   syncReadConcurrency: number
+  syncBatchSessions: number
 }
 
 interface ObservedSession {
@@ -335,6 +346,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       .min(1)
       .max(Number.MAX_SAFE_INTEGER)
       .default(SESSION_QUERY_SQLITE_DEFAULT_SYNC_READ_CONCURRENCY),
+    syncBatchSessions: z.number()
+      .step(1)
+      .min(1)
+      .max(10_000)
+      .default(SESSION_QUERY_SQLITE_DEFAULT_SYNC_BATCH_SESSIONS),
   })
 
   /** Validated and defaulted backend configuration. */
@@ -1084,53 +1100,70 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   ): Promise<void> {
     if (work.length === 0) return
     const concurrency = Math.min(this.config.syncReadConcurrency, work.length)
+    const batchSize = this.config.syncBatchSessions
     let next = 0
+    let pending: Array<{ readonly target: SyncWorkItem; readonly prepared: SessionPublication }> = []
+    let flushing: Promise<void> = Promise.resolve()
+    const flush = (): Promise<void> => {
+      if (pending.length === 0) return flushing
+      const batch = pending
+      pending = []
+      flushing = flushing.then(async () => {
+        await this._serialized(signal, () => {
+          this._publishPreparedBatch(batch)
+        })
+        // Bound each event-loop hold so a large first index never blocks searches.
+        await scheduler.yield()
+      })
+      return flushing
+    }
     const readNext = async (): Promise<void> => {
-      while (!signal.aborted) {
+      while (!this._syncCancelled(signal)) {
         const item = work[next]
         next += 1
         if (item === undefined) return
-        await this._syncSource(persistence, item, signal)
+        const prepared = await this._prepareSyncSource(persistence, item, signal)
+        if (prepared === undefined) continue
+        pending.push({ target: item, prepared })
+        if (pending.length >= batchSize) await flush()
       }
     }
     await Promise.all(Array.from({ length: concurrency }, readNext))
+    await flush()
+    await flushing
   }
 
-  private async _syncSource(
+  private async _prepareSyncSource(
     persistence: SessionPersistence,
     target: SyncWorkItem,
     signal: AbortSignal,
-  ): Promise<void> {
-    let prepared: SessionPublication
+  ): Promise<SessionPublication | undefined> {
     try {
       const options = { signal }
       const before = await persistence.stat(target.id, options)
-      if (this._syncCancelled(signal)) return
+      if (this._syncCancelled(signal)) return undefined
       // Absent sources are resolved by the next complete listing, which owns deletion.
-      if (before === undefined) return
-      if (before.revision !== target.revision) return
+      if (before === undefined) return undefined
+      if (before.revision !== target.revision) return undefined
       const log = await readColdSessionLog(persistence, target.id, signal)
-      if (this._syncCancelled(signal)) return
+      if (this._syncCancelled(signal)) return undefined
       const after = await persistence.stat(target.id, options)
-      if (this._syncCancelled(signal)) return
+      if (this._syncCancelled(signal)) return undefined
       // A generation that moved during the read is retried by the next scan
       // instead of publishing a mixed-cut prefix.
-      if (after === undefined || after.revision !== before.revision) return
+      if (after === undefined || after.revision !== before.revision) return undefined
       if (log.inheritedEventCount > log.storedEventCount) {
         await this._recordSourceFailure(target, signal, 'inherited prefix exceeds the stored log')
-        return
+        return undefined
       }
       assertSessionHeadersCompatible(target.header, log.header)
-      prepared = prepareSessionPublication(log)
+      return prepareSessionPublication(log)
     } catch (error: unknown) {
-      if (this._syncCancelled(signal)) return
-      if (error instanceof SessionQueryError && error.code === 'SESSION_QUERY_ABORTED') return
+      if (this._syncCancelled(signal)) return undefined
+      if (error instanceof SessionQueryError && error.code === 'SESSION_QUERY_ABORTED') return undefined
       await this._recordSourceFailure(target, signal, errorMessage(error))
-      return
+      return undefined
     }
-    await this._serialized(signal, () => {
-      this._publishPreparedSession(target, prepared)
-    })
   }
 
   private async _recordSourceFailure(
@@ -1154,28 +1187,36 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   }
 
   /**
-   * Commit one validated source generation atomically, after rechecking the
-   * adopted source and the pending generation it was read for.
-   * @param target - listed generation the read was started for.
-   * @param prepared - immutable header, inherited cut, and documents to publish.
+   * Commit one batch of validated source generations atomically. Every entry is
+   * rechecked against the pending generation it was read for; rows whose source
+   * moved are skipped and retried by the next pass. One transaction and one
+   * generation step cover the accepted entries, which keeps commit/fsync cost
+   * off the per-session path.
+   * @param batch - validated publications paired with the listed generation they came from.
    */
-  private _publishPreparedSession(target: SyncWorkItem, prepared: SessionPublication): void {
+  private _publishPreparedBatch(
+    batch: readonly { readonly target: SyncWorkItem; readonly prepared: SessionPublication }[],
+  ): void {
     if (this._closed) throw indexClosed()
     if (this._persistenceBinding.identity !== this._syncBinding) return
     const db = this._requireDb()
-    const row = db.prepare('SELECT revision FROM sync_sessions WHERE id = ?').get(target.id) as {
-      revision: string
-    } | undefined
-    if (row === undefined || row.revision !== target.revision) return
+    const lookup = db.prepare('SELECT revision FROM sync_sessions WHERE id = ?')
+    const accepted = batch.filter(({ target }) => {
+      const row = lookup.get(target.id) as { revision: string } | undefined
+      return row !== undefined && row.revision === target.revision
+    })
+    if (accepted.length === 0) return
     let next = this._globalGeneration
     this._transaction(() => {
-      this._deleteSession('persisted', target.id)
       next = this._mainGeneration() + 1
-      this._replacePersistedSession(prepared, target.revision, next)
-      db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(target.id)
+      for (const { target, prepared } of accepted) {
+        this._deleteSession('persisted', target.id)
+        this._replacePersistedSession(prepared, target.revision, next)
+        db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(target.id)
+      }
       db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(next)
     })
-    this._globalGeneration += 1
+    this._globalGeneration = next
     this._localGeneration = Math.max(this._localGeneration, next)
   }
 
@@ -2050,6 +2091,7 @@ function resolveConfig(config: Config): ResolvedConfig {
     syncMode: config.syncMode ?? 'on-search',
     syncIntervalMs: config.syncIntervalMs ?? SESSION_QUERY_SQLITE_DEFAULT_SYNC_INTERVAL_MS,
     syncReadConcurrency: config.syncReadConcurrency ?? SESSION_QUERY_SQLITE_DEFAULT_SYNC_READ_CONCURRENCY,
+    syncBatchSessions: config.syncBatchSessions ?? SESSION_QUERY_SQLITE_DEFAULT_SYNC_BATCH_SESSIONS,
   }
   if (typeof resolved.path !== 'string' || resolved.path.trim().length === 0) {
     throw invalidConfig('path must not be blank')
@@ -2093,6 +2135,13 @@ function resolveConfig(config: Config): ResolvedConfig {
     || resolved.syncReadConcurrency < 1
   ) {
     throw invalidConfig('syncReadConcurrency must be a positive safe integer')
+  }
+  if (
+    !Number.isSafeInteger(resolved.syncBatchSessions)
+    || resolved.syncBatchSessions < 1
+    || resolved.syncBatchSessions > 10_000
+  ) {
+    throw invalidConfig('syncBatchSessions must be an integer between 1 and 10000')
   }
   return resolved
 }

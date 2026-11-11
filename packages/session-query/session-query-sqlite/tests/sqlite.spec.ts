@@ -2355,6 +2355,7 @@ describe('SQLite background synchronization', () => {
       syncMode: 'on-search',
       syncIntervalMs: 5000,
       syncReadConcurrency: 2,
+      syncBatchSessions: 24,
     })
     expect(new SqliteSessionQueryEngine.Config({
       path: ':memory:',
@@ -2372,6 +2373,9 @@ describe('SQLite background synchronization', () => {
     }
     for (const syncReadConcurrency of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
       expect(() => new SqliteSessionQueryEngine.Config({ path: ':memory:', syncReadConcurrency })).toThrow()
+    }
+    for (const syncBatchSessions of [0, -1, 1.5, 10_001]) {
+      expect(() => new SqliteSessionQueryEngine.Config({ path: ':memory:', syncBatchSessions })).toThrow()
     }
 
     const ctx = await liveContext(BACKGROUND_SYNC)
@@ -2406,6 +2410,28 @@ describe('SQLite background synchronization', () => {
     } finally {
       await ctx.fiber.dispose()
     }
+  })
+
+  it('commits pending sessions in bounded batches and keeps every one searchable', async () => {
+    const entries = Array.from({ length: 12 }, (_, index) => ({
+      meta: header(`batched-${index}`, index + 1),
+      events: messageEvents(`batched needle ${index}`),
+    }))
+    TestPersistence.reset(entries)
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, { ...BACKGROUND_SYNC, syncBatchSessions: 5 })
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+
+    const page = await service.searchSessions({ query: 'needle', limit: 50 })
+    expect(page.items).toHaveLength(12)
+    expect(new Set(page.items.map(item => item.header.id)).size).toBe(12)
+    expect(page.coverage).toMatchObject({ state: 'ready', indexedSessions: 12, pendingSessions: 0 })
+    await search.dispose()
+    await persistence.dispose()
   })
 
   it('returns indexed history without awaiting a blocked persistence listing', async () => {

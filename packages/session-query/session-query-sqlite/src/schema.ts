@@ -76,6 +76,9 @@ export async function openSearchDatabase(
       // Apply mutating pragmas only after refusing foreign or canonical files.
       // journalMode is a validated closed union, not caller-controlled SQL.
       db.exec(`PRAGMA journal_mode = ${journalMode.toUpperCase()}`)
+      // This derived index is disposable and rebuildable, so NORMAL durability is
+      // safe: it drops one fsync per commit on the large first-index path.
+      db.exec('PRAGMA synchronous = NORMAL')
       ensurePersistentSchema(db)
       ensureTemporarySchema(db)
       return { db, release: () => ownership.release() }

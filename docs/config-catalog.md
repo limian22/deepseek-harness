@@ -3209,7 +3209,7 @@ export interface Config {
 
 - `inject`: `sessions`
 - `refs`: [`SessionQueryConfig`](../packages/session-query/session-query/src/index.ts)
-- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:117`](../packages/session-query/session-query-sqlite/src/index.ts)
+- `source`: [`packages/session-query/session-query-sqlite/src/index.ts:120`](../packages/session-query/session-query-sqlite/src/index.ts)
 
 ```ts config-catalog
 /** Combined session-query configuration backed by SQLite full-text search. */
@@ -3252,6 +3252,13 @@ export interface Config extends SessionQueryConfig {
   syncIntervalMs?: number
   /** Concurrent cold-log reads in one background reconciliation. At most `Number.MAX_SAFE_INTEGER`; defaults to 2. */
   syncReadConcurrency?: number
+  /**
+   * Validated sessions committed per background transaction. Larger batches cut
+   * commit/fsync overhead on a large first index; each batch still verifies every
+   * session's source revision before publishing, and an interrupted batch is
+   * simply re-read on the next pass. Defaults to 24.
+   */
+  syncBatchSessions?: number
 }
 
 /** SQLite module/handle opening phase; `never` disables full-text search entirely. */

@@ -54,6 +54,7 @@ kind: "package-reference"
 | `syncMode` | `on-search` | `on-search` 在每次搜索内对账完整持久化来源且不报告 coverage；`background` 立即返回已索引历史、由实例自有的后台任务对账并报告 coverage |
 | `syncIntervalMs` | `5000` | 后台对账间隔；最大 `2^31 - 1`，即 Node 的最大 timer 延迟 |
 | `syncReadConcurrency` | `2` | 一次后台对账中的并发冷日志读取数 |
+| `syncBatchSessions` | `24` | 每个后台事务提交的已校验会话数 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-session-query-sqlite)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
@@ -69,7 +70,7 @@ kind: "package-reference"
 
 ### 后台同步
 
-启用 `syncMode: background` 后，搜索从不等待持久化列举或冷日志读取。它从当前派生索引作答，并请求实例自有的后台任务对账来源；该任务在服务活动期间每 `syncIntervalMs` 也对账一次，并合并重叠请求。每个被列举的会话在来源修订检查后于自己的事务中提交，因此中断的扫描从已提交会话继续，而不重新读取它们。来源修订已变化的世代在其通过校验的替代内容提交前保持隐藏；只有在完整的成功列举未包含某会话后才删除它。使用 `openAt: first-search` 时，后台同步从首次搜索开始，而不是在激活时开始。
+启用 `syncMode: background` 后，搜索从不等待持久化列举或冷日志读取。它从当前派生索引作答，并请求实例自有的后台任务对账来源；该任务在服务活动期间每 `syncIntervalMs` 也对账一次，并合并重叠请求。已校验会话按有界批次提交（`syncBatchSessions`，每批一个事务、一个世代步进），派生索引使用 `synchronous = NORMAL`（可重建），从而把提交开销移出每会话路径；中断的批次在下一轮重新读取。来源修订已变化的世代在其通过校验的替代内容提交前保持隐藏；只有在完整的成功列举未包含某会话后才删除它。使用 `openAt: first-search` 时，后台同步从首次搜索开始，而不是在激活时开始。
 
 每个后台页面都携带 `coverage`，按请求的全部会话谓词计算：在索引针对当前来源校验完成前 `state` 为 `initializing`；扫描运行或有已列举会话等待读取时为 `syncing`；出现隔离的来源失败后为 `degraded`；可枚举语料库完成索引后为 `ready`。`checkedAt` 是最后一次成功的完整观察。`indexedSessions`、`pendingSessions` 与 `failedSessions` 是限定在请求过滤器内的计数，绝不包含请求过滤之外的会话。在列举尚未建立范围之前省略计数；经过验证的计数包含可搜索的仅实时会话，且不会重复计算其持久化基库。捕获分页保留第一页的 coverage，因此续页绝不会报告比其捕获更新的状态；`on-search` 页面不携带 coverage。
 
