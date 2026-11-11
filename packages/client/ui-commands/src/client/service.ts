@@ -67,6 +67,11 @@ function submittedCommandName(line: string): string {
   return (separator === -1 ? trimmed : trimmed.slice(0, separator)).slice(1)
 }
 
+/** Resolve a contribution's static-or-getter menu copy for one candidate pass. */
+function resolveCandidateCopy(value: string | (() => string)): string {
+  return typeof value === 'function' ? value() : value
+}
+
 /** Live mutable state in one holder (service methods run behind the caller-ctx tracker). */
 interface LiveState {
   readonly contributions: Map<string, CommandContribution>
@@ -236,16 +241,22 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
       })
     }
     for (const contribution of this.live.contributions.values()) {
-      if (!contribution.available(session)) continue
       if (seen.has(contribution.name)) {
         throw new Error(`ui-commands: contribution /${contribution.name} collides with a host command`)
       }
-      rows.push({
-        name: contribution.name,
-        ...(contribution.label === undefined ? {} : { label: contribution.label() }),
-        ...(contribution.description === undefined ? {} : { description: contribution.description() }),
-        ...(contribution.icon === undefined ? {} : { icon: contribution.icon }),
-      })
+      try {
+        if (!contribution.available(session)) continue
+        rows.push({
+          name: contribution.name,
+          ...(contribution.label === undefined ? {} : { label: resolveCandidateCopy(contribution.label) }),
+          ...(contribution.description === undefined ? {} : { description: resolveCandidateCopy(contribution.description) }),
+          ...(contribution.icon === undefined ? {} : { icon: contribution.icon }),
+        })
+      } catch (error) {
+        // One malformed third-party contribution must not take down the whole
+        // '/' command source; log it and keep the remaining rows.
+        console.error(`[ui-commands] contribution /${contribution.name} failed:`, error)
+      }
     }
     const visible = rows.filter(c => req.position === 'leading' || c.hint === undefined)
     return req.query === '' ? sectionRows(visible, this.t) : new TextSearchIndex(visible, row => ({ fuzzy: [row.name, row.label] })).search(req.query)
