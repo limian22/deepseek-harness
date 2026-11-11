@@ -1,0 +1,22 @@
+# Bilingual-pair consistency record for 2026-11-10-management-session-read-perf.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/plans/2026-11-10-management-session-read-perf.md
+/management-and-session-read-performance-implementation-plan:
+  en: cc93149437119c12
+  zh: d80c30ab792518d3
+/management-and-session-read-performance-implementation-plan/scope-and-constraints:
+  en: 49a0a8a4204a4626
+  zh: 3a2ac3bd1961d841
+/management-and-session-read-performance-implementation-plan/task-1-plugin-management:
+  en: f6e65dc7004a6b36
+  zh: 61d2a2efc2b4c7cd
+/management-and-session-read-performance-implementation-plan/task-2-session-persistence-listing:
+  en: 3f06470b7a4207f1
+  zh: 10ef582c5210cc21
+/management-and-session-read-performance-implementation-plan/task-3-integration-and-evidence:
+  en: 2825998ba80f4e50
+  zh: e8f3e0c23e8c911f
+/management-and-session-read-performance-implementation-plan/acceptance:
+  en: c25ff58d3e415b5f
+  zh: bbeaa46b881ecd7c

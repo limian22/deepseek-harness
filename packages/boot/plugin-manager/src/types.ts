@@ -36,7 +36,11 @@ export interface IncompatiblePlugin {
 
 /** Localizable management failure and optional external diagnostic. */
 export interface ManagementError {
-  code: ReadOnlyReason | 'unknown-plugin' | 'invalid-spec' | 'already-installed' | 'ambiguous-install' | 'not-bundle' | 'not-removable' | 'stop-profile' | 'bundle-in-use' | 'stale-approval' | 'incompatible-version' | 'unsupported-platform' | 'unexpected-package' | 'operation-error'
+  /**
+   * `duplicate-entry` refuses a layer whose inserted row id another layer already inserts; `diagnostic` names both,
+   * because the locale cannot enumerate them.
+   */
+  code: ReadOnlyReason | 'unknown-plugin' | 'invalid-spec' | 'already-installed' | 'ambiguous-install' | 'not-bundle' | 'not-removable' | 'stop-profile' | 'bundle-in-use' | 'stale-approval' | 'incompatible-version' | 'unsupported-platform' | 'duplicate-entry' | 'operation-error'
   diagnostic?: string
   /** Present with `incompatible-version`: the packages the running DSH version rejects. */
   incompatible?: IncompatiblePlugin[]
@@ -85,10 +89,7 @@ export interface BundleInfo {
   description?: string
   /** Default GUI visibility after package and Host checks; selected or profile-installed bundles remain manageable. */
   listedByDefault?: boolean
-  /**
-   * Selected in the profile manifest; a selected bundle whose layer was skipped carries the load `error`, and none of
-   * its `rows` has an `entryId`.
-   */
+  /** Selected in the profile manifest; a load error means its layer was skipped. */
   enabled: boolean
   /** Whether the profile declares this dependency; availability separately reports whether its files can be read. */
   installed: boolean
@@ -104,18 +105,21 @@ export interface BundleInfo {
   optional: boolean
   removable: boolean
   /**
-   * How `updateBundle` replaces the bundle, absent when it cannot: `registry` for a third-party profile dependency saved
-   * as a registry spec under its own name, whose newer versions `listVersions` reads; `git` for one saved as a Git spec
-   * pinned to a full commit, which updates to another commit of the same repository directory. Either needs a semver
-   * manifest version and no plugin management.
+   * Whether `listVersions` and `updateBundle` accept the bundle: a third-party profile dependency saved as a registry
+   * spec under its own name, whose installed manifest declares a semver version, and that carries no plugin management.
    */
-  update?: 'registry' | 'git'
+  updatable: boolean
   readOnlyReason?: ReadOnlyReason
   error?: ManagementError
   /** The rows the bundle's patch inserts, in declaration order; empty when the patch cannot be read. */
   rows: BundleRowInfo[]
   /** Ids of rows the bundle's patch changes without declaring them: the built-in rows it configures or disables. */
   overrides: string[]
+  /**
+   * Selected bundles that already insert every row this unselected bundle inserts, under the same ids and the same
+   * resolved module: enabling it adds no component and would duplicate ids the Loader cannot address separately.
+   */
+  providedBy?: string[]
 }
 
 /** A registry to install from: an http(s) URL, or null for the one pnpm's own configuration names. */
@@ -159,12 +163,6 @@ export interface PackageResult {
   timedOut?: boolean
   /** Present when a compatibility check refused the run: the packages the running DSH version rejects. */
   incompatible?: IncompatiblePlugin[]
-  /**
-   * Present when an `expected` check refused the run: `unexpected-package` when the run left the expected package
-   * missing or at another version, or added or changed another direct dependency; otherwise `not-bundle` when the
-   * expected package declares no bundle. The output names what the run installed.
-   */
-  unmet?: 'unexpected-package' | 'not-bundle'
 }
 
 /** Persisted change and independently observed application outcome. */
@@ -212,13 +210,6 @@ export interface InstallBundleOptions {
   approvedBuilds?: string[]
   /** The registry asked first; absent, the configured one. The configured fallbacks follow while a registry is unreachable or stale. */
   registry?: Registry
-  /**
-   * The package and manifest version the spec must install. An installation that leaves this package missing or at
-   * another version, or that adds or changes another direct dependency, is undone with its profile files and modules
-   * before its bundle loads, and fails with `unexpected-package`; one whose package declares no bundle is undone the
-   * same way and fails with `not-bundle`, and one whose bundle patches cannot load fails as an operation error.
-   */
-  expected?: { readonly name: string; readonly version: string }
 }
 
 /** Where an inspection asks. */
@@ -328,11 +319,6 @@ export interface ListVersionsOptions {
 export interface UpdateBundleOptions {
   /** The registry asked first, normally the one that answered `listVersions`; absent, as for `listVersions`. */
   readonly registry?: Registry
-  /**
-   * The Git spec of the target version: required for a bundle listed with `update: 'git'`, where it must pin a full
-   * commit of the installed copy's repository directory, and refused for any other.
-   */
-  readonly spec?: string
   /** Names the update's progress and the target installation's logs; `cancelInstall` stops only that installation. */
   readonly requestId?: PluginInstallRequestId
 }

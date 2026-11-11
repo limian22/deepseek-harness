@@ -354,4 +354,6 @@ it('tells the agent the next step for each change outcome it can act on', async 
   expect(await outcome({ changed: false, application: 'failed' })).toContain('Report the diagnostic')
   expect(await outcome({ changed: false, application: 'failed', error: { code: 'unsupported-platform' } }))
     .toBe('This bundle cannot run on the current Host platform; ask the user to use a supported Host.')
+  expect(await outcome({ changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: 'row is already inserted by core' } }))
+    .toBe('Inspect the conflicting row ids and layers in diagnostic. Use list_bundles to find an existing provider and manage its components; for a patch conflict, fix the duplicate insertion before retrying.')
 })

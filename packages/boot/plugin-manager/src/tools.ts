@@ -26,6 +26,7 @@ const ERROR_STEPS: Record<ManagementError['code'], string> = {
   'stale-approval': 'Call install_bundle again without approvedBuilds to read the current pendingBuilds.',
   'incompatible-version': 'Install a version compatible with the running DSH. A version exemption needs the user\'s explicit acceptance of crash and data-loss risk.',
   'unsupported-platform': 'This bundle cannot run on the current Host platform; ask the user to use a supported Host.',
+  'duplicate-entry': 'Inspect the conflicting row ids and layers in diagnostic. Use list_bundles to find an existing provider and manage its components; for a patch conflict, fix the duplicate insertion before retrying.',
   'operation-error': 'Report the diagnostic to the user; retry only after its cause is addressed.',
 }
 

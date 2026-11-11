@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,7 +8,7 @@ import { PluginPackages, readPluginMeta, type RuntimeResolution } from '@deepsee
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import type { AgentPresetRegistry } from '@deepseek-ai/dsh-agent-preset-registry'
-import PluginInventoryGateway from '../src/index.ts'
+import PluginInventoryGateway, { readPluginInventory } from '../src/index.ts'
 
 const contexts: Context[] = []
 const roots: string[] = []
@@ -250,5 +250,42 @@ describe('PluginInventoryGateway', () => {
       },
       { id: 'damaged', isDefault: false, broken: 'the composition file is missing', rows: [] },
     ])
+  })
+
+  it('reads package metadata once per module specifier within one snapshot', async () => {
+    const { ctx, inventory } = await harness(pathToFileURL(join(tmpdir(), 'dsh-inventory-meta-dedup', 'entry.mjs')).href)
+    const metaOf = vi.fn((specifier: string) => ({ title: specifier }))
+    ctx.provide('pluginPackages', { metaOf } as never)
+    const first = await ctx.loader.create({ name: 'local-plugin/feature', disabled: true })
+    const second = await ctx.loader.create({ name: 'local-plugin/feature', disabled: true })
+    ctx.provide('agentPresets', {
+      compositionInventory: async () => [{
+        id: 'local', isDefault: true,
+        rows: [{ entryId: 'feature', moduleName: 'local-plugin/feature', enabled: false }],
+      }],
+    } as Partial<AgentPresetRegistry> as never)
+
+    const snapshot = await inventory.list()
+    expect(snapshot.entries.map(entry => entry.entryId)).toEqual([first, second])
+    expect(snapshot.entries.map(entry => entry.meta)).toEqual([
+      { title: 'local-plugin/feature' }, { title: 'local-plugin/feature' },
+    ])
+    expect(snapshot.agentPresets?.[0]?.rows[0]?.meta).toEqual({ title: 'local-plugin/feature' })
+    expect(metaOf).toHaveBeenCalledOnce()
+    expect(metaOf).toHaveBeenCalledWith('local-plugin/feature', expect.any(String))
+  })
+
+  it('reads only Loader entries when the caller does not need preset compositions', async () => {
+    const { ctx } = await harness()
+    const compositionInventory = vi.fn(async () => [{
+      id: 'local', isDefault: true,
+      rows: [{ entryId: null, moduleName: 'pkg-file', enabled: false }],
+    }])
+    ctx.provide('agentPresets', { compositionInventory } as Partial<AgentPresetRegistry> as never)
+
+    expect(await readPluginInventory(ctx, { includePresets: false })).toEqual({ entries: [] })
+    expect(compositionInventory).not.toHaveBeenCalled()
+    expect((await readPluginInventory(ctx)).agentPresets).toHaveLength(1)
+    expect(compositionInventory).toHaveBeenCalledOnce()
   })
 })

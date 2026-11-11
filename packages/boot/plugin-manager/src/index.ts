@@ -18,26 +18,29 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import { readBundleDocument, readBundleImage, type BundleDetailOptions } from './bundle-detail.ts'
 import { pluginEntryId, readPluginInventory } from '@deepseek-ai/dsh-host-plugin-inventory'
 import {
-  readPluginMeta, readProfileManifest, resolveBundleDir, loadOverlayPatches, composeEntries,
-  readProfilePatches, bundlePatchPaths,
+  readPluginMeta, readProfileManifest, resolveBundleDir, loadOverlayPatches, loadOptionalPatches, composeEntries,
+  readProfilePatches, bundlePatchPaths, PROFILE_PATCH_FILENAME,
   evaluatePluginCompatibility, readProfileCompatibility, readProfileVersionExemptions,
   setProfileVersionExemption, validatePluginVersionExemption, PROFILE_COMPATIBILITY_FILENAME,
   getDshRuntimeVersion, ResolutionRestartRequired,
   assertBundlePlatform, UnsupportedBundlePlatformError,
 } from '@deepseek-ai/dsh-app-boot'
-import { OPTIONAL_BUNDLES, OFFICIAL_ON_DEMAND_CATALOG, PROTECTED_PLUGINS } from '@deepseek-ai/dsh-official-bundles'
+import { OPTIONAL_BUNDLES, OFFICIAL_ON_DEMAND_CATALOG, PROTECTED_PLUGINS, RETIRED_BUNDLES } from '@deepseek-ai/dsh-official-bundles'
 import type {} from '@deepseek-ai/dsh-hmr'
 import type { ProfileContext, ProfileManifest } from '@deepseek-ai/dsh-app-boot'
 import { bundleManifest, readProfileRegistry, registryArguments, runProfilePnpm, saveManifest, viewProfilePackage } from './operations.ts'
 import { classifyInstallFailure } from './install-failure.ts'
-import { officialBundleInstallTarget } from './official-install-target.ts'
-import { dependencySpec, InvalidInstallSpecError, parseInstallSpec, pinnedGitOrigin, type ParsedInstallSpec } from './install-spec.ts'
+import { officialBundleInstallTargets } from './official-install-target.ts'
+import { dependencySpec, InvalidInstallSpecError, parseInstallSpec, type ParsedInstallSpec } from './install-spec.ts'
 import { attributeFailure, normalizeRegistry, NPMMIRROR_REGISTRY, registryPlan } from './registry.ts'
 import { flatten, writePluginEnabled } from './patch.ts'
+import {
+  addedRows, bareModuleDir, collidingRows, duplicateEntryDiagnostic, insertedRows, moduleIdentity, patchInsertedRows, providingLayers,
+  repeatedRowIds, rowIdentity, type AddedRow, type InsertedRow, type LayerPackage, type RowLayer,
+} from './row-conflict.ts'
 import { incompatiblePlugin, ManagementFailure } from './failure.ts'
-import { PluginManagerError, readProfileState } from './error.ts'
 import { approveBuilds, recordPendingBuilds } from './build-approval.ts'
-import { checkGitConnection, checkGithubConnection, type GithubConnectionFailure } from './github-connection.ts'
+import { checkGithubConnection, type GithubConnectionFailure } from './github-connection.ts'
 import { chooseGitTransport, sshGitSpec } from './git-transport.ts'
 import { newerVersions, VERSION_FIELDS, VERSION_LIST_FIELDS, versionFacts } from './versions.ts'
 import type {
@@ -49,8 +52,7 @@ import type {
 } from './types.ts'
 export type * from './types.ts'
 export { classifyInstallFailure, type InstallFailureFacts } from './install-failure.ts'
-export { PluginManagerError, type PluginManagerErrorCode } from './error.ts'
-export { InvalidInstallSpecError, parseInstallSpec, pinnedGitOrigin, type ParsedInstallSpec } from './install-spec.ts'
+export { InvalidInstallSpecError, parseInstallSpec, type ParsedInstallSpec } from './install-spec.ts'
 
 /** The pnpm executable, registries, and limits for diagnostics, lookups and connection checks. */
 export interface Config {
@@ -112,7 +114,11 @@ function messageOf(error: unknown): string { return error instanceof Error ? err
 function managementError(error: unknown): ManagementError {
   if (error instanceof UnsupportedBundlePlatformError) return { code: 'unsupported-platform' }
   if (!(error instanceof ManagementFailure)) return { code: 'operation-error', diagnostic: messageOf(error) }
-  return { code: error.code, ...error.incompatible === undefined ? {} : { incompatible: error.incompatible } }
+  return {
+    code: error.code,
+    ...error.incompatible === undefined ? {} : { incompatible: error.incompatible },
+    ...error.diagnostic === undefined ? {} : { diagnostic: error.diagnostic },
+  }
 }
 
 /** The caller stopped an installation; its files are restored before this is thrown. */
@@ -163,26 +169,18 @@ function refused(problem: Extract<PluginSpecInspection, { status: 'refused' }>['
   return { status: 'refused', problem, reason }
 }
 
-/**
- * An installed bundle an update can replace and its installed version: a registry copy with its parsed registry spec,
- * or a Git copy with the saved spec that installs it again and the repository directory it pins.
- */
-type UpdateTarget<B> =
-  | { kind: 'registry'; bundle: B; installed: string; parsed: Extract<ParsedInstallSpec, { kind: 'registry' }> }
-  | { kind: 'git'; bundle: B; installed: string; source: string; origin: string }
-
-/** What an update installs: the target spec, the registry asked first when one is named, and whether the save is exact. */
-interface UpdatePlan {
-  spec: string
-  registry: Registry | undefined
-  saveExact: boolean
+/** An installed registry bundle an update can replace, its installed version, and its parsed registry spec. */
+interface UpdateTarget<B> {
+  bundle: B
+  installed: string
+  parsed: Extract<ParsedInstallSpec, { kind: 'registry' }>
 }
 
 /**
  * Why an update cannot replace a listed bundle, or what it replaces.
  * @param bundle The listed bundle, or undefined for a name the inventory does not list.
  * @param name The package name, for the refusal.
- * @returns The bundle, its installed version, and how it was installed; or the refusal's diagnostic.
+ * @returns The bundle, its installed version, and its registry spec; or the refusal's diagnostic.
  */
 function updateRefusal<B extends Pick<BundleInfo, 'name' | 'installed' | 'availability' | 'official' | 'version' | 'source' | 'readOnlyReason'>>(
   bundle: B | undefined, name: string,
@@ -194,15 +192,12 @@ function updateRefusal<B extends Pick<BundleInfo, 'name' | 'installed' | 'availa
   if (bundle.readOnlyReason !== undefined) return `${bundle.name} carries plugin management and cannot be removed`
   const installed = bundle.version
   if (installed === undefined || semver.valid(installed) === null) return `${bundle.name} declares no semver version`
-  // Only a pinned commit reinstalls the removed version when its replacement fails.
-  const origin = pinnedGitOrigin(bundle.source)
-  if (origin !== undefined) return { kind: 'git', bundle, installed, source: bundle.source, origin }
   const parsed = parsedForRegistry(bundle.source)
   // A protocol in the saved range, such as an `npm:` alias, names another package than the dependency.
   if (parsed.kind !== 'registry' || parsed.name !== bundle.name || parsed.range?.includes(':') === true) {
-    return `${bundle.name} is installed neither from a registry under its own name nor from a Git commit`
+    return `${bundle.name} is not installed from a registry under its own name`
   }
-  return { kind: 'registry', bundle, installed, parsed }
+  return { bundle, installed, parsed }
 }
 
 /** What asking planned registries in turn answered: the parsed output and the registry that gave it, or the last refusal. */
@@ -249,9 +244,104 @@ function printedError(printed: string): string {
 /** What applying the saved profile reports into a change result. */
 type Reload = Pick<ChangeResult, 'warnings' | 'restartReason'>
 
+/** The inserted rows one profile layer contributes, and whether the layer is a selected bundle. */
+interface CompositionLayer extends RowLayer {
+  /** Only a selected bundle may be named as a `providedBy` provider. */
+  readonly bundle: boolean
+}
+
+/** The profile's current composition and where each inserted row id came from. */
+interface Composition {
+  /** The selected bundle layers' patches in application order. */
+  readonly bundlePatches: PatchOptions[]
+  /** The profile patch, the home patch, and launch overlays: every layer after the bundles. */
+  readonly trailingPatches: PatchOptions[]
+  /** The composed entry list. */
+  readonly rows: EntryOptions[]
+  /** Inserted rows per layer, limited to the rows the composition really holds, attributed to the layer that last
+   * inserted or replaced them. */
+  readonly layers: CompositionLayer[]
+  /** Every row id the composition holds. */
+  readonly ids: ReadonlySet<string>
+}
+
 /** The bundles a profile manifest selects. */
 function bundleSelection(manifest: ProfileManifest): readonly string[] {
   return manifest.dsh?.profile?.bundles ?? []
+}
+
+/**
+ * Bundle facts one listing or one selection reads: each package's manifest, directory, patches, and display metadata at
+ * most once. A caller keeps it in a local variable, so a later call reads the profile again and nothing here outlives the
+ * call that created it. A read that throws is not remembered, so the next caller retries it with the same failure.
+ */
+class BundleFacts {
+  private readonly manifests = new Map<string, ProfileManifest | undefined>()
+  private readonly directories = new Map<string, string>()
+  private readonly patches = new Map<string, PatchOptions[]>()
+  private readonly metas = new Map<string, ReturnType<typeof readPluginMeta>>()
+
+  constructor(private readonly profile: Pick<ProfileContext, 'dir' | 'installAnchor'>) {}
+
+  /** The bundle package's manifest, or undefined when it declares none. */
+  manifest(name: string): ProfileManifest | undefined {
+    if (!this.manifests.has(name)) this.manifests.set(name, bundleManifest(name, this.profile.dir, this.profile.installAnchor))
+    return this.manifests.get(name)
+  }
+
+  /** The bundle package's directory. */
+  directory(name: string): string {
+    const cached = this.directories.get(name)
+    if (cached !== undefined) return cached
+    const dir = resolveBundleDir('dsh', name, this.profile.installAnchor, this.profile.dir)
+    this.directories.set(name, dir)
+    return dir
+  }
+
+  /** The patch lists the bundle contributes in application order; an unreadable patch throws. */
+  patchList(name: string): PatchOptions[] {
+    const cached = this.patches.get(name)
+    if (cached !== undefined) return cached
+    const info = this.manifest(name)
+    const patches = info?.dsh?.bundle === undefined
+      ? []
+      : bundlePatchPaths(this.directory(name), info.dsh.bundle).flatMap(file => loadOverlayPatches('dsh', file))
+    this.patches.set(name, patches)
+    return patches
+  }
+
+  /** Localized display metadata for one module, read once per resolution base. */
+  meta(specifier: string, base: string): ReturnType<typeof readPluginMeta> {
+    const key = `${base}\u0000${specifier}`
+    if (!this.metas.has(key)) this.metas.set(key, readPluginMeta(specifier, base))
+    return this.metas.get(key)
+  }
+}
+
+/**
+ * The rows a patch that replaces a group's whole config declares, following nested group containers. A patch without
+ * `insert` replaces the config of the row it names, so its children are new rows of the composition even though no
+ * `insert` appears.
+ * @param patches The layer's patches in application order.
+ * @param groups Row ids the composition holds before this layer, mapped to whether each is a group.
+ * @returns The declared child rows, in patch then declaration order.
+ */
+function replacementRows(patches: readonly PatchOptions[], groups: ReadonlyMap<string, boolean>): InsertedRow[] {
+  const declared: InsertedRow[] = []
+  const visit = (rows: readonly EntryOptions[], parent: string): void => {
+    for (const row of rows) {
+      if (typeof row.id !== 'string' || typeof row.name !== 'string') continue
+      const group = row.group === true
+      declared.push({ rowId: row.id, specifier: row.name, moduleKey: '', parent, group })
+      if (group && Array.isArray(row.config)) visit(row.config as EntryOptions[], row.id)
+    }
+  }
+  for (const patch of patches) {
+    if (patch.insert !== undefined || typeof patch.id !== 'string' || !Array.isArray(patch.config)) continue
+    if (groups.get(patch.id) !== true) continue
+    visit(patch.config as EntryOptions[], patch.id)
+  }
+  return declared
 }
 
 /**
@@ -472,14 +562,13 @@ export class PluginManager extends TypertRemoteService {
   }
 
   /** Read current plugins, including why a row cannot be changed through the profile patch.
+   * The listing projects Loader entries only; preset compositions belong to the inventory Remote.
    * @returns Current runtime entries with persistent patch targets.
-   * @throws {PluginManagerError} `PLUGIN_MANAGER_PROFILE_READ_FAILED` to in-process callers when the profile patches
-   *   cannot be read; Remote callers receive `gateway/internal`.
    */
   @Remote
   async listPlugins(): Promise<PluginInfo[]> {
-    const rows = readProfileState(() => flatten(composeEntries([readProfilePatches('dsh', this.profile)])))
-    const snapshot = await readPluginInventory(this.ctx)
+    const rows = flatten(composeEntries([readProfilePatches('dsh', this.profile)]))
+    const snapshot = await readPluginInventory(this.ctx, { includePresets: false })
     return snapshot.entries.map((entry) => {
       const actual = [...this.ctx.loader.entries()].find(row => row.id === entry.entryId)
       const candidates = rows.filter(row => row.id === actual?.options.id)
@@ -498,32 +587,31 @@ export class PluginManager extends TypertRemoteService {
   /** Read installed, installation-provided, and offline Official catalog bundles, plus selected non-bundle names.
    * A dependency without a bundle patch is listed, as a `not-bundle` problem, only while it is selected.
    * @returns Package versions, manifest descriptions, the installable spec of profile dependencies, rows, optional
-   * display metadata, activation selections, whether the installation offers the bundle, and removal availability.
-   * @throws {PluginManagerError} `PLUGIN_MANAGER_PROFILE_READ_FAILED` to in-process callers when a profile or
-   *   installation manifest cannot be read; Remote callers receive `gateway/internal`.
+   * display metadata, activation selections, whether the installation offers the bundle, removal availability, and for
+   * an unselected bundle whose every row another selected bundle already inserts under the same id and module, the
+   * providing bundle names in `providedBy`; `enabled` stays the saved selection, not successful activation.
    */
   @Remote
   listBundles(): Promise<BundleInfo[]> {
-    return Promise.resolve(this.readBundles().map((bundle) => {
-      const target = updateRefusal(bundle, bundle.name)
-      return typeof target === 'string' ? bundle : { ...bundle, update: target.kind }
-    }))
+    return Promise.resolve(this.readBundles().map(bundle => ({ ...bundle, updatable: typeof updateRefusal(bundle, bundle.name) !== 'string' })))
   }
 
   /** The bundle inventory before update eligibility, which is derived from each listed bundle. */
-  private readBundles(): Omit<BundleInfo, 'update'>[] {
-    const { manifest, exemptions, installation } = readProfileState(() => ({
-      manifest: readProfileManifest('dsh', this.profile.dir),
-      exemptions: readProfileVersionExemptions(this.profile.dir),
-      installation: JSON.parse(readFileSync(this.profile.installAnchor, 'utf8')) as InstallationManifest,
-    }))
+  private readBundles(): Omit<BundleInfo, 'updatable'>[] {
+    const manifest = readProfileManifest('dsh', this.profile.dir)
+    const exemptions = readProfileVersionExemptions(this.profile.dir)
     const selected = bundleSelection(manifest)
     const recorded = manifest.dependencies ?? {}
     const dependencies = Object.keys(recorded)
+    const installation = JSON.parse(readFileSync(this.profile.installAnchor, 'utf8')) as InstallationManifest
     const catalog = new Map(OFFICIAL_ON_DEMAND_CATALOG.map(entry => [entry.packageName, entry]))
     const names = [...new Set([...selected, ...dependencies, ...Object.keys(installation.dependencies ?? {}), ...catalog.keys()])]
-    const bundles: Omit<BundleInfo, 'update'>[] = []
+    const bundles: Omit<BundleInfo, 'updatable'>[] = []
+    const facts = new BundleFacts(this.profile)
+    const composition = this.composition(facts)
+    const repeated = repeatedRowIds(composition.rows)
     const runtimeVersion = getDshRuntimeVersion()
+    const officialTargets = officialBundleInstallTargets(this.profile.installAnchor, runtimeVersion)
     for (const name of names) {
       const installed = dependencies.includes(name)
       const optional = OPTIONAL_BUNDLES.includes(name)
@@ -534,7 +622,7 @@ export class PluginManager extends TypertRemoteService {
       let target: Pick<BundleInfo, 'installTarget'> = {}
       let targetError: ManagementError | undefined
       if (offered !== undefined) {
-        try { target = { installTarget: officialBundleInstallTarget(name, this.profile.installAnchor, runtimeVersion) } }
+        try { target = { installTarget: officialTargets(name) } }
         catch (error) { targetError = managementError(error) }
       }
       const catalogMeta = offered === undefined ? {} : { meta: offered.meta }
@@ -559,7 +647,7 @@ export class PluginManager extends TypertRemoteService {
       let version: string | undefined
       let listing: Pick<BundleInfo, 'listedByDefault'> = {}
       try {
-        const info = bundleManifest(name, this.profile.dir, this.profile.installAnchor)
+        const info = facts.manifest(name)
         availability = shipped ? 'installation' : 'profile'
         if (info === undefined) {
           if (enabled || offered !== undefined) bundles.push({ name, official, availability, ...catalogMeta, ...target,
@@ -569,29 +657,37 @@ export class PluginManager extends TypertRemoteService {
         }
         version = info.version
         const listedByDefault = info.dsh?.bundle?.listedByDefault
-        // The launcher ignores this display field, so an invalid value is a metadata diagnostic, not a load error.
-        const listingDiagnostic = listedByDefault === undefined || typeof listedByDefault === 'boolean'
-          ? undefined
-          : 'dsh.bundle.listedByDefault must be a boolean'
-        if (typeof listedByDefault === 'boolean') listing = { listedByDefault }
+        if (listedByDefault !== undefined) {
+          if (typeof listedByDefault !== 'boolean') throw new Error('dsh.bundle.listedByDefault must be a boolean')
+          listing = { listedByDefault }
+        }
         const compatibility = evaluatePluginCompatibility(info, exemptions)
         if (compatibility !== undefined && !compatibility.exempted) throw new ManagementFailure('incompatible-version', [incompatiblePlugin(compatibility)])
-        const dir = resolveBundleDir('dsh', name, this.profile.installAnchor, this.profile.dir)
-        const read: BundleInfo['meta'] = offered?.meta ?? readPluginMeta(info.name ?? name, pathToFileURL(join(dir, 'package.json')).href)
-        const meta = listingDiagnostic === undefined
-          ? read
-          : { ...read, error: read?.error === undefined ? listingDiagnostic : `${read.error}; ${listingDiagnostic}` }
+        const dir = facts.directory(name)
+        const meta = offered?.meta ?? facts.meta(info.name ?? name, pathToFileURL(join(dir, 'package.json')).href)
         let platformError: ManagementError | undefined
         try { assertBundlePlatform(info.dsh?.bundle?.platforms, process.platform) }
         catch (error) { platformError = managementError(error) }
         if (platformError?.code === 'unsupported-platform') listing = { listedByDefault: false }
-        const error = platformError ?? targetError
+        const declared = this.declaredRows(name, info, repeated, facts)
+        let providedBy: string[] | undefined
+        let duplicate: ManagementError | undefined
+        if (!enabled) {
+          const added = this.selectionRows(name, composition, facts)
+          const collisions = collidingRows(added, composition.layers, name)
+          const providers = declared.overrides.length === 0 && added.every(row => row.existed)
+            ? providingLayers(added, composition.layers.filter(layer => layer.bundle)) : []
+          if (providers.length === 1) providedBy = providers
+          else if (collisions.length > 0) duplicate = { code: 'duplicate-entry', diagnostic: duplicateEntryDiagnostic(collisions) }
+        }
+        const error = platformError ?? targetError ?? duplicate
         bundles.push({ name, official, availability, ...listing, ...target, ...(version === undefined ? {} : { version }),
           ...(info.description === undefined || info.description === '' ? {} : { description: info.description }),
           ...meta === undefined ? {} : { meta },
           ...sourceOf(info.name), enabled, installed, optional, removable: removable && readOnlyReason === undefined,
           ...(readOnlyReason === undefined ? {} : { readOnlyReason }),
-          ...this.declaredRows(name, info),
+          ...declared,
+          ...providedBy === undefined ? {} : { providedBy },
           ...error === undefined ? {} : { error } })
       } catch (error) {
         if (enabled || installed || optional || offered !== undefined) {
@@ -688,7 +784,6 @@ export class PluginManager extends TypertRemoteService {
   async listVersions(name: string, options?: ListVersionsOptions, signal?: AbortSignal): Promise<PluginVersionList> {
     const target = updateRefusal((await this.listBundles()).find(bundle => bundle.name === name), name)
     if (typeof target === 'string') return { status: 'refused', problem: 'not-updatable', reason: target, attempts: [] }
-    if (target.kind === 'git') return { status: 'refused', problem: 'not-updatable', reason: `${name} is installed from Git, which lists no versions`, attempts: [] }
     const plan = registryPlan(this.registryFor(name, options?.registry), await this.registries())
     const listing = await this.askRegistries(name, VERSION_LIST_FIELDS, plan, target.parsed, signal)
     if (listing.status === 'refused') return listing
@@ -725,21 +820,15 @@ export class PluginManager extends TypertRemoteService {
   }
 
   /**
-   * Replace an installed bundle with a newer version. A registry copy updates to `name@version`, checked on the registry
-   * first: it must exist, declare a bundle, and accept the running DSH version, or nothing changes. A Git copy updates
-   * to the Git spec `options.spec` names, which must pin a full commit of the repository directory the copy came from;
-   * with HMR, a network failure or timeout reaching its repository stops the update before anything changes. pnpm reads
-   * a Git package only while installing it, so its bundle and compatibility are checked then. Either target
-   * installation is undone, profile files and modules included, before its bundle loads unless it installs `name` at
-   * `version`. With HMR the installed version is removed, so its plugins stop, and the target is installed with the same
-   * selection; when that installation fails or is cancelled, the removed version is installed again: a registry copy
-   * from the registry it came from, a Git copy from its saved spec. Without HMR the target is installed over the running
-   * version and the result reports the restart.
+   * Replace an installed registry bundle with a newer published version. The target is checked on the registry first:
+   * it must exist, declare a bundle, and accept the running DSH version, or nothing changes. With HMR the installed
+   * version is removed, so its plugins stop, and the target is installed with the same selection; when that
+   * installation fails or is cancelled, the removed version is installed again from the registry it came from.
+   * Without HMR the target is installed over the running version and the result reports the restart.
    * @param name Installed profile dependency name.
-   * @param version Exact version newer than the installed one.
-   * @param options The registry asked first, as for `listVersions`; the Git spec of `version`, required for and accepted
-   * only by a bundle `listBundles` lists with `update: 'git'`; and the request id naming the progress and the target
-   * installation's logs and cancellation.
+   * @param version Exact published version newer than the installed one.
+   * @param options The registry asked first, as for `listVersions`, and the request id naming the progress and the
+   * target installation's logs and cancellation.
    * @returns The versions, the last step that ran with its result, and the reinstallation when one ran.
    */
   @Remote
@@ -760,33 +849,28 @@ export class PluginManager extends TypertRemoteService {
     if (semver.valid(version) === null || !semver.gt(version, from)) {
       return refusedBefore({ code: 'invalid-spec', diagnostic: `${version} is not a version newer than the installed ${from}` })
     }
-    const planned = target.kind === 'git'
-      ? this.planGitUpdate(name, target.origin, options)
-      : await this.checkRegistryUpdate(name, version, options)
-    if ('code' in planned) return refusedBefore(planned)
-    const { spec, registry, saveExact } = planned
+    const spec = `${name}@${version}`
+    const plan = registryPlan(this.registryFor(name, options?.registry), await this.registries())
+    const checked = await this.askRegistries(spec, VERSION_FIELDS, plan, { kind: 'registry', spec, name })
+    if (checked.status === 'refused') return refusedBefore({ code: 'operation-error', diagnostic: checked.reason })
+    const facts = versionFacts(checked.answer, name, version)
+    if (!facts.bundle) return refusedBefore({ code: 'not-bundle' })
+    let compatibility
+    try { compatibility = evaluatePluginCompatibility(facts.manifest, readProfileVersionExemptions(this.profile.dir)) }
+    catch (error) { return refusedBefore({ code: 'operation-error', diagnostic: messageOf(error) }) }
+    if (compatibility !== undefined && !compatibility.exempted) {
+      return refusedBefore({ code: 'incompatible-version', incompatible: [incompatiblePlugin(compatibility)] })
+    }
     const { enabled } = bundle
     // A lock timeout or disposal rejects instead of reporting; it reads as the failed step it is.
     const settled = (stage: ChangeResult['stage'], target: string, operation: Promise<ChangeResult>): Promise<ChangeResult> =>
       operation.catch((error: unknown) => ({ changed: false, application: 'failed', stage, target, error: managementError(error) }))
     const installTarget = (): Promise<ChangeResult> => settled('install', spec, this.installBundle(spec, {
-      saveExact, enabled, expected: { name, version },
-      ...registry === undefined ? {} : { registry }, ...requestId === undefined ? {} : { requestId },
+      saveExact: true, registry: checked.registry, enabled, ...requestId === undefined ? {} : { requestId },
     }))
     if (this.ownerContext.get('hmr') === undefined) {
       announce('installing')
       return { from, to: version, step: 'install', result: await installTarget() }
-    }
-    // A Git host that cannot be reached would fail the target and the reinstallation alike, so nothing is removed.
-    const unreachable = target.kind === 'git' ? await this.gitHostUnreachable(spec) : undefined
-    if (unreachable !== undefined) {
-      return {
-        from, to: version, step: 'check',
-        result: {
-          changed: false, application: 'failed', stage: 'install', target: name, failedAt: 'spec-host', packageResult: unreachable,
-          error: { code: 'operation-error', diagnostic: unreachable.output },
-        },
-      }
     }
     // The removed version is installed again where it came from, else over the configured plan, as its removal asks.
     const previousRegistry = this.installedFrom.get(name)
@@ -800,78 +884,11 @@ export class PluginManager extends TypertRemoteService {
     // A target that installed but failed to start is still a dependency; it goes before the removed version returns.
     if (result.stage === 'enable') await settled('remove', name, this.removeBundle(name))
     // The reinstallation carries no request id, so cancelling the update cannot leave the package removed.
-    const previous = target.kind === 'git' ? target.source : `${name}@${from}`
+    const previous = `${name}@${from}`
     const restore = await settled('install', previous, this.installBundle(previous, {
-      saveExact, enabled, ...previousRegistry === undefined ? {} : { registry: previousRegistry },
+      saveExact: true, enabled, ...previousRegistry === undefined ? {} : { registry: previousRegistry },
     }))
     return { from, to: version, step: 'install', result, restore }
-  }
-
-  /**
-   * The target of a Git copy's update: the caller's Git spec, pinned to a full commit of the copy's repository directory.
-   * @param name The package name.
-   * @param origin The repository directory the installed copy pins.
-   * @param options The caller's spec and registry.
-   * @returns The spec and the registry its dependencies are asked from first, or why the update is refused.
-   */
-  private planGitUpdate(name: string, origin: string, options: UpdateBundleOptions | undefined): UpdatePlan | ManagementError {
-    const spec = options?.spec
-    const pinned = spec === undefined ? undefined : pinnedGitOrigin(spec)
-    if (spec === undefined || pinned === undefined) {
-      return { code: 'invalid-spec', diagnostic: `${name} is installed from Git and updates only to a Git spec pinned to a full commit` }
-    }
-    if (pinned !== origin) {
-      return { code: 'invalid-spec', diagnostic: `${spec} is not in the repository directory ${name} is installed from, ${origin}` }
-    }
-    return { spec, registry: this.registryFor(name, options?.registry), saveExact: false }
-  }
-
-  /**
-   * Check that the network reaches the repository of a Git update's target. Only a network failure or a timeout
-   * counts: a check Git cannot run, or one the repository refuses without credentials, leaves the answer to pnpm.
-   * @param spec The target's pinned Git spec.
-   * @returns The failed check, or undefined when the host answered or the check could not tell.
-   */
-  private async gitHostUnreachable(spec: string): Promise<PackageResult | undefined> {
-    const parsed = parseInstallSpec(spec)
-    /* v8 ignore next -- planGitUpdate accepts only a pinned Git spec */
-    if (parsed.kind !== 'git') return undefined
-    const env = this.profile.packageManager?.env === undefined ? {} : { env: this.profile.packageManager.env }
-    const check = checkGitConnection(parsed, this.profile.dir, {
-      timeoutMs: this.githubConnectionTimeoutMs, outputBytes: this.outputBytes, signal: this.abort.signal, ...env,
-    })
-    this.packageOperations.add(check)
-    let failure: GithubConnectionFailure | undefined
-    try { failure = await check } finally { this.packageOperations.delete(check) }
-    this.abort.signal.throwIfAborted()
-    if (failure?.kind !== 'network' && failure?.kind !== 'timeout') return undefined
-    // The answer keeps a plain PackageResult; the check's command line stays out of the wire fields.
-    const { argv: _argv, ...packageResult } = failure
-    return packageResult
-  }
-
-  /**
-   * Check a registry copy's update target on the registry plan before anything changes.
-   * @param name The package name.
-   * @param version The target version.
-   * @param options The caller's registry, as for `listVersions`; a spec is refused.
-   * @returns The exact spec and the registry that answered for it, or why the target cannot replace the bundle.
-   */
-  private async checkRegistryUpdate(
-    name: string, version: string, options: UpdateBundleOptions | undefined,
-  ): Promise<UpdatePlan | ManagementError> {
-    const spec = `${name}@${version}`
-    if (options?.spec !== undefined) return { code: 'invalid-spec', diagnostic: `${name} is installed from a registry and updates only to ${spec}` }
-    const plan = registryPlan(this.registryFor(name, options?.registry), await this.registries())
-    const checked = await this.askRegistries(spec, VERSION_FIELDS, plan, { kind: 'registry', spec, name })
-    if (checked.status === 'refused') return { code: 'operation-error', diagnostic: checked.reason }
-    const facts = versionFacts(checked.answer, name, version)
-    if (!facts.bundle) return { code: 'not-bundle' }
-    let compatibility
-    try { compatibility = evaluatePluginCompatibility(facts.manifest, readProfileVersionExemptions(this.profile.dir)) }
-    catch (error) { return { code: 'operation-error', diagnostic: messageOf(error) } }
-    if (compatibility !== undefined && !compatibility.exempted) return { code: 'incompatible-version', incompatible: [incompatiblePlugin(compatibility)] }
-    return { spec, registry: checked.registry, saveExact: true }
   }
 
   /**
@@ -946,7 +963,9 @@ export class PluginManager extends TypertRemoteService {
     }), { stage: 'enable', target: id, enabled }, 'plugin')
   }
 
-  /** Select or remove a bundle layer while retaining installed dependencies.
+  /** Select or remove a bundle layer while retaining installed dependencies. Enabling a bundle that is not selected
+   * yet refuses, with `duplicate-entry`, row ids another layer already inserts; the refusal names the ids and layers in
+   * its diagnostic and saves no selection. Re-selecting a saved bundle changes nothing and reports none.
    * @param name Bundle package name.
    * @param enabled Whether the bundle contributes its patch layer.
    * @returns Persisted and runtime outcomes.
@@ -1043,16 +1062,11 @@ export class PluginManager extends TypertRemoteService {
           result.registries.push(registry)
           used = registry
           announce('installing', { registry, index: index + 1, total: plan.length })
-          run = await this.runPnpm(
-            ['add', installSpec, ...options?.saveExact === true ? ['--save-exact'] : [], ...registryArguments(registry)],
-            control.abort.signal, requestId, options?.expected,
-          )
+          run = await this.runPnpm(['add', installSpec, ...options?.saveExact === true ? ['--save-exact'] : [], ...registryArguments(registry)], control.abort.signal, requestId)
           result.packageResult = run
           if (stopped()) throw new InstallCancelledError()
           // A compatibility refusal is the package's own answer, so no other registry is asked.
           if (run.incompatible !== undefined) throw new ManagementFailure('incompatible-version', run.incompatible)
-          // So is a run that installed another package, version, or no bundle where the caller expects one.
-          if (run.unmet !== undefined) throw new ManagementFailure(run.unmet)
           // A run this manager terminated is not a success, even when pnpm trapped the signal and exited 0.
           if (run.exitCode === 0 && run.timedOut !== true) break
           /* v8 ignore next 2 -- runPnpm classifies every run it does not report as succeeded */
@@ -1159,11 +1173,11 @@ export class PluginManager extends TypertRemoteService {
         const bundle = (await this.listBundles()).find(item => item.name === name)
         if (bundle === undefined || !bundle.removable) throw new ManagementFailure('not-removable')
         if (this.ownerContext.get('hmr') === undefined && (this.profile.startedBundles.includes(name)
-          || (bundle.error === undefined && this.bundleRows(name).some(row => [...this.ctx.loader.entries()]
-            .some(entry => entry.options.id === row.id && entry.fiber !== undefined))))) {
+          || this.readableRows(name, bundle).some(row => [...this.ctx.loader.entries()]
+            .some(entry => entry.options.id === row.id && entry.fiber !== undefined)))) {
           throw new ManagementFailure('stop-profile')
         }
-        const contributions = bundle.error === undefined ? this.bundleRows(name) : []
+        const contributions = this.readableRows(name, bundle)
         if (bundle.enabled) {
           await this.selectBundle(name, false)
           Object.assign(result, await this.reload())
@@ -1187,19 +1201,153 @@ export class PluginManager extends TypertRemoteService {
     }, { stage: 'remove', target: name }, 'remove')
   }
 
-  /** The rows a bundle's patch inserts and the existing rows it changes; an unreadable patch throws. */
-  private declaredRows(name: string, info: ProfileManifest): Pick<BundleInfo, 'rows' | 'overrides'> {
+  /** The module identity one layer's rows resolve to: a bare name through the layer's own package and lookup order. */
+  private moduleKeys(base: string, self?: LayerPackage): (row: EntryOptions) => string {
+    return row => moduleIdentity(row.name, base, specifier => bareModuleDir(specifier, base, self,
+      (name, from) => this.ctx.get('pluginPackages')?.packageOf(name, from)?.dir))
+  }
+
+  /**
+   * Compose the profile's current layers and attribute each inserted row to the layer that last inserted or replaced it.
+   * The profile patch, the home patch, and launch overlays are layers like any bundle: a duplicate they insert collides
+   * even though this manager cannot rewrite them. Layers are read from the profile files alone, so listing a profile
+   * never rewrites it.
+   * @returns The composed rows with the bundles' and the trailing patches, each layer's surviving rows, and every id the
+   *   composition holds.
+   */
+  private composition(facts: BundleFacts = new BundleFacts(this.profile)): Composition {
+    const manifest = readProfileManifest('dsh', this.profile.dir)
+    const exemptions = readProfileVersionExemptions(this.profile.dir)
+    const sources: { label: string; base: string; bundle: boolean; self?: LayerPackage; patches: PatchOptions[] }[] = []
+    // A configuration row a non-insert patch declares resolves beside the root include, not beside the patch file.
+    const rootBase = pathToFileURL(join(this.profile.dir, 'cordis.yml')).href
+    for (const name of bundleSelection(manifest)) {
+      if (RETIRED_BUNDLES.has(name)) continue
+      try {
+        const info = facts.manifest(name)
+        if (info === undefined) continue
+        assertBundlePlatform(info.dsh?.bundle?.platforms, process.platform)
+        const compatibility = evaluatePluginCompatibility(info, exemptions)
+        if (compatibility !== undefined && !compatibility.exempted) continue
+        const dir = facts.directory(name)
+        sources.push({
+          label: name, base: pathToFileURL(join(dir, 'package.json')).href, bundle: true,
+          self: { name: info.name ?? name, dir }, patches: facts.patchList(name),
+        })
+      } catch (_error) {
+        // A selected bundle the launcher skips contributes no layer and mounts no row.
+        continue
+      }
+    }
+    const profilePatch = this.profile.patchPath
+    sources.push({
+      label: profilePatch, base: rootBase, bundle: false, patches: loadOptionalPatches('dsh', profilePatch) ?? [],
+    })
+    const homePatch = join(this.profile.home, PROFILE_PATCH_FILENAME)
+    sources.push({
+      label: homePatch, base: rootBase, bundle: false, patches: loadOptionalPatches('dsh', homePatch) ?? [],
+    })
+    sources.push({ label: 'launch overlay', base: rootBase, bundle: false, patches: [...this.profile.overlays] })
+    const rows = composeEntries(sources.map(source => source.patches))
+    // Attribute each surviving row to the last layer whose patches declare it. Declarations are read from the patches
+    // under the composition's own group-acceptance rule, so a row keeps the module and parent it was inserted with, and
+    // an id a later layer replaces away simply never appears in the composed rows. The module identity is resolved only
+    // for rows that survive, once, in the layer that owns them.
+    const groups = new Map<string, boolean>()
+    const owners = new Map<string, { layer: number; row: InsertedRow }>()
+    for (const [index, source] of sources.entries()) {
+      const declared = [...patchInsertedRows(source.patches, () => '', groups), ...replacementRows(source.patches, groups)]
+      for (const row of declared) {
+        owners.set(rowIdentity(row), { layer: index, row })
+        groups.set(row.rowId, row.group)
+      }
+    }
+    const inserted = insertedRows(rows, () => '')
+    const held = new Set(inserted.map(rowIdentity))
+    const kept: CompositionLayer[] = sources.map(source => ({ layer: source.label, bundle: source.bundle, rows: [] }))
+    const keyed: ((row: EntryOptions) => string)[] = []
+    for (const [identity, owner] of owners) {
+      if (!held.has(identity)) continue
+      const layer = sources[owner.layer]
+      /* v8 ignore next -- an owner layer index always names a source */
+      if (layer === undefined) continue
+      const keyOf = keyed[owner.layer] ??= this.moduleKeys(layer.base, layer.self)
+      kept[owner.layer]?.rows.push({ ...owner.row, moduleKey: keyOf({ id: owner.row.rowId, name: owner.row.specifier }) })
+    }
+    return {
+      bundlePatches: sources.filter(source => source.bundle).flatMap(source => source.patches),
+      trailingPatches: sources.filter(source => !source.bundle).flatMap(source => source.patches),
+      rows,
+      layers: kept,
+      ids: new Set(inserted.map(row => row.rowId)),
+    }
+  }
+
+  /** The patch lists a bundle contributes in application order; an unreadable patch throws. */
+  private bundlePatches(name: string): PatchOptions[] {
+    return new BundleFacts(this.profile).patchList(name)
+  }
+
+  /**
+   * The rows appending a bundle to the selection would add: its own declared rows that the composition then really
+   * holds, each marked with whether the composition without it already inserts the id. A group-target insert counts only
+   * when that group exists before the appended bundle, and a row a higher-priority layer replaces away does not count.
+   * @param name Bundle package name.
+   * @param composition The composition without the bundle.
+   * @param facts Bundle facts shared with this listing.
+   * @returns The rows the selection would add, in declaration order.
+   */
+  private selectionRows(name: string, composition: Composition, facts: BundleFacts): AddedRow[] {
+    const dir = facts.directory(name)
+    const patches = facts.patchList(name)
+    const groups = new Map(insertedRows(composeEntries([composition.bundlePatches]), () => '').map(row => [row.rowId, row.group]))
+    const self = { name: facts.manifest(name)?.name ?? name, dir }
+    const declared = patchInsertedRows(patches, this.moduleKeys(pathToFileURL(join(dir, 'package.json')).href, self), groups)
+    // The composition after the selection, less the rows it already held: the budget is what this layer really adds,
+    // so a row a trailing layer replaces away cannot be reported as a duplicate it introduced.
+    const survival = new Map<string, number>()
+    for (const row of insertedRows(composeEntries([[...composition.bundlePatches, ...patches, ...composition.trailingPatches]]), () => '')) {
+      survival.set(rowIdentity(row), (survival.get(rowIdentity(row)) ?? 0) + 1)
+    }
+    for (const row of insertedRows(composition.rows, () => '')) {
+      survival.set(rowIdentity(row), (survival.get(rowIdentity(row)) ?? 0) - 1)
+    }
+    const added: InsertedRow[] = []
+    for (const row of declared) {
+      const remaining = survival.get(rowIdentity(row)) ?? 0
+      if (remaining === 0) continue
+      survival.set(rowIdentity(row), remaining - 1)
+      added.push(row)
+    }
+    return addedRows(added, composition.ids)
+  }
+
+  /** A listed bundle's rows when its patch is readable; a duplicate row id is a readable patch, not an unreadable one. */
+  private readableRows(name: string, bundle: Pick<BundleInfo, 'error'>): EntryOptions[] {
+    return bundle.error !== undefined && bundle.error.code !== 'duplicate-entry' ? [] : this.bundleRows(name)
+  }
+
+  /**
+   * The rows a bundle's patch inserts and the existing rows it changes; an unreadable patch throws.
+   * @param name Bundle package name.
+   * @param info The bundle's manifest.
+   * @param repeated Ids the composition holds more than once, which no live entry addresses uniquely.
+   * @param facts Bundle facts shared with this listing.
+   * @returns The declared rows and overrides, naming a live entry only when one entry holds the id with the row's own
+   *   module.
+   */
+  private declaredRows(name: string, info: ProfileManifest, repeated: ReadonlySet<string>, facts: BundleFacts): Pick<BundleInfo, 'rows' | 'overrides'> {
     const bundle = info.dsh?.bundle
     /* v8 ignore next -- bundleManifest answers only manifests that declare a patch */
     if (bundle === undefined) return { rows: [], overrides: [] }
-    const dir = resolveBundleDir('dsh', name, this.profile.installAnchor, this.profile.dir)
-    const patches: PatchOptions[] = bundlePatchPaths(dir, bundle).flatMap(file => loadOverlayPatches('dsh', file))
-    // One entry per row id: the Loader keeps a single entry for an id, whichever layer declared it last.
-    const live = new Map<string, { entryId: PluginEntryId; baseUrl: string | undefined }>()
+    const dir = facts.directory(name)
+    const patches = facts.patchList(name)
+    // One entry per row id: the Loader keeps a single entry for an id, whichever tree declared it last.
+    const live = new Map<string, { entryId: PluginEntryId; moduleName: string; baseUrl: string | undefined }>()
     for (const entry of this.ctx.loader.entries()) {
       /* v8 ignore next -- the Loader gives every entry an id before it is listed */
       if (typeof entry.options.id === 'string') live.set(entry.options.id, {
-        entryId: pluginEntryId(entry.id), baseUrl: entry.parent.tree.ctx.baseUrl,
+        entryId: pluginEntryId(entry.id), moduleName: entry.options.name, baseUrl: entry.parent.tree.ctx.baseUrl,
       })
     }
     const rows: BundleRowInfo[] = []
@@ -1208,9 +1356,9 @@ export class PluginManager extends TypertRemoteService {
       // Group rows are containers without a plugin inventory entry; their children carry the switches.
       if (typeof row.id !== 'string' || typeof row.name !== 'string' || row.group === true) continue
       const active = live.get(row.id)
-      const entryId = active?.entryId
+      const entryId = active?.moduleName === row.name && !repeated.has(row.id) ? active.entryId : undefined
       const base = active?.baseUrl ?? pathToFileURL(join(dir, 'package.json')).href
-      const meta = packages?.metaOf(row.name, base)
+      const meta = packages === undefined ? undefined : facts.meta(row.name, base)
       rows.push({ rowId: row.id, moduleName: row.name,
         ...entryId === undefined ? {} : { entryId }, ...meta === undefined ? {} : { meta } })
     }
@@ -1220,9 +1368,9 @@ export class PluginManager extends TypertRemoteService {
     return { rows, overrides }
   }
 
-  /** Run one pnpm command in the profile, streaming its output as install-log chunks; `expected` is the package an `add` must install. */
+  /** Run one pnpm command in the profile, streaming its output as install-log chunks. */
   private async runPnpm(
-    args: readonly string[], signal?: AbortSignal, requestId?: PluginInstallRequestId, expected?: InstallBundleOptions['expected'],
+    args: readonly string[], signal?: AbortSignal, requestId?: PluginInstallRequestId,
   ): Promise<PackageResult> {
     const jobId = randomUUID()
     const argv = ['pnpm', ...args]
@@ -1232,7 +1380,7 @@ export class PluginManager extends TypertRemoteService {
       execution: 'service', ...this.profile.packageManager ?? { command: this.pnpmCommand },
       signal: signal === undefined ? this.abort.signal : AbortSignal.any([this.abort.signal, signal]),
       outputBytes: this.outputBytes, activateNewBundles: false, idleTimeoutMs: this.idleTimeoutMs,
-      lookupTimeoutMs: this.inspectTimeoutMs, ...expected === undefined ? {} : { expected },
+      lookupTimeoutMs: this.inspectTimeoutMs,
       onOutput: (text, stream) => {
         this.ownerContext.emit('plugin-manager/install-log', { ...identity, jobId, argv, cwd, stream, text })
       },
@@ -1285,7 +1433,15 @@ export class PluginManager extends TypertRemoteService {
         assertBundlePlatform(metadata.dsh?.bundle?.platforms, process.platform)
         const compatibility = evaluatePluginCompatibility(metadata, readProfileVersionExemptions(this.profile.dir))
         if (compatibility !== undefined && !compatibility.exempted) throw new ManagementFailure('incompatible-version', [incompatiblePlugin(compatibility)])
-        this.bundleRows(name)
+        // Only a new selection adds rows; re-selecting a saved one changes no composition and reports none.
+        if (previous.includes(name)) {
+          this.bundleRows(name)
+        } else {
+          const facts = new BundleFacts(this.profile)
+          const composition = this.composition(facts)
+          const collisions = collidingRows(this.selectionRows(name, composition, facts), composition.layers, name)
+          if (collisions.length > 0) throw new ManagementFailure('duplicate-entry', undefined, duplicateEntryDiagnostic(collisions))
+        }
       }
     }
     if (!enabled && previous.includes(name)) {
@@ -1299,10 +1455,7 @@ export class PluginManager extends TypertRemoteService {
   }
 
   private bundleRows(name: string): EntryOptions[] {
-    const info = bundleManifest(name, this.profile.dir, this.profile.installAnchor)
-    if (info?.dsh?.bundle === undefined) return []
-    const dir = resolveBundleDir('dsh', name, this.profile.installAnchor, this.profile.dir)
-    return flatten(composeEntries([bundlePatchPaths(dir, info.dsh.bundle).flatMap(file => loadOverlayPatches('dsh', file))]))
+    return flatten(composeEntries([this.bundlePatches(name)]))
   }
 
   private protectsManager(name: string): boolean {
@@ -1383,9 +1536,7 @@ export class PluginManager extends TypertRemoteService {
     let settled: ChangeResult
     try {
       settled = await withFileLock(join(this.profile.dir, 'package.json'), async () => {
-        if (this.abort.signal.aborted) {
-          throw new PluginManagerError('plugin-manager: the manager is disposed; retry after the Host reloads it', 'PLUGIN_MANAGER_UNAVAILABLE')
-        }
+        this.abort.signal.throwIfAborted()
         const before = this.diskState()
         const result: ChangeResult = { ...request, changed: false,
           ...this.ownerContext.get('hmr') !== undefined ? { application: 'applied' } : { application: 'restart-required', restartReason: 'no-hmr' } }

@@ -1,5 +1,5 @@
 /** Persistent manager behavior through a real profile Include and Loader. */
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
@@ -23,6 +23,8 @@ import Timer from '@deepseek-ai/cordis-plugin-timer'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { Group } from '@deepseek-ai/cordis-plugin-loader'
 import * as operations from '../src/operations.ts'
+import * as officialInstall from '../src/official-install-target.ts'
+import * as rowConflict from '../src/row-conflict.ts'
 import * as githubConnection from '../src/github-connection.ts'
 import * as gitTransport from '../src/git-transport.ts'
 import { parse, parseDocument } from 'yaml'
@@ -63,14 +65,13 @@ async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, pre
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
   writeFileSync(join(dir, 'cordis.yml'), '[]\n')
   prepareFiles?.(dir)
-  const overlayPath = join(home, 'overlay.patch.yml')
-  writeFileSync(overlayPath, JSON.stringify(overlay ? [{ id: 'managed', disabled: true }] : []))
+  const overlays: PatchOptions[] = overlay ? [{ id: 'managed', disabled: true }] : []
   const profile: ProfileContext = {
     name: 'test',
     ...(packageManager === undefined ? {} : { packageManager }),
     startedBundles: loadProfileDirectory('test', dir, anchor).layers.map(layer => layer.packageName),
     dir, patchPath: join(dir, 'cordis.patch.yml'), installAnchor: anchor, cwd: home, home,
-    overlayPaths: [overlayPath], telemetryDisabledEnv: undefined,
+    overlays, telemetryDisabledEnv: undefined,
   }
   const ctx = await boot('test', join(dir, 'cordis.yml'), readProfilePatches('test', profile), (ctx) => {
     owner = ctx
@@ -82,8 +83,7 @@ async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, pre
   // What pnpm's own configuration names is read from pnpm before every registry plan; the fixture answers npm's own registry.
   const registry = vi.spyOn(operations, 'readProfileRegistry').mockResolvedValue('https://registry.npmjs.org/')
   const connection = vi.spyOn(githubConnection, 'checkGithubConnection').mockResolvedValue(undefined)
-  const gitConnection = vi.spyOn(githubConnection, 'checkGitConnection').mockResolvedValue(undefined)
-  onTestFinished(() => { registry.mockRestore(); connection.mockRestore(); gitConnection.mockRestore() })
+  onTestFinished(() => { registry.mockRestore(); connection.mockRestore() })
   let stopHmr = async () => {}
   if (reload === 'live') {
     await ctx.plugin(Timer)
@@ -91,7 +91,7 @@ async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, pre
     stopHmr = () => owner.dispose()
     await ctx.hmr.runExclusive(async () => {})
   }
-  return { ctx, dir, manager: ctx.pluginManager, bundle, profile, stopHmr, overlayPath, connection, gitConnection }
+  return { ctx, dir, manager: ctx.pluginManager, bundle, profile, stopHmr, overlays, connection }
 }
 
 it.each(['live', 'startup'] as const)('refuses an unsupported bundle before saving or applying it with %s reload', async (reload) => {
@@ -416,16 +416,27 @@ it('lists bundle versions and current-profile plugin targets', async () => {
   expect(plugins.find(row => row.entryId === 'include:manager')?.readOnlyReason).toBe('management-required')
   expect((await manager.listBundles()).filter(bundle => bundle.installTarget === undefined)).toEqual([
     {
-      name: 'core', version: '1.0.0', enabled: true, installed: false, official: false, availability: 'profile', optional: false, removable: false, readOnlyReason: 'management-required',
+      name: 'core', version: '1.0.0', enabled: true, installed: false, official: false, availability: 'profile', optional: false, removable: false, updatable: false, readOnlyReason: 'management-required',
       meta: { title: 'core' },
       rows: [{ rowId: 'manager', moduleName: 'cordis:manager', entryId: 'include:manager' }], overrides: [],
     },
     {
-      name: 'extra', version: '1.0.0', source: 'extra@1.0.0', enabled: true, installed: true, official: false, availability: 'profile', optional: false, removable: true, update: 'registry',
+      name: 'extra', version: '1.0.0', source: 'extra@1.0.0', enabled: true, installed: true, official: false, availability: 'profile', optional: false, removable: true, updatable: true,
       meta: { title: 'extra' },
       rows: [{ rowId: 'managed', moduleName: pathToFileURL(join(dir, 'node_modules', 'extra', 'plugin.mjs')).href, entryId: 'include:managed' }], overrides: [],
     },
   ])
+})
+
+it('lists profile plugins without composing agent presets', async () => {
+  const compositionInventory = vi.fn(async () => [{
+    id: 'standard', isDefault: true, rows: [{ entryId: null, moduleName: 'pkg-file', enabled: false }],
+  }])
+  const { manager } = await fixture('live', false, (ctx) => {
+    ctx.provide('agentPresets' as never, { compositionInventory } as never)
+  })
+  expect((await manager.listPlugins()).some(row => row.entryId === 'include:managed')).toBe(true)
+  expect(compositionInventory).not.toHaveBeenCalled()
 })
 
 it('describes a bundle by its manifest and patch: one-liner, rows without a live entry, and the built-in rows it changes', async () => {
@@ -443,7 +454,7 @@ it('describes a bundle by its manifest and patch: one-liner, rows without a live
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
   const moduleName = pathToFileURL(join(dir, 'node_modules', 'described', 'plugin.mjs')).href
   expect((await manager.listBundles()).find(row => row.name === 'described')).toEqual({
-    name: 'described', version: '2.0.0', description: 'Describes itself.', source: 'described@2.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, update: 'registry',
+    name: 'described', version: '2.0.0', description: 'Describes itself.', source: 'described@2.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, updatable: true,
     meta: { title: 'described', description: 'Describes itself.' },
     rows: [{ rowId: 'described-row', moduleName }], overrides: ['managed'],
   })
@@ -471,16 +482,8 @@ it('projects each bundle\'s default GUI listing without changing its selection, 
   }
   manifest.dsh.bundle.listedByDefault = 'hidden'
   writeFileSync(path, JSON.stringify(manifest))
-  // The launcher ignores the field, so an invalid value is a metadata diagnostic beside the running layer's live row.
-  const invalid = (await manager.listBundles()).find(row => row.name === 'extra')
-  expect(invalid).toMatchObject({ enabled: true, meta: { error: 'dsh.bundle.listedByDefault must be a boolean' },
-    rows: [{ rowId: 'managed', entryId: 'include:managed' }] })
-  expect(invalid?.error).toBeUndefined()
-  expect(invalid?.listedByDefault).toBeUndefined()
-  // An unreadable icon keeps its own diagnostic beside the listing one.
-  writeFileSync(path, JSON.stringify({ ...manifest, icon: 'missing.svg' }))
-  expect((await manager.listBundles()).find(row => row.name === 'extra')?.meta?.error)
-    .toMatch(/^Plugin metadata for extra: .+; dsh\.bundle\.listedByDefault must be a boolean$/)
+  expect((await manager.listBundles()).find(row => row.name === 'extra')).toMatchObject({ enabled: true,
+    error: { diagnostic: 'dsh.bundle.listedByDefault must be a boolean' } })
 })
 
 it('names where each installed bundle comes from as a spec pnpm installs', async () => {
@@ -594,7 +597,7 @@ it.each([
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
 
   expect((await manager.listBundles()).find(row => row.name === 'unnamed')).toEqual({
-    name: 'unnamed', version: '1.0.0', source: 'unnamed@1.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, update: 'registry',
+    name: 'unnamed', version: '1.0.0', source: 'unnamed@1.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, updatable: true,
     rows: [], overrides: [], ...expected,
   })
 })
@@ -735,15 +738,6 @@ it('reports an overlay overriding a saved plugin toggle', async () => {
   const id = (await manager.listPlugins()).find(row => row.patchId === 'managed')!.entryId
   expect(await manager.setPluginEnabled(id, true)).toMatchObject({ changed: true, application: 'overridden' })
   expect(await manager.setPluginEnabled(id, true)).toMatchObject({ changed: false, application: 'overridden' })
-})
-
-it('lists plugins from current overlay files in a startup-only profile', async () => {
-  const { manager, overlayPath } = await fixture('startup')
-  const id = (await manager.listPlugins()).find(row => row.patchId === 'managed')!.entryId
-  rmSync(overlayPath)
-  await expect(manager.listPlugins()).rejects.toThrow(`failed to read overlay ${overlayPath}`)
-  writeFileSync(overlayPath, '[]\n')
-  expect((await manager.listPlugins()).some(row => row.entryId === id)).toBe(true)
 })
 
 it('saves startup-only toggles and refuses removal of currently used packages', async () => {
@@ -1439,7 +1433,7 @@ it.each(OPTIONAL_BUNDLES)('offers %s switched off and never removable', async (o
   expect((await manager.listBundles()).find(row => row.name === offered)).toEqual({
     name: offered, version: '3.0.0', description: 'Package one-liner.',
     meta: { title: offered, description: 'Package one-liner.' },
-    enabled: false, installed: false, official: true, availability: 'installation', optional: true, removable: false,
+    enabled: false, installed: false, official: true, availability: 'installation', optional: true, removable: false, updatable: false,
     rows: [{ rowId: 'offered-row', moduleName: pathToFileURL(join(supplied, 'plugin.mjs')).href }], overrides: [],
   })
   expect(await manager.setBundleEnabled(offered, true)).toMatchObject({ application: 'applied' })
@@ -1473,10 +1467,9 @@ it('omits installation-owned plain packages from the bundle inventory', async ()
 })
 
 it('does not delete a bundle retained by a higher-priority overlay', async () => {
-  const { ctx, manager, overlayPath, dir } = await fixture()
+  const { ctx, manager, overlays, dir } = await fixture()
   const entry = [...ctx.loader.entries()].find(row => row.id === 'include:managed')!
-  const retained: PatchOptions[] = [{ insert: [{ ...entry.options }] }]
-  writeFileSync(overlayPath, JSON.stringify(retained))
+  overlays.push({ insert: [{ ...entry.options }] })
   const remove = vi.spyOn(operations, 'runProfilePnpm')
   onTestFinished(() => { remove.mockRestore() })
   expect(await manager.removeBundle('extra')).toMatchObject({ changed: true, application: 'failed', error: { code: 'bundle-in-use' } })
@@ -1830,7 +1823,7 @@ it('lists absent Official entries offline without resolving their packages or co
     expect(bundles.filter(bundle => bundle.name === entry.packageName)).toHaveLength(1)
     expect(bundles.filter(bundle => bundle.name === entry.packageName)).toMatchObject([{
       name: entry.packageName, official: true, availability: 'missing', enabled: false, installed: false, optional: false,
-      removable: false, rows: [], overrides: [], meta: entry.meta,
+      removable: false, updatable: false, rows: [], overrides: [], meta: entry.meta,
       ...entry.platforms !== undefined && !entry.platforms.includes(process.platform)
         ? { listedByDefault: false, error: { code: 'unsupported-platform' } } : {},
       installTarget: { spec: `${entry.packageName}@${getDshRuntimeVersion()}`, version: getDshRuntimeVersion() },
@@ -1838,6 +1831,36 @@ it('lists absent Official entries offline without resolving their packages or co
     expect(resolve.mock.calls.some(([name]) => name === entry.packageName)).toBe(false)
   }
   expect(registry).not.toHaveBeenCalled()
+})
+
+it('shares one official-target reading across all listed catalog entries', async () => {
+  const { manager } = await fixture('startup')
+  const targets = vi.spyOn(officialInstall, 'officialBundleInstallTargets')
+  onTestFinished(() => { targets.mockRestore() })
+  const listed = await manager.listBundles()
+  for (const entry of OFFICIAL_ON_DEMAND_CATALOG) {
+    expect(listed.find(bundle => bundle.name === entry.packageName)?.installTarget).toEqual({
+      spec: `${entry.packageName}@${getDshRuntimeVersion()}`, version: getDshRuntimeVersion(),
+    })
+  }
+  expect(targets).toHaveBeenCalledTimes(1)
+  await manager.listBundles()
+  expect(targets).toHaveBeenCalledTimes(2)
+})
+
+it('walks the composed rows once however many layers the profile stacks', async () => {
+  const layers = ['layer-a', 'layer-b', 'layer-c', 'layer-d', 'layer-e', 'layer-f']
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    for (const name of layers) writeBundle(dir, name, [{ insert: [] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', ...layers] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  const walk = vi.spyOn(rowConflict, 'insertedRows')
+  onTestFinished(() => { walk.mockRestore() })
+  await manager.listBundles()
+  // One walk of the composed rows, however many layers the profile stacks.
+  expect(walk.mock.calls.length).toBe(1)
 })
 
 it.each([false, true])('applies offline platform admission to an uninstalled Official bundle (selected=%s)', async (selected) => {
@@ -2113,20 +2136,17 @@ it('refuses to list versions of a package not installed from a registry', async 
   const manifest = readProfileManifest('test', dir)
   manifest.dependencies = { ...manifest.dependencies, linked: `link:${join(dir, 'node_modules', 'linked')}` }
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
-  expect(await manager.listVersions('linked')).toEqual(refusal('linked is installed neither from a registry under its own name nor from a Git commit'))
+  expect(await manager.listVersions('linked')).toEqual(refusal('linked is not installed from a registry under its own name'))
   // An alias saves another package under the dependency's name; its versions are not the alias's.
   const aliased = readProfileManifest('test', dir)
   aliased.dependencies = { ...aliased.dependencies, linked: 'npm:other-plugin@1.0.0' }
   writeFileSync(join(dir, 'package.json'), JSON.stringify(aliased))
-  expect(await manager.listVersions('linked')).toEqual(refusal('linked is installed neither from a registry under its own name nor from a Git commit'))
+  expect(await manager.listVersions('linked')).toEqual(refusal('linked is not installed from a registry under its own name'))
   writeFileSync(join(dir, 'node_modules', 'extra', 'package.json'), JSON.stringify({ name: 'extra', version: 'nightly', dsh: BUNDLE }))
   expect(await manager.listVersions('extra')).toEqual(refusal('extra declares no semver version'))
   // A bundle carrying plugin management cannot be removed, so it is not offered for an update.
-  writeFileSync(join(dir, 'node_modules', 'extra', 'package.json'), JSON.stringify({ name: 'extra', version: '1.0.0', dsh: BUNDLE }))
   writeFileSync(join(dir, 'node_modules', 'extra', 'cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'pm', name: '@deepseek-ai/dsh-plugin-manager' }] }]))
-  const managed = (await manager.listBundles()).find(item => item.name === 'extra')
-  expect(managed).toMatchObject({ readOnlyReason: 'management-required' })
-  expect(managed).not.toHaveProperty('update')
+  expect((await manager.listBundles()).find(item => item.name === 'extra')).toMatchObject({ readOnlyReason: 'management-required', updatable: false })
   expect(await manager.listVersions('extra')).toEqual(refusal('extra carries plugin management and cannot be removed'))
   expect(view).not.toHaveBeenCalled()
 })
@@ -2166,8 +2186,6 @@ it('updates a registry bundle by removing it and installing the exact newer vers
   expect(updated.restore).toBeUndefined()
   expect(steps).toEqual(['checking', 'removing', 'installing'])
   expect(pnpm.mock.calls.map(call => call[1])).toEqual([['remove', 'extra'], ['add', 'extra@1.2.0', '--save-exact', `--registry=${MIRROR}`]])
-  // The run itself is undone unless it installs this package at this version.
-  expect(pnpm.mock.calls[1]?.[2]).toMatchObject({ expected: { name: 'extra', version: '1.2.0' } })
   expect(readProfileManifest('test', dir).dependencies?.extra).toBe('1.2.0')
   expect(ctx.get('managedProbe')).toBe(true)
 })
@@ -2344,216 +2362,414 @@ it('omits exemption identity when only the runtime version is invalid', async ()
   }
 })
 
-const GIT_REPOSITORY = 'git+https://gitlab.example/g/plugins.git'
-/** A Git spec of the `extra` directory pinned to one commit. */
-const gitSpec = (commit: string): string => `${GIT_REPOSITORY}#${commit.repeat(40)}&path:/packages/extra`
-const GIT_A = gitSpec('a')
-const GIT_B = gitSpec('b')
-
-/** Save the fixture's `extra` 1.0.0 as installed from `spec`. */
-function installedFromGit(dir: string, spec = GIT_A): void {
+/** Record these bundles as profile dependencies, so a listing shows them unselected. */
+function installDependencies(dir: string, ...names: readonly string[]): void {
   const manifest = readProfileManifest('test', dir)
-  manifest.dependencies = { ...manifest.dependencies, extra: spec }
+  manifest.dependencies = { ...manifest.dependencies, ...Object.fromEntries(names.map(name => [name, '1.0.0'])) }
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
 }
 
-/**
- * A pnpm stand-in that removes the package a `remove` names and installs the package `installs` maps a Git spec to. A run
- * whose package differs from the one the caller expects, or declares no bundle, is refused without changes, as
- * `runProfilePnpm` undoes it.
- */
-function gitPnpm(
-  dir: string, bundle: (name: string, rows: unknown[]) => void,
-  installs: Readonly<Record<string, { name: string; version: string; bundle?: false }>>,
-) {
-  const pnpm = vi.spyOn(operations, 'runProfilePnpm').mockImplementation(async (_context, args, options) => {
-    const manifest = readProfileManifest('test', dir)
-    const spec = String(args[1])
-    const installed = installs[spec]
-    if (args[0] === 'remove') {
-      delete manifest.dependencies?.[spec]
-      rmSync(join(dir, 'node_modules', spec), { recursive: true, force: true })
-    } else if (installed === undefined) {
-      return { exitCode: 1, output: `ERR_PNPM_GIT_CHECKOUT_FAILED  ${spec}`, truncated: false, logPath: '/install.log', kind: 'unknown' as const }
-    } else if (options.expected !== undefined && `${installed.name}@${installed.version}` !== `${options.expected.name}@${options.expected.version}`) {
-      const found = `${installed.name}@${installed.version}`
-      const output = `dsh: installation rejected: ${found} is installed where ${options.expected.name}@${options.expected.version} was expected`
-      return { exitCode: 1, output, truncated: false, logPath: '/install.log', kind: 'unknown' as const, unmet: 'unexpected-package' as const }
-    } else if (options.expected !== undefined && installed.bundle === false) {
-      const output = `dsh: installation rejected: ${installed.name}@${installed.version} declares no bundle`
-      return { exitCode: 1, output, truncated: false, logPath: '/install.log', kind: 'unknown' as const, unmet: 'not-bundle' as const }
-    } else {
-      bundle(installed.name, [{ id: `${installed.name}-row`, name: './plugin.mjs', config: { service: `${installed.name}Probe` } }])
-      writeFileSync(join(dir, 'node_modules', installed.name, 'package.json'), JSON.stringify({ name: installed.name, version: installed.version, dsh: BUNDLE }))
-      manifest.dependencies = { ...manifest.dependencies, [installed.name]: spec }
-    }
-    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
-    return { exitCode: 0, output: '', truncated: false, logPath: '/install.log' }
-  })
-  onTestFinished(() => { pnpm.mockRestore() })
-  return pnpm
+/** Write an installed bundle package whose patch is exactly `patches`. */
+function writeBundle(dir: string, name: string, patches: unknown[]): void {
+  const path = join(dir, 'node_modules', name)
+  mkdirSync(path, { recursive: true })
+  writeFileSync(join(path, 'package.json'), JSON.stringify({ name, version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } } }))
+  writeFileSync(join(path, 'cordis.patch.yml'), JSON.stringify(patches))
 }
 
-it('lists a copy pinned to a Git commit for an update and refuses to list its versions', async () => {
-  const { manager, dir } = await fixture()
-  const view = viewAnswers(extraRegistry)
-  installedFromGit(dir)
-  expect((await manager.listBundles()).find(item => item.name === 'extra')).toMatchObject({ source: GIT_A, update: 'git' })
-  expect(await manager.listVersions('extra')).toEqual({
-    status: 'refused', problem: 'not-updatable', reason: 'extra is installed from Git, which lists no versions', attempts: [],
-  })
-  // A branch moves, so reinstalling it would not bring back the removed version.
-  installedFromGit(dir, `${GIT_REPOSITORY}#main&path:/packages/extra`)
-  expect((await manager.listBundles()).find(item => item.name === 'extra')?.update).toBeUndefined()
-  expect((await manager.updateBundle('extra', '1.1.0', { spec: GIT_B })).result.error).toEqual({
-    code: 'invalid-spec', diagnostic: 'extra is installed neither from a registry under its own name nor from a Git commit',
-  })
-  expect(view).not.toHaveBeenCalled()
-})
-
-it('updates a Git copy by removing it and installing the expected package from another commit with its selection', async () => {
-  const { ctx, manager, dir, bundle } = await fixture()
-  const view = viewAnswers(extraRegistry)
-  installedFromGit(dir)
-  const pnpm = gitPnpm(dir, bundle, { [GIT_B]: { name: 'extra', version: '1.1.0' } })
-  const steps: string[] = []
-  ctx.on('plugin-manager/update-state', ({ step }) => { steps.push(step) })
-  const requestId = '0b6f3c2a-9d8e-4f71-a5b4-3c2d1e0f9a8b' as PluginInstallRequestId
-  const updated = await manager.updateBundle('extra', '1.1.0', { spec: GIT_B, requestId })
-  expect(updated).toMatchObject({ from: '1.0.0', to: '1.1.0', step: 'install', result: { application: 'applied', bundle: 'extra', version: '1.1.0', enabled: true } })
-  expect(updated.restore).toBeUndefined()
-  expect(steps).toEqual(['checking', 'removing', 'installing'])
-  // The Git target names its own commit, so nothing is viewed on a registry and the save is not exact.
-  expect(pnpm.mock.calls.map(call => call[1])).toEqual([['remove', 'extra'], ['add', GIT_B]])
-  expect(pnpm.mock.calls[1]?.[2]).toMatchObject({ expected: { name: 'extra', version: '1.1.0' } })
-  expect(view).not.toHaveBeenCalled()
-  expect(readProfileManifest('test', dir).dependencies?.extra).toBe(GIT_B)
-  expect(ctx.get('extraProbe')).toBe(true)
-})
-
-it.each([
-  ['another package', { name: 'other', version: '1.1.0' }],
-  ['another version', { name: 'extra', version: '1.0.5' }],
-] as const)('installs the removed Git copy again from its saved spec when the target installs %s', async (_name, installed) => {
-  const { manager, dir, bundle } = await fixture()
-  installedFromGit(dir)
-  const pnpm = gitPnpm(dir, bundle, { [GIT_A]: { name: 'extra', version: '1.0.0' }, [GIT_B]: installed })
-  const updated = await manager.updateBundle('extra', '1.1.0', { spec: GIT_B })
-  expect(updated).toMatchObject({
-    step: 'install', restore: { application: 'applied', version: '1.0.0' },
-    result: {
-      application: 'failed', error: { code: 'unexpected-package' },
-      packageResult: { unmet: 'unexpected-package', output: expect.stringContaining(`${installed.name}@${installed.version} is installed`) as string },
-    },
-  })
-  expect(pnpm.mock.calls.map(call => call[1])).toEqual([['remove', 'extra'], ['add', GIT_B], ['add', GIT_A]])
-  expect(readProfileManifest('test', dir).dependencies).toEqual({ extra: GIT_A })
-})
-
-it('updates a copy pnpm saved as a known host\'s shortcut to the HTTPS spec of another commit', async () => {
-  const { manager, dir, bundle } = await fixture()
-  const target = `git+https://github.com/o/plugins.git#${'b'.repeat(40)}&path:/packages/extra`
-  installedFromGit(dir, `github:o/plugins#${'a'.repeat(40)}&path:/packages/extra`)
-  gitPnpm(dir, bundle, { [target]: { name: 'extra', version: '1.1.0' } })
-  expect(await manager.updateBundle('extra', '1.1.0', { spec: target })).toMatchObject({ step: 'install', result: { application: 'applied', version: '1.1.0' } })
-})
-
-it('installs a Git target over the running version without HMR and reports the restart', async () => {
-  const { manager, dir, bundle, gitConnection } = await fixture('startup')
-  installedFromGit(dir)
-  const pnpm = gitPnpm(dir, bundle, { [GIT_B]: { name: 'extra', version: '1.1.0' } })
-  expect(await manager.updateBundle('extra', '1.1.0', { spec: GIT_B })).toMatchObject({
-    step: 'install', result: { application: 'restart-required', restartReason: 'no-hmr', version: '1.1.0' },
-  })
-  expect(pnpm.mock.calls.map(call => call[1])).toEqual([['add', GIT_B]])
-  // Without HMR nothing is removed, so the repository is left to the installation.
-  expect(gitConnection).not.toHaveBeenCalled()
-})
-
-it('keeps the running Git copy without HMR when the target declares no bundle', async () => {
+it('refuses a bundle whose inserted id another layer already inserts, before saving the selection', async () => {
   const { manager, dir, bundle } = await fixture('startup')
-  installedFromGit(dir)
-  const before = readFileSync(join(dir, 'package.json'), 'utf8')
-  gitPnpm(dir, bundle, { [GIT_B]: { name: 'extra', version: '1.1.0', bundle: false } })
-  expect(await manager.updateBundle('extra', '1.1.0', { spec: GIT_B })).toMatchObject({
-    step: 'install', result: { application: 'failed', error: { code: 'not-bundle' }, packageResult: { unmet: 'not-bundle' } },
-  })
-  expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(before)
+  bundle('duplicate', [{ id: 'manager', name: 'cordis:manager' }])
+  const saved = readFileSync(join(dir, 'package.json'), 'utf8')
+  const result = await manager.setBundleEnabled('duplicate', true)
+  expect(result).toMatchObject({ changed: false, application: 'failed', stage: 'enable', target: 'duplicate', error: { code: 'duplicate-entry' } })
+  expect(result.error?.diagnostic).toBe('manager is already inserted by core')
+  expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(saved)
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual(['core', 'extra'])
 })
 
-it.each(['network', 'timeout'] as const)('keeps a Git copy when a %s stops reaching the target repository before its removal', async (kind) => {
-  const env = { GIT_CONFIG_GLOBAL: '/application/git.config' }
-  const { manager, dir, bundle, gitConnection } = await fixture('live', false, undefined, {}, { command: 'pnpm', args: [], env })
-  installedFromGit(dir)
-  const before = readFileSync(join(dir, 'package.json'), 'utf8')
-  const pnpm = gitPnpm(dir, bundle, { [GIT_B]: { name: 'extra', version: '1.1.0' } })
-  const failure = { exitCode: 128, output: 'fatal: unable to access', truncated: false, logPath: join(dir, 'git.log'), kind }
-  // The command line the check ran stays out of the answer.
-  gitConnection.mockResolvedValue({ ...failure, argv: ['git', 'ls-remote', '--', 'https://gitlab.example/g/plugins.git', 'HEAD'] })
-  expect(await manager.updateBundle('extra', '1.1.0', { spec: GIT_B })).toEqual({
-    from: '1.0.0', to: '1.1.0', step: 'check',
-    result: {
-      changed: false, application: 'failed', stage: 'install', target: 'extra', failedAt: 'spec-host', packageResult: failure,
-      error: { code: 'operation-error', diagnostic: 'fatal: unable to access' },
-    },
-  })
-  expect(gitConnection).toHaveBeenCalledWith(expect.objectContaining({ kind: 'git', spec: GIT_B }), dir, expect.objectContaining({ timeoutMs: 5000, env }))
-  expect(pnpm).not.toHaveBeenCalled()
-  expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(before)
+it('selects one module under several distinct ids', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  bundle('instances', [{ id: 'instance-a', name: './plugin.mjs' }, { id: 'instance-b', name: './plugin.mjs' }])
+  expect(await manager.setBundleEnabled('instances', true)).toMatchObject({ changed: true, application: 'restart-required', stage: 'enable', target: 'instances' })
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual(['core', 'extra', 'instances'])
 })
 
-it('leaves a Git repository check that is not a connection failure to pnpm', async () => {
-  const { manager, dir, bundle, gitConnection } = await fixture()
-  installedFromGit(dir)
-  gitPnpm(dir, bundle, { [GIT_B]: { name: 'extra', version: '1.1.0' } })
-  gitConnection.mockResolvedValue({
-    exitCode: 127, output: 'spawn git ENOENT', truncated: false, logPath: join(dir, 'git.log'), kind: 'unknown', argv: ['git'],
-  })
-  expect(await manager.updateBundle('extra', '1.1.0', { spec: GIT_B })).toMatchObject({ step: 'install', result: { application: 'applied' } })
+it('selects a bundle that only changes existing rows', async () => {
+  const { manager, dir } = await fixture('startup')
+  writeBundle(dir, 'tuning', [{ id: 'managed', config: { service: 'tuned' } }])
+  expect(await manager.setBundleEnabled('tuning', true)).toMatchObject({ changed: true, application: 'restart-required' })
+  expect((await manager.listBundles()).find(row => row.name === 'tuning')).toMatchObject({ enabled: true, rows: [], overrides: ['managed'] })
 })
 
-it('refuses an update whose target does not match where the copy was installed from, before changing anything', async () => {
-  const { manager, dir, bundle } = await fixture()
-  const view = viewAnswers(extraRegistry)
-  const pnpm = gitPnpm(dir, bundle, {})
-  const refused = async (version: string, spec?: string) => (await manager.updateBundle('extra', version, spec === undefined ? {} : { spec })).result.error
-  expect(await refused('1.2.0', GIT_B)).toEqual({ code: 'invalid-spec', diagnostic: 'extra is installed from a registry and updates only to extra@1.2.0' })
-  installedFromGit(dir)
-  const before = readFileSync(join(dir, 'package.json'), 'utf8')
-  const pinnedOnly = { code: 'invalid-spec', diagnostic: 'extra is installed from Git and updates only to a Git spec pinned to a full commit' }
-  expect(await refused('1.1.0')).toEqual(pinnedOnly)
-  expect(await refused('1.1.0', 'extra@1.1.0')).toEqual(pinnedOnly)
-  expect(await refused('1.1.0', `${GIT_REPOSITORY}#main&path:/packages/extra`)).toEqual(pinnedOnly)
-  const sibling = `${GIT_REPOSITORY}#${'b'.repeat(40)}&path:/packages/other`
-  expect(await refused('1.1.0', sibling)).toEqual({
-    code: 'invalid-spec', diagnostic: `${sibling} is not in the repository directory extra is installed from, gitlab.example/g/plugins#packages/extra`,
-  })
-  expect(await refused('0.9.0', GIT_B)).toEqual({ code: 'invalid-spec', diagnostic: '0.9.0 is not a version newer than the installed 1.0.0' })
-  expect(pnpm).not.toHaveBeenCalled()
-  expect(view).not.toHaveBeenCalled()
-  expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(before)
+it('marks an unselected bundle whose rows another selected bundle provides', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  bundle('mirror', [{ id: 'manager', name: 'cordis:manager' }])
+  installDependencies(dir, 'mirror')
+  const listed = (await manager.listBundles()).find(row => row.name === 'mirror')
+  expect(listed).toMatchObject({ enabled: false, providedBy: ['core'] })
+  expect(listed?.error).toBeUndefined()
+  expect(await manager.setBundleEnabled('mirror', true)).toMatchObject({ changed: false, application: 'failed', error: { code: 'duplicate-entry' } })
 })
 
-it('reports profile read, lock, and disposal failures with error codes', async () => {
-  const { ctx, manager, dir } = await fixture('startup', false, undefined, { lockWaitMs: 0 })
-  const manifest = join(dir, 'package.json')
-  const saved = readFileSync(manifest, 'utf8')
-  writeFileSync(manifest, '{')
-  const unreadable = Promise.resolve().then(() => manager.listBundles())
-  await expect(unreadable).rejects.toMatchObject({ name: 'PluginManagerError', code: 'PLUGIN_MANAGER_PROFILE_READ_FAILED' })
-  await expect(unreadable).rejects.toHaveProperty('cause', expect.any(SyntaxError))
-  writeFileSync(manifest, saved)
+it('reports a bundle that duplicates only some ids as a duplicate-entry problem', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  bundle('partial', [{ id: 'manager', name: 'cordis:manager' }, { id: 'partial-own', name: './plugin.mjs' }])
+  installDependencies(dir, 'partial')
+  const listed = (await manager.listBundles()).find(row => row.name === 'partial')
+  expect(listed?.providedBy).toBeUndefined()
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'manager is already inserted by core' })
+})
 
-  writeFileSync(`${manifest}.lock`, `${process.pid}\n`)
-  await expect(manager.setBundleEnabled('extra', false)).rejects.toMatchObject({
-    name: 'FileLockError', code: 'FILE_LOCK_TIMEOUT',
-  })
-  rmSync(`${manifest}.lock`)
+it('reports a same-id row under another module as a conflict rather than a provided row', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  bundle('foreign', [{ id: 'manager', name: './plugin.mjs' }])
+  installDependencies(dir, 'foreign')
+  const listed = (await manager.listBundles()).find(row => row.name === 'foreign')
+  expect(listed?.providedBy).toBeUndefined()
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'manager is already inserted by core' })
+})
 
-  const entry = [...ctx.loader.entries()].find(candidate => candidate.options.name === 'cordis:manager')
-  await entry?.fiber?.dispose()
-  await expect(manager.setBundleEnabled('extra', false)).rejects.toMatchObject({
-    name: 'PluginManagerError', code: 'PLUGIN_MANAGER_UNAVAILABLE',
+it('never treats two bundles\' relative modules as the same component', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  bundle('local-copy', [{ id: 'local-row', name: './plugin.mjs' }])
+  installDependencies(dir, 'local-copy')
+  expect(await manager.setBundleEnabled('local-copy', true)).toMatchObject({ application: 'restart-required' })
+  writeBundle(dir, 'local-twin', [{ insert: [{ id: 'local-row', name: './plugin.mjs' }] }])
+  installDependencies(dir, 'local-twin')
+  const listed = (await manager.listBundles()).find(row => row.name === 'local-twin')
+  expect(listed?.providedBy).toBeUndefined()
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'local-row is already inserted by local-copy' })
+})
+
+it('keeps a disabled row and a group child occupying their ids', async () => {
+  const { manager, bundle } = await fixture('startup')
+  bundle('idle', [{ id: 'managed', name: './plugin.mjs', disabled: true }])
+  bundle('nested', [{ id: 'panel', group: true, name: 'cordis:group', config: [{ id: 'managed', name: './plugin.mjs' }] }])
+  expect(await manager.setBundleEnabled('idle', true)).toMatchObject({ changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: 'managed is already inserted by extra' } })
+  expect(await manager.setBundleEnabled('nested', true)).toMatchObject({ changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: 'managed is already inserted by extra' } })
+})
+
+it('refuses a group container whose id another layer already inserts', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'grouped-host', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'host-child', name: 'cordis:host', disabled: true }] }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'grouped-host'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
   })
-  expect(readFileSync(manifest, 'utf8')).toBe(saved)
+  writeBundle(dir, 'grouped-twin', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+    config: [{ id: 'twin-child', name: 'cordis:twin', disabled: true }] }] }])
+  expect(await manager.setBundleEnabled('grouped-twin', true)).toMatchObject({
+    changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: 'panel is already inserted by grouped-host' },
+  })
+})
+
+it('ignores a group child a later layer replaced', async () => {
+  const { manager, dir, bundle } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'replaceable', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'dead', name: 'cordis:dead', disabled: true }, { id: 'live', name: 'cordis:live', disabled: true }] }] }])
+    writeFileSync(join(dir, 'cordis.patch.yml'), JSON.stringify([{ id: 'panel', config: [{ id: 'live', name: 'cordis:live', disabled: true }] }]))
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'replaceable'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  bundle('dead-id', [{ id: 'dead', name: './plugin.mjs' }])
+  expect(await manager.setBundleEnabled('dead-id', true)).toMatchObject({ changed: true, application: 'restart-required' })
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toContain('dead-id')
+})
+
+it('names the profile patch as the layer that already inserts a conflicting id', async () => {
+  const { manager, dir } = await fixture('startup')
+  writeFileSync(join(dir, 'cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'handmade', name: './plugin.mjs' }] }]))
+  writeBundle(dir, 'handmade-twin', [{ insert: [{ id: 'handmade', name: './plugin.mjs' }] }])
+  expect(await manager.setBundleEnabled('handmade-twin', true)).toMatchObject({
+    changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: `handmade is already inserted by ${join(dir, 'cordis.patch.yml')}` },
+  })
+})
+
+it('names the home patch as the layer that already inserts a conflicting id', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  const home = join(dir, '..', '..')
+  writeFileSync(join(home, 'cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'home-row', name: './plugin.mjs' }] }]))
+  bundle('home-twin', [{ id: 'home-row', name: './plugin.mjs' }])
+  expect(await manager.setBundleEnabled('home-twin', true)).toMatchObject({
+    changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: `home-row is already inserted by ${join(home, 'cordis.patch.yml')}` },
+  })
+})
+
+it('marks rows a bare module resolution proves are provided', async () => {
+  const { manager, dir } = await fixture('startup', false, (ctx) => { ctx.plugin(PluginPackages) }, {}, undefined, (dir) => {
+    writeBundle(dir, 'fixture-bare', [{ insert: [] }])
+    writeFileSync(join(dir, 'node_modules', 'fixture-bare', 'package.json'), JSON.stringify({ name: 'fixture-bare', version: '1.0.0' }))
+    writeBundle(dir, 'bare-host', [{ insert: [{ id: 'bare-row', name: 'fixture-bare', disabled: true }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'bare-host'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeBundle(dir, 'bare-mirror', [{ insert: [{ id: 'bare-row', name: 'fixture-bare', disabled: true }] }])
+  installDependencies(dir, 'bare-mirror')
+  const listed = (await manager.listBundles()).find(row => row.name === 'bare-mirror')
+  expect(listed).toMatchObject({ enabled: false, providedBy: ['bare-host'] })
+  expect(listed?.error).toBeUndefined()
+})
+
+it('resolves module identities only in the layer that contributes each row', async () => {
+  const rows = Array.from({ length: 12 }, (_, index) => ({ id: `bare-row-${index}`, name: 'fixture-bare', disabled: true }))
+  const { manager, ctx, dir } = await fixture('startup', false, (ctx) => { ctx.plugin(PluginPackages) }, {}, undefined, (dir) => {
+    writeBundle(dir, 'fixture-bare', [{ insert: [] }])
+    writeFileSync(join(dir, 'node_modules', 'fixture-bare', 'package.json'), JSON.stringify({ name: 'fixture-bare', version: '1.0.0' }))
+    writeBundle(dir, 'bare-host', [{ insert: rows }])
+    writeBundle(dir, 'unrelated-tail', [{ insert: [] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'bare-host', 'unrelated-tail'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeBundle(dir, 'bare-mirror', [{ insert: rows }])
+  installDependencies(dir, 'bare-mirror')
+  const packages = ctx.get('pluginPackages')
+  if (packages === undefined) throw new Error('The fixture requires PluginPackages')
+  const lookup = vi.spyOn(packages, 'packageOf')
+  onTestFinished(() => { lookup.mockRestore() })
+  const listed = (await manager.listBundles()).find(row => row.name === 'bare-mirror')
+  const inheritedBases = new Set([
+    pathToFileURL(join(dir, 'cordis.yml')).href,
+    pathToFileURL(join(dir, 'node_modules', 'unrelated-tail', 'package.json')).href,
+  ])
+  const inherited = lookup.mock.calls.filter(([name, base]) => name === 'fixture-bare' && inheritedBases.has(base))
+  expect(listed).toMatchObject({ enabled: false, providedBy: ['bare-host'], rows: rows.map(row => ({ rowId: row.id })) })
+  expect(listed?.error).toBeUndefined()
+  expect(inherited).toHaveLength(0)
+})
+
+it('does not claim a provided row from an unresolved bare module', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'bare-host', [{ insert: [{ id: 'loose-row', name: 'loose-package', disabled: true }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'bare-host'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeBundle(dir, 'loose-twin', [{ insert: [{ id: 'loose-row', name: 'loose-package', disabled: true }] }])
+  installDependencies(dir, 'loose-twin')
+  const listed = (await manager.listBundles()).find(row => row.name === 'loose-twin')
+  expect(listed?.providedBy).toBeUndefined()
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'loose-row is already inserted by bare-host' })
+})
+
+it('refuses a bundle that inserts one id twice itself', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  bundle('twice', [{ id: 'twin', name: './plugin.mjs' }, { id: 'twin', name: './plugin.mjs' }])
+  installDependencies(dir, 'twice')
+  const listed = (await manager.listBundles()).find(row => row.name === 'twice')
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'twin is already inserted by twice' })
+  expect(await manager.setBundleEnabled('twice', true)).toMatchObject({
+    changed: false, application: 'failed', error: { code: 'duplicate-entry', diagnostic: 'twin is already inserted by twice' },
+  })
+})
+
+it('enables an already-selected bundle as a no-op without reordering the composition', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'host', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'row', name: './row.mjs', disabled: true }] }] }])
+    writeBundle(dir, 'clearer', [{ id: 'panel', config: [{ id: 'other', name: './other.mjs', disabled: true }] }])
+    writeBundle(dir, 'root-row', [{ insert: [{ id: 'row', name: './root-row.mjs', disabled: true }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'host', 'clearer', 'root-row'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  expect((await manager.listBundles()).find(row => row.name === 'host')).toMatchObject({ enabled: true })
+  const result = await manager.setBundleEnabled('host', true)
+  expect(result).toMatchObject({ changed: false })
+  expect(result.error).toBeUndefined()
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual(['core', 'extra', 'host', 'clearer', 'root-row'])
+})
+
+it('reports a candidate row inserted into a group under another module as a duplicate, not as provided', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'panel-owner', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'sibling', name: 'cordis:sibling', disabled: true }] }] }])
+    writeBundle(dir, 'root-owner', [{ insert: [{ id: 'row', name: 'cordis:manager', disabled: true }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'panel-owner', 'root-owner'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeBundle(dir, 'mirror', [{ id: 'panel', insert: [{ id: 'row', name: 'cordis:other', disabled: true }] }])
+  installDependencies(dir, 'mirror')
+  const listed = (await manager.listBundles()).find(row => row.name === 'mirror')
+  expect(listed?.providedBy).toBeUndefined()
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'row is already inserted by root-owner' })
+})
+
+it('attributes a replaced group child to the layer that replaced it', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'host-group', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'sibling', name: 'cordis:sibling', disabled: true }] }] }])
+    writeBundle(dir, 'original', [{ id: 'panel', insert: [{ id: 'child', name: 'cordis:original', disabled: true }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'host-group', 'original'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeFileSync(join(dir, 'cordis.patch.yml'), JSON.stringify([
+    { id: 'panel', config: [{ id: 'child', name: 'cordis:replaced', disabled: true }] },
+  ]))
+  writeBundle(dir, 'mirror', [{ insert: [{ id: 'child', name: 'cordis:replaced', disabled: true }] }])
+  writeBundle(dir, 'stale', [{ insert: [{ id: 'child', name: 'cordis:original', disabled: true }] }])
+  installDependencies(dir, 'mirror', 'stale')
+  for (const name of ['mirror', 'stale']) {
+    const listed = (await manager.listBundles()).find(row => row.name === name)
+    expect(listed?.providedBy).toBeUndefined()
+    expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: `child is already inserted by ${join(dir, 'cordis.patch.yml')}` })
+  }
+})
+
+it('ignores a group-target insert the composition cannot accept', async () => {
+  const { manager, dir } = await fixture('startup')
+  writeBundle(dir, 'ghost', [{ id: 'absent-group', insert: [{ id: 'ghost-row', name: 'cordis:ghost', disabled: true }] }])
+  installDependencies(dir, 'ghost')
+  const listed = (await manager.listBundles()).find(row => row.name === 'ghost')
+  expect(listed?.error).toBeUndefined()
+  expect(listed?.providedBy).toBeUndefined()
+  expect(await manager.setBundleEnabled('ghost', true)).toMatchObject({ changed: true, application: 'restart-required' })
+})
+
+it('leaves ids of bundles the launcher skips out of duplicate detection', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'skipped-compat', [{ insert: [{ id: 'compat-row', name: 'cordis:compat', disabled: true }] }])
+    writeFileSync(join(dir, 'node_modules', 'skipped-compat', 'package.json'), JSON.stringify({ name: 'skipped-compat', version: '1.0.0',
+      peerDependencies: { '@deepseek-ai/dsh': '>=999.0.0' }, dsh: { bundle: { patch: './cordis.patch.yml' } } }))
+    writeBundle(dir, 'skipped-platform', [{ insert: [{ id: 'platform-row', name: 'cordis:platform', disabled: true }] }])
+    writeFileSync(join(dir, 'node_modules', 'skipped-platform', 'package.json'), JSON.stringify({ name: 'skipped-platform', version: '1.0.0',
+      dsh: { bundle: { patch: './cordis.patch.yml', platforms: [process.platform === 'darwin' ? 'win32' : 'darwin'] } } }))
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'skipped-compat', 'skipped-platform'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeBundle(dir, 'reuse', [{ insert: [
+    { id: 'compat-row', name: 'cordis:compat', disabled: true },
+    { id: 'platform-row', name: 'cordis:platform', disabled: true },
+  ] }])
+  installDependencies(dir, 'reuse')
+  const listed = (await manager.listBundles()).find(row => row.name === 'reuse')
+  expect(listed?.error).toBeUndefined()
+  expect(await manager.setBundleEnabled('reuse', true)).toMatchObject({ changed: true, application: 'restart-required' })
+})
+
+it('lists bundles without rewriting a profile that names a retired bundle', async () => {
+  const { manager, dir } = await fixture('startup')
+  const manifest = readProfileManifest('test', dir)
+  manifest.dsh = { profile: { bundles: ['core', 'extra', '@deepseek-ai/dsh-experimental-schedule-bundle'] } }
+  writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  const saved = readFileSync(join(dir, 'package.json'), 'utf8')
+  await manager.listBundles()
+  expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(saved)
+})
+
+it('recognizes one package reached through two links as the same component', async () => {
+  const { manager } = await fixture('startup', false, (ctx) => { ctx.plugin(PluginPackages) }, {}, undefined, (dir) => {
+    const physical = join(dir, '..', '..', 'enhancement')
+    mkdirSync(physical, { recursive: true })
+    writeFileSync(join(physical, 'package.json'), JSON.stringify({
+      name: '@fixture/memory-enhancement', version: '1.0.0', exports: { '.': './index.mjs' },
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }))
+    writeFileSync(join(physical, 'cordis.patch.yml'), JSON.stringify([{ insert: [
+      { id: 'fixture-memory-enhancement', name: '@fixture/memory-enhancement', disabled: true },
+    ] }]))
+    writeBundle(dir, 'starter', [{ insert: [{ id: 'enhancement', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'fixture-memory-enhancement', name: '@fixture/memory-enhancement', disabled: true }] }] }])
+    linkInto(join(dir, 'node_modules', 'starter', 'node_modules', '@fixture', 'memory-enhancement'), physical)
+    linkInto(join(dir, 'node_modules', '@fixture', 'memory-enhancement'), physical)
+    const manifest = readProfileManifest('test', dir)
+    manifest.dependencies = { ...manifest.dependencies, '@fixture/memory-enhancement': 'file:../../enhancement' }
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'starter'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  const listed = (await manager.listBundles()).find(row => row.name === '@fixture/memory-enhancement')
+  expect(listed).toMatchObject({ enabled: false, providedBy: ['starter'] })
+  expect(listed?.error).toBeUndefined()
+})
+
+it('keeps two physical copies of one package name distinct', async () => {
+  const { manager } = await fixture('startup', false, (ctx) => { ctx.plugin(PluginPackages) }, {}, undefined, (dir) => {
+    for (const [name, target] of [['enhancement-a', '@fixture/memory-enhancement'], ['enhancement-b', '@fixture/memory-enhancement']] as const) {
+      const physical = join(dir, '..', '..', name)
+      mkdirSync(physical, { recursive: true })
+      writeFileSync(join(physical, 'package.json'), JSON.stringify({
+        name: target, version: '1.0.0', exports: { '.': './index.mjs' }, dsh: { bundle: { patch: './cordis.patch.yml' } },
+      }))
+      writeFileSync(join(physical, 'cordis.patch.yml'), JSON.stringify([{ insert: [
+        { id: 'fixture-memory-enhancement', name: target, disabled: true },
+      ] }]))
+    }
+    writeBundle(dir, 'starter', [{ insert: [{ id: 'enhancement', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'fixture-memory-enhancement', name: '@fixture/memory-enhancement', disabled: true }] }] }])
+    linkInto(join(dir, 'node_modules', 'starter', 'node_modules', '@fixture', 'memory-enhancement'), join(dir, '..', '..', 'enhancement-a'))
+    linkInto(join(dir, 'node_modules', '@fixture', 'memory-enhancement'), join(dir, '..', '..', 'enhancement-b'))
+    const manifest = readProfileManifest('test', dir)
+    manifest.dependencies = { ...manifest.dependencies, '@fixture/memory-enhancement': 'file:../../enhancement-b' }
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'starter'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  const listed = (await manager.listBundles()).find(row => row.name === '@fixture/memory-enhancement')
+  expect(listed?.providedBy).toBeUndefined()
+  expect(listed?.error).toMatchObject({ code: 'duplicate-entry', diagnostic: 'fixture-memory-enhancement is already inserted by starter' })
+})
+
+it('allows a bundle whose row a higher-priority layer replaces with the same row', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'host-group', [{ insert: [{ id: 'panel', group: true, name: 'cordis:group', disabled: true,
+      config: [{ id: 'shared', name: 'cordis:shared', disabled: true }] }] }])
+    writeFileSync(join(dir, 'cordis.patch.yml'), JSON.stringify([{ id: 'panel', config: [{ id: 'shared', name: 'cordis:shared', disabled: true }] }]))
+    const manifest = readProfileManifest('test', dir)
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'host-group'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  writeBundle(dir, 'mirror', [{ id: 'panel', insert: [{ id: 'shared', name: 'cordis:shared', disabled: true }] }])
+  installDependencies(dir, 'mirror')
+  const listed = (await manager.listBundles()).find(row => row.name === 'mirror')
+  expect(listed?.error).toBeUndefined()
+  expect(await manager.setBundleEnabled('mirror', true)).toMatchObject({ changed: true, application: 'restart-required' })
+})
+
+/** Put a directory link at `path`, so a package resolves here and physically lives at `target`. */
+function linkInto(path: string, target: string): void {
+  mkdirSync(join(path, '..'), { recursive: true })
+  symlinkSync(target, path, process.platform === 'win32' ? 'junction' : 'dir')
+}
+
+it('keeps a newly installed bundle unselected when it duplicates a selected id', async () => {
+  const { manager, dir, bundle } = await fixture('startup')
+  const install = vi.spyOn(operations, 'runProfilePnpm').mockImplementation(async (_context, args) => {
+    const name = String(args[1])
+    bundle(name, [{ id: 'managed', name: './plugin.mjs' }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dependencies = { ...manifest.dependencies, [name]: '1.0.0' }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+    return { exitCode: 0, output: 'installed', truncated: false, logPath: join(dir, 'pnpm.log') }
+  })
+  onTestFinished(() => { install.mockRestore() })
+  expect(await manager.installBundle('clash')).toMatchObject({
+    application: 'failed', stage: 'enable', target: 'clash', bundle: 'clash', error: { code: 'duplicate-entry' },
+  })
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual(['core', 'extra'])
+  expect(readProfileManifest('test', dir).dependencies).toMatchObject({ clash: '1.0.0' })
+})
+
+it('allows deselecting a bundle that duplicates another selected layer', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'twin', [{ insert: [{ id: 'managed', name: './plugin.mjs', disabled: true }] }])
+    const manifest = readProfileManifest('test', dir)
+    manifest.dependencies = { ...manifest.dependencies, twin: '1.0.0' }
+    manifest.dsh = { profile: { bundles: ['core', 'extra', 'twin'] } }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+  })
+  // Two live entries share the id, so neither row may claim one for its switch.
+  const listed = await manager.listBundles()
+  expect(listed.find(row => row.name === 'extra')?.rows[0]?.entryId).toBeUndefined()
+  expect(listed.find(row => row.name === 'twin')?.rows[0]?.entryId).toBeUndefined()
+  expect(await manager.setBundleEnabled('twin', false)).toMatchObject({ changed: true, application: 'restart-required' })
+  expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual(['core', 'extra'])
+  expect((await manager.listBundles()).find(row => row.name === 'twin')).toMatchObject({
+    enabled: false, error: { code: 'duplicate-entry' },
+  })
 })

@@ -10,9 +10,9 @@ The [boot package group](../../packages/boot/README.md) owns launcher-provided p
 
 `PluginInfo` carries module identity, effective enablement, fiber phase and optional display `meta`, plus a unique `patchId` or a `readOnlyReason`.
 
-`BundleInfo.official` identifies project-maintained shipped optional bundles and on-demand catalog entries independently of installation. `availability` identifies a readable installation-provided or profile package, or `missing`; on-demand catalog entries exclude undeclared transitive copies. `installed` records the profile dependency declaration. An on-demand `installTarget` carries the host-derived exact spec and version. `BundleInfo` also carries the package name, optional installed version, selected enablement, removal availability, update method (`update`: `registry` or `git`, absent when the bundle cannot be updated), optional resolution or unsupported-platform error, and, for a bundle the profile's own dependency supplies and the installation does not, `source`: that dependency as a spec `pnpm add` accepts. Its optional `meta` and each `BundleRowInfo.meta` contain display text or a metadata diagnostic; Clients select a language at render time.
+`BundleInfo.official` identifies project-maintained shipped optional bundles and on-demand catalog entries independently of installation. `availability` identifies a readable installation-provided or profile package, or `missing`; on-demand catalog entries exclude undeclared transitive copies. `installed` records the profile dependency declaration. An on-demand `installTarget` carries the host-derived exact spec and version. `BundleInfo` also carries the package name, optional installed version, selected enablement, removal availability, update eligibility (`updatable`), optional resolution or unsupported-platform error, and, for a bundle the profile's own dependency supplies and the installation does not, `source`: that dependency as a spec `pnpm add` accepts. Its optional `meta` and each `BundleRowInfo.meta` contain display text or a metadata diagnostic; Clients select a language at render time.
 
-`InstallBundleOptions.saveExact` passes `--save-exact` to the shared package installer. `InstallBundleOptions.enabled` defaults to true. False installs without selecting the bundle layer. `approvedBuilds` grants persistent script permission to the supplied pending package names before installation. `registry` names the registry asked first; absent, the configured one. `expected` names the package and manifest version the spec must install; a run that installs anything else is undone with its profile files and modules and fails with `unexpected-package`, one whose package declares no bundle fails with `not-bundle`, and one whose bundle patches cannot load fails as an operation error.
+`InstallBundleOptions.saveExact` passes `--save-exact` to the shared package installer. `InstallBundleOptions.enabled` defaults to true. False installs without selecting the bundle layer. `approvedBuilds` grants persistent script permission to the supplied pending package names before installation. `registry` names the registry asked first; absent, the configured one.
 
 `BundleDetail` is a profile bundle's long description: `{ status: 'found' }` with its `origin` (`locale` or `readme`), its `path` inside the package, and its `markdown`, or `{ status: 'none' }`; [`readBundleDetail`](../../packages/boot/plugin-manager/README.md#bundle-detail-documents) documents the order and the image route. `NpmFileSource` names a public npm file CDN, `jsdelivr`, `unpkg`, or `npmmirror`; a read's `npmFileSources` lists the ones to ask first.
 
@@ -26,7 +26,7 @@ The [boot package group](../../packages/boot/README.md) owns launcher-provided p
 
 `MarketIndexSummary` carries one configured index URL with the `title` and `description` of its last successful read and, when the last read failed, its `error`.
 
-`MarketQuery` selects one page of an index: fuzzy `text`, a `category`, `labels` that must all be present, a `MarketSort`, `offset`, `limit` up to 100, `refresh` to fetch again instead of using a cached document, and `fetchedAt` to continue the pages of one document. `MarketSearchResult` carries the index URL, `title`, optional `description`, market `metadata`, the document's `fetchedAt`, the page's `entries`, the `total` number of matches, and the `nextOffset`. Each `MarketListingEntry` adds `defaultVersion`, the version installed by default, and `installation`, the profile's status for the package name; each of its `versions` adds `install`, the exact spec and optional first registry for `installBundle`, `compatibility`, the evaluation of its `engines.dsh` including a version exemption, and `update`, whether the version can replace an installed Git copy through `updateBundle`: it is newer and pins a commit of the repository directory that copy came from.
+`MarketQuery` selects one page of an index: fuzzy `text`, a `category`, `labels` that must all be present, a `MarketSort`, `offset`, `limit` up to 100, `refresh` to fetch again instead of using a cached document, and `fetchedAt` to continue the pages of one document. `MarketSearchResult` carries the index URL, `title`, optional `description`, market `metadata`, the document's `fetchedAt`, the page's `entries`, the `total` number of matches, and the `nextOffset`. Each `MarketListingEntry` adds `defaultVersion`, the version installed by default, and `installation`, the profile's status for the package name; each of its `versions` adds `install`, the exact spec and optional first registry for `installBundle`, and `compatibility`, the evaluation of its `engines.dsh` including a version exemption.
 
 `PluginDetail` is a market entry's long description: `{ status: 'found' }` with its `origin` (`locale`, `readme`, or `repository`), its `markdown`, and a `document` id whose images `GET /api/plugin-market/detail-file` serves, or `{ status: 'none' }`. The [plugin market documents the order](../../packages/boot/plugin-market/README.md#plugin-detail-documents) its sources are read in.
 
@@ -73,20 +73,12 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 
 ### `ctx.actionCards` — `ActionCards`
 
-Kind registry, skill switch, Session projection, user actions and status notices.
+Card tool, kind registry, Session projection, user actions and status notices.
 
 ```ts cordis-catalog
 /**
- * Build a kind's skill provider. It lists the skill while recommendations are enabled.
- * @param candidate - the skill's catalog entry.
- * @param get - loads the skill's definition.
- * @returns the factory the kind passes to `ctx.skills.registerProvider`.
- */
-skillProvider(candidate: SkillCandidate, get: SkillProvider['get']): (control: SkillProviderControl) => SkillProvider
-
-/**
  * Register one action kind for the caller's lifetime.
- * @param kind - the kind's details schema, verbs and handler.
+ * @param kind - the kind's skill, details schema, verbs and handler.
  * @returns disposer removing the kind; actions on its cards are then unavailable.
  * @throws when another kind already registered the same action.
  */
@@ -96,14 +88,14 @@ register<Details>(kind: ActionCardKind<Details>): () => void
  * Record a card decision in the Session log; the next model request reports it.
  * @param agent - agent whose Session owns the card.
  * @param decision - the card's new state.
- * @throws when no kind ever registered the decision's action with this service.
+ * @throws when no kind ever registered the decision's action with this service, or its phase is one the projection derives.
  */
 record(agent: Agent, decision: ActionCardDecision): void
 
 /**
  * Read the cards of one Session.
  * @param session - a Session whose projections are prepared.
- * @returns proposals and decisions by card id.
+ * @returns proposals and decisions by call id.
  */
 view(session: Session): ActionCardView
 
@@ -112,38 +104,17 @@ view(session: Session): ActionCardView
  * recorded here and every other verb goes to the card's kind. `dismiss` also works on an unstarted card whose kind
  * is no longer registered. Concurrent actions on one card share one operation.
  * @param agent - live root resolved from the displayed Session.
- * @param cardId - the card's id in the Session's card view.
+ * @param callId - the card's `propose_action` call id.
  * @param verb - `dismiss` or one of the kind's verbs.
  * @param payload - kind-defined fields such as a chosen location.
  * @returns acceptance of background work, the decision in effect, or a refusal.
  */
-@Remote act(agent: Agent, cardId: ActionCardId, verb: string, payload?: Record<string, JsonValue>): Promise<ActionCardResult>
+@Remote act(agent: Agent, callId: ToolCallId, verb: string, payload?: Record<string, JsonValue>): Promise<ActionCardResult>
 ```
 
-Types: [Agent](core.md) · [Session](session.md) · [SkillCandidate](skills.md) · [SkillProvider](skills.md) · [SkillProviderControl](skills.md)
+Types: [Agent](core.md) · [Session](session.md) · [ToolCallId](core.md)
 
-Source: [`packages/interaction/action-cards/src/index.ts`](../../packages/interaction/action-cards/src/index.ts)
-
-<a id="ctxcliaccounts--cliaccounts"></a>
-
-### `ctx.cliAccounts` — `CliAccounts`
-
-Holds what CLI app plugins register: for each plugin, the CLI path the model reads in runtime context, the account operations that run one at a time, and the account the Plugins page shows.
-
-```ts cordis-catalog
-/**
- * Register the calling plugin's CLI and account: add the CLI's absolute path to required runtime context, run the
- * plugin's account operations one at a time, and show the account on the Plugins page while `connectorAccounts` is
- * loaded. The registration belongs to the calling plugin: unloading that plugin withdraws it, after the active
- * operation and the CLI processes it started have stopped.
- * @param registration - the plugin's CLI, account operations, and Plugins page text.
- * @returns the handle for the plugin's own reads and updates of the account.
- * @throws when the runtime-context name `<name>:cli` is already registered.
- */
-register<Account, Kind extends string, Phase extends string, Command extends string, Key extends string>( registration: CliAccountRegistration<Account, Kind, Phase, Command, Key>, ): CliAccountHandle<Account, Kind, Phase, Command>
-```
-
-Source: [`packages/connector/cli-account/src/index.ts`](../../packages/connector/cli-account/src/index.ts)
+Source: [`packages/experimental/action-cards/src/index.ts`](../../packages/experimental/action-cards/src/index.ts)
 
 <a id="ctxconfigeditor--configeditor"></a>
 
@@ -171,50 +142,6 @@ async edit( entry: Entry, change: (current: Record<string, unknown>, inherited: 
 ```
 
 Source: [`packages/boot/config-editor/src/index.ts`](../../packages/boot/config-editor/src/index.ts)
-
-<a id="ctxconnectoraccounts--connectoraccounts"></a>
-
-### `ctx.connectorAccounts` — `ConnectorAccounts`
-
-Holds the registered accounts and serves them to the Plugins page.
-
-```ts cordis-catalog
-/**
- * Show one account on the Plugins page for as long as the returned disposer has not run.
- * @param registration - the account key, its bundle package, the account source, the page operations, and the
- *   presentation.
- * @returns an idempotent disposer that withdraws the account.
- * @throws when another account already uses the key or the package.
- */
-register<View extends AnyConnectorAccountView>(registration: ConnectorAccountRegistration<View>): () => void
-
-/**
- * Follow every registered account; each new subscriber starts a check of each account that runs no operation.
- * @param signal - the Client's observation lifetime; disposal also ends the stream.
- * @returns the current accounts, then each changed set, coalescing changes that arrive before the next read.
- */
-@Remote({ mode: 'stream' }) async *watch(signal: AbortSignal): AsyncIterable<ConnectorAccountsView>
-
-/**
- * Start one of the operations the account registered as page actions.
- * @param key - the account key.
- * @param operation - the operation kind.
- * @returns the operation identity once the account's source has started it.
- * @throws for an unknown account or operation, or whatever the account's source refuses, such as a second operation.
- */
-@Remote async start(key: string, operation: string): Promise<ConnectorOperationId>
-
-/**
- * Cancel one operation while its phase is cancellable, and wait for it to settle.
- * @param key - the account key.
- * @param id - the operation to cancel; a finished one or a phase that is not cancellable is ignored.
- * @returns after the operation settles, or at once when nothing is cancelled.
- * @throws for an unknown account.
- */
-@Remote cancel(key: string, id: ConnectorOperationId): Promise<void>
-```
-
-Source: [`packages/client/ui-connector-account/src/index.ts`](../../packages/client/ui-connector-account/src/index.ts)
 
 <a id="ctxheadlessstartup--headlessstartupvalues"></a>
 
@@ -306,17 +233,15 @@ Manage profile files and apply their declared reload lifecycle.
 
 /** Read current plugins, including why a row cannot be changed through the profile patch.
  * @returns Current runtime entries with persistent patch targets.
- * @throws {PluginManagerError} `PLUGIN_MANAGER_PROFILE_READ_FAILED` to in-process callers when the profile patches
- *   cannot be read; Remote callers receive `gateway/internal`.
  */
 @Remote async listPlugins(): Promise<PluginInfo[]>
 
 /** Read installed, installation-provided, and offline Official catalog bundles, plus selected non-bundle names.
  * A dependency without a bundle patch is listed, as a `not-bundle` problem, only while it is selected.
  * @returns Package versions, manifest descriptions, the installable spec of profile dependencies, rows, optional
- * display metadata, activation selections, whether the installation offers the bundle, and removal availability.
- * @throws {PluginManagerError} `PLUGIN_MANAGER_PROFILE_READ_FAILED` to in-process callers when a profile or
- *   installation manifest cannot be read; Remote callers receive `gateway/internal`.
+ * display metadata, activation selections, whether the installation offers the bundle, removal availability, and for
+ * an unselected bundle whose every row another selected bundle already inserts under the same id and module, the
+ * providing bundle names in `providedBy`; `enabled` stays the saved selection, not successful activation.
  */
 @Remote listBundles(): Promise<BundleInfo[]>
 
@@ -344,21 +269,15 @@ Manage profile files and apply their declared reload lifecycle.
 @Remote async listVersions(name: string, options?: ListVersionsOptions, signal?: AbortSignal): Promise<PluginVersionList>
 
 /**
- * Replace an installed bundle with a newer version. A registry copy updates to `name@version`, checked on the registry
- * first: it must exist, declare a bundle, and accept the running DSH version, or nothing changes. A Git copy updates
- * to the Git spec `options.spec` names, which must pin a full commit of the repository directory the copy came from;
- * with HMR, a network failure or timeout reaching its repository stops the update before anything changes. pnpm reads
- * a Git package only while installing it, so its bundle and compatibility are checked then. Either target
- * installation is undone, profile files and modules included, before its bundle loads unless it installs `name` at
- * `version`. With HMR the installed version is removed, so its plugins stop, and the target is installed with the same
- * selection; when that installation fails or is cancelled, the removed version is installed again: a registry copy
- * from the registry it came from, a Git copy from its saved spec. Without HMR the target is installed over the running
- * version and the result reports the restart.
+ * Replace an installed registry bundle with a newer published version. The target is checked on the registry first:
+ * it must exist, declare a bundle, and accept the running DSH version, or nothing changes. With HMR the installed
+ * version is removed, so its plugins stop, and the target is installed with the same selection; when that
+ * installation fails or is cancelled, the removed version is installed again from the registry it came from.
+ * Without HMR the target is installed over the running version and the result reports the restart.
  * @param name Installed profile dependency name.
- * @param version Exact version newer than the installed one.
- * @param options The registry asked first, as for `listVersions`; the Git spec of `version`, required for and accepted
- * only by a bundle `listBundles` lists with `update: 'git'`; and the request id naming the progress and the target
- * installation's logs and cancellation.
+ * @param version Exact published version newer than the installed one.
+ * @param options The registry asked first, as for `listVersions`, and the request id naming the progress and the
+ * target installation's logs and cancellation.
  * @returns The versions, the last step that ran with its result, and the reinstallation when one ran.
  */
 @Remote async updateBundle(name: string, version: string, options?: UpdateBundleOptions): Promise<PluginUpdateResult>
@@ -370,7 +289,9 @@ Manage profile files and apply their declared reload lifecycle.
  */
 @Remote setPluginEnabled(id: PluginEntryId, enabled: boolean): Promise<ChangeResult>
 
-/** Select or remove a bundle layer while retaining installed dependencies.
+/** Select or remove a bundle layer while retaining installed dependencies. Enabling a bundle that is not selected
+ * yet refuses, with `duplicate-entry`, row ids another layer already inserts; the refusal names the ids and layers in
+ * its diagnostic and saves no selection. Re-selecting a saved bundle changes nothing and reports none.
  * @param name Bundle package name.
  * @param enabled Whether the bundle contributes its patch layer.
  * @returns Persisted and runtime outcomes.
@@ -496,15 +417,15 @@ Catalog lookups for card text and the enabling behind the `enable_official_plugi
 /**
  * Read the current catalog text for a logged card.
  * @param agent - Exact live root resolved by the Gateway from the Session id.
- * @param cardId - The card's id, never a package supplied by the browser.
+ * @param callId - The card's `propose_action` call id, never a package supplied by the browser.
  * @returns the plugin's title, description and selection, or a refusal when the card names no available official plugin.
  */
-@Remote async describe(agent: Agent, cardId: ActionCardId): Promise<RecommendationDetails>
+@Remote async describe(agent: Agent, callId: ToolCallId): Promise<RecommendationDetails>
 ```
 
-Types: [Agent](core.md)
+Types: [Agent](core.md) · [ToolCallId](core.md)
 
-Source: [`packages/extensions/plugin-recommendations/src/index.ts`](../../packages/extensions/plugin-recommendations/src/index.ts)
+Source: [`packages/experimental/plugin-recommendations/src/index.ts`](../../packages/experimental/plugin-recommendations/src/index.ts)
 
 <a id="ctxpluginregistryprobe--pluginregistryprobe"></a>
 

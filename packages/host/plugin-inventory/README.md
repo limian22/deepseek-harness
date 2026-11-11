@@ -39,7 +39,7 @@ With a roster composed, `agentPresets` carries one group per preset in roster or
 
 ### What you can and cannot do with it
 
-The inventory is a snapshot for display and diagnostics: a client can render the roster, flag failed entries, and detect changes by comparing snapshots. It cannot enable, disable, add, or remove plugins, and it carries no history — a fiber that already failed and was removed is absent. Because the service reads the Loader on every call, the answer always reflects the current composition rather than a cached view.
+The inventory is a snapshot for display and diagnostics: a client can render the roster, flag failed entries, and detect changes by comparing snapshots. It cannot enable, disable, add, or remove plugins, and it carries no history — a fiber that already failed and was removed is absent. Because the service reads the Loader on every call, the answer always reflects the current composition rather than a cached view. Within one snapshot each package's display metadata is read once per resolution base and module specifier, so rows naming the same module share that read; the next snapshot reads those files again.
 
 Failed entries include the current startup diagnostic read from their Cordis fiber. Recovery removes it; inventory reads do not wait for loading entries or retain a separate error cache.
 
@@ -55,7 +55,7 @@ Failed entries include the current startup diagnostic read from their Cordis fib
 
 The gateway is a direct projection with no second lifecycle truth: every `list()` call reads `ctx.loader.entries()` and maps each non-group entry to its public row. Cordis's internal `plugin/status` events already maintain `Entry.fiber` and `Fiber.state`, so a cache would only add another lifecycle truth to keep synchronized. The agent-preset roster is an optional peer resolved per call through `ctx.get('agentPresets')`: its `compositionInventory()` owns preset composition reads, and this package maps root-fiber states onto the public phases.
 
-Display metadata comes from the optional `pluginPackages` service using each Loader tree's resolution base, or the gateway context's base for preset rows. Without the service or the applicable base, `meta` is absent. Reading metadata does not load or activate plugins.
+Display metadata comes from the optional `pluginPackages` service using each Loader tree's resolution base, or the gateway context's base for preset rows. Without the service or the applicable base, `meta` is absent. Reading metadata does not load or activate plugins. A caller that projects Loader entries alone passes `includePresets: false` to `readPluginInventory` and skips the roster read, so no `agentPresets` field answers.
 
 ### The phase mapping
 

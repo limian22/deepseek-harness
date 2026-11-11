@@ -203,6 +203,20 @@ interface ResolvedJsonlGeneration {
   readonly currentPath: string
 }
 
+/** One translated current-format header retained while its physical identity is unchanged. */
+interface HeaderObservation {
+  readonly identity: JsonlPhysicalIdentity
+  readonly metadata: GenerationHeader
+}
+
+/** One selected generation with the translated header and identity observed for it. */
+interface ObservedJsonlGeneration {
+  readonly metadata: GenerationHeader
+  readonly identity: JsonlPhysicalIdentity
+  /** Detached entry a complete scan may retain for later observations. */
+  readonly reusable?: HeaderObservation
+}
+
 /** One backend-owned historical preparation shared by its current callers. */
 interface MigrationPreparation {
   readonly sourcePath: string
@@ -211,6 +225,20 @@ interface MigrationPreparation {
   readonly promise: Promise<PreparedStoredLog>
   settled: boolean
   waiters: number
+}
+
+/** Whether two stat identities name the identical physical file state. */
+function samePhysicalIdentity(left: JsonlPhysicalIdentity, right: JsonlPhysicalIdentity): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+}
+
+/** Detach one translated header so a consumer cannot mutate a retained observation. */
+function copyGenerationMetadata(metadata: GenerationHeader): GenerationHeader {
+  return { header: { ...metadata.header }, formatStatus: metadata.formatStatus }
 }
 
 /** Whether a filesystem error means absence; every non-ENOENT failure must surface. */
@@ -316,6 +344,17 @@ class JsonlSessionPersistence extends SessionPersistence {
    * revision guard.
    */
   private readonly coldLogMemo = new Map<SessionId, StoredLog>()
+  /**
+   * Current-format header observations keyed by absolute artifact path. A
+   * complete successful listing replaces this map with exactly its own
+   * observations, so deleted or unreadable paths do not survive; each entry is
+   * used only while a fresh stat observes the identical physical identity.
+   * `stat()` may add its own stable observation between scans, so retention is
+   * bounded by the existing Session artifacts rather than by the latest scan;
+   * the next complete scan prunes what it does not observe. Copying the header
+   * keeps a consumer-visible snapshot from mutating it.
+   */
+  private headerObservations = new Map<string, HeaderObservation>()
   /** One joinable decode/migration operation per selected historical Session file revision. */
   private readonly migrationPreparations = new Map<SessionId, MigrationPreparation>()
   /**
@@ -611,7 +650,9 @@ class JsonlSessionPersistence extends SessionPersistence {
   }
 
   /**
-   * Observe one stored session without reading its event log.
+   * Observe one stored session without reading its event log. A decoded
+   * current-format header is reused when a fresh identity stat matches the
+   * observation that produced it.
    * @param id - the stored session to observe.
    * @param options - optional cancellation.
    * @returns the snapshot (`sizeBytes` carries the physical artifact size), or
@@ -630,29 +671,27 @@ class JsonlSessionPersistence extends SessionPersistence {
     }
     const selected = await this.findLog(id, options?.signal)
     if (selected === undefined) return undefined
-    const metadata = await this.readGenerationHeader(selected, id, options?.signal)
-    if (metadata === undefined) return undefined
-    try {
-      const identity = await stat(selected.sourcePath, { bigint: true })
-      options?.signal?.throwIfAborted()
-      return {
-        ...metadata,
-        revision: selected.sourceVersion < SESSION_FORMAT_VERSION
-          ? SessionPersistenceRevision(`${fileRevision(identity)}:${await this.historicalCorpusRevision(options?.signal)}`)
-          : fileRevision(identity),
-        sizeBytes: Number(identity.size),
-        location: { kind: 'jsonl', path: selected.sourcePath },
-      }
-    } catch (error: unknown) {
-      options?.signal?.throwIfAborted()
-      if (isENOENT(error)) return undefined
-      throw error
+    const observation = await this.observeGenerationHeader(selected, id, options?.signal)
+    if (observation === undefined) return undefined
+    if (observation.reusable !== undefined) {
+      this.headerObservations.set(selected.sourcePath, observation.reusable)
+    }
+    return {
+      ...observation.metadata,
+      revision: selected.sourceVersion < SESSION_FORMAT_VERSION
+        ? SessionPersistenceRevision(`${fileRevision(observation.identity)}:${await this.historicalCorpusRevision(options?.signal)}`)
+        : fileRevision(observation.identity),
+      sizeBytes: Number(observation.identity.size),
+      location: { kind: 'jsonl', path: selected.sourcePath },
     }
   }
 
   /**
    * List every stored session visible to this process: materialized artifacts
-   * plus this process's created-but-unmaterialized sessions.
+   * plus this process's created-but-unmaterialized sessions. Every call rescans
+   * the Session directories and selects the highest canonical generation; a
+   * decoded current-format header is reused only while the selected file
+   * identity is unchanged.
    * @param options - optional cancellation.
    * @returns one snapshot per session, in no promised order.
    */
@@ -665,31 +704,18 @@ class JsonlSessionPersistence extends SessionPersistence {
     // predate the scan), so create-to-list visibility never has a hole.
     const pending = [...this.tracker.pendingEntries()]
     const artifacts = await this.listArtifacts(signal)
+    signal?.throwIfAborted()
     const corpusRevision = artifacts.some(artifact => artifact.sourceVersion < SESSION_FORMAT_VERSION)
       ? await this.historicalCorpusRevision(signal) : undefined
-    const statted = settledValues(await settleLimited(this.listLimit, artifacts, async (artifact) => {
-      signal?.throwIfAborted()
-      try {
-        const identity = await stat(artifact.path, { bigint: true })
-        signal?.throwIfAborted()
-        return { artifact, identity }
-      } catch (error: unknown) {
-        signal?.throwIfAborted()
-        if (!isENOENT(error)) throw error
-        return undefined
-      }
-    }))
-    for (const entry of statted) {
-      if (entry === undefined) continue
-      const { artifact, identity } = entry
+    for (const artifact of artifacts) {
       listed.add(artifact.header.id)
       snapshots.push({
         header: artifact.header,
         formatStatus: artifact.formatStatus,
         revision: artifact.sourceVersion < SESSION_FORMAT_VERSION
-          ? SessionPersistenceRevision(`${fileRevision(identity)}:${corpusRevision}`)
-          : fileRevision(identity),
-        sizeBytes: Number(identity.size),
+          ? SessionPersistenceRevision(`${fileRevision(artifact.identity)}:${corpusRevision}`)
+          : fileRevision(artifact.identity),
+        sizeBytes: Number(artifact.identity.size),
         location: { kind: 'jsonl', path: artifact.path },
       })
     }
@@ -1272,9 +1298,18 @@ class JsonlSessionPersistence extends SessionPersistence {
     return hash.digest('hex')
   }
 
+  /**
+   * Read every selected generation header. A complete successful scan replaces
+   * the reusable current-header observations; a cancelled or failed scan
+   * publishes nothing.
+   */
   private async listArtifacts(
     signal?: AbortSignal,
-  ): Promise<Array<GenerationHeader & { path: string; sourceVersion: number }>> {
+  ): Promise<Array<GenerationHeader & {
+    path: string
+    sourceVersion: number
+    identity: JsonlPhysicalIdentity
+  }>> {
     signal?.throwIfAborted()
     await this.ensureRootEncoding()
     signal?.throwIfAborted()
@@ -1282,28 +1317,103 @@ class JsonlSessionPersistence extends SessionPersistence {
     const headers = await settleLimited(this.listLimit, generations, async (selected) => {
       signal?.throwIfAborted()
       try {
-        return { selected, metadata: await this.readGenerationHeader(selected, undefined, signal) }
+        return { selected, observation: await this.observeGenerationHeader(selected, undefined, signal) }
       } catch (error: unknown) {
         if (error instanceof SessionFormatUnsupportedError || error instanceof SessionPersistenceCorruptionError) {
-          return { selected, metadata: undefined }
+          return { selected, observation: undefined }
         }
         throw error
       }
     })
-    const artifacts: Array<GenerationHeader & { path: string; sourceVersion: number }> = []
+    const artifacts: Array<GenerationHeader & {
+      path: string
+      sourceVersion: number
+      identity: JsonlPhysicalIdentity
+    }> = []
+    const observations = new Map<string, HeaderObservation>()
     const ids = new Set<SessionId>()
     for (const outcome of headers) {
       if (outcome.status === 'rejected') throw outcome.reason
-      const { selected, metadata } = outcome.value
-      if (metadata === undefined) continue
+      const { selected, observation } = outcome.value
+      if (observation === undefined) continue
+      const { metadata, identity, reusable } = observation
       if (ids.has(metadata.header.id)) {
         throw new Error(`duplicate JSONL session id "${metadata.header.id}" appears in multiple project directories`)
       }
       ids.add(metadata.header.id)
-      artifacts.push({ ...metadata, path: selected.sourcePath, sourceVersion: selected.sourceVersion })
+      artifacts.push({ ...metadata, path: selected.sourcePath, sourceVersion: selected.sourceVersion, identity })
+      if (reusable !== undefined) observations.set(selected.sourcePath, reusable)
     }
     signal?.throwIfAborted()
+    this.headerObservations = observations
     return artifacts
+  }
+
+  /** Stat one selected generation, treating absence as no observation. */
+  private async observedIdentity(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<JsonlPhysicalIdentity | undefined> {
+    try {
+      const identity = await stat(path, { bigint: true })
+      signal?.throwIfAborted()
+      return identity
+    } catch (error: unknown) {
+      signal?.throwIfAborted()
+      if (isENOENT(error)) return undefined
+      throw error
+    }
+  }
+
+  /**
+   * Observe one selected generation header before its events are read. A
+   * current-format header is reused only when a stat before the read and the
+   * stat after it observe the same physical identity; a historical header is
+   * always translated from its selected file because its public revision
+   * depends on the corpus. The returned metadata is detached from the retained
+   * observation, so a consumer-visible snapshot cannot mutate it.
+   */
+  private async observeGenerationHeader(
+    selected: ResolvedJsonlGeneration,
+    expectedId?: SessionId,
+    signal?: AbortSignal,
+  ): Promise<ObservedJsonlGeneration | undefined> {
+    signal?.throwIfAborted()
+    if (selected.sourceVersion !== SESSION_FORMAT_VERSION) {
+      const metadata = await this.readGenerationHeader(selected, expectedId, signal)
+      if (metadata === undefined) return undefined
+      const identity = await this.observedIdentity(selected.sourcePath, signal)
+      if (identity === undefined) return undefined
+      return { metadata, identity }
+    }
+    const before = await this.observedIdentity(selected.sourcePath, signal)
+    if (before === undefined) return undefined
+    const cached = this.headerObservations.get(selected.sourcePath)
+    if (cached !== undefined && samePhysicalIdentity(cached.identity, before)) {
+      await this.assertStoredIdentity(
+        selected.sourcePath,
+        selected.sourceVersion,
+        cached.metadata.header,
+        expectedId,
+        signal,
+      )
+      return {
+        metadata: copyGenerationMetadata(cached.metadata),
+        identity: before,
+        reusable: cached,
+      }
+    }
+    const metadata = await this.readGenerationHeader(selected, expectedId, signal)
+    if (metadata === undefined) return undefined
+    const after = await this.observedIdentity(selected.sourcePath, signal)
+    if (after === undefined) return undefined
+    return {
+      metadata,
+      identity: after,
+      ...samePhysicalIdentity(before, after)
+        ? { reusable: { identity: after, metadata: copyGenerationMetadata(metadata) } }
+        : {},
+    }
   }
 
   /** Read and translate one selected generation header without inspecting its body. */

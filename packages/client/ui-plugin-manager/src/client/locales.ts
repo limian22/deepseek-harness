@@ -7,6 +7,9 @@ export const INSTALL_PATH_EXAMPLE = '/Users/name/my-plugin'
 
 /** Simplified Chinese dictionary and key source of truth. */
 export const zh = {
+  statusProvided: '已由其他插件包提供',
+  providedDescription: '这些组件已由 {names} 提供，无需再次启用独立插件包。下方列出已有组件的状态与可用控制项',
+  reasonDuplicateEntry: '此插件包会重复挂载已有配置行。请检查现有组合包或补丁中的冲突 ID，保留一份挂载后再启用',
   panel: '插件',
   settingsEntry: '插件管理',
   clientSyncing: '正在同步本页面的插件…',
@@ -311,6 +314,9 @@ export type PluginManagerLocaleKey = keyof typeof zh
 
 /** English dictionary checked against the Chinese key set. */
 export const en = {
+  statusProvided: 'Provided by another package',
+  providedDescription: 'These components are provided by {names}; no separate package activation is needed. Existing component states and available controls are listed below.',
+  reasonDuplicateEntry: 'This package would duplicate existing configuration rows. Check the conflicting IDs in the existing bundle or patch and keep a single declaration.',
   panel: 'Plugins',
   settingsEntry: 'Plugins',
   clientSyncing: 'Syncing plugins on this page…',
@@ -612,6 +618,9 @@ export const en = {
 
 /** Japanese copy, checked against the English keys. */
 export const ja = {
+  statusProvided: '別のパッケージが提供',
+  providedDescription: 'これらのコンポーネントは {names} が提供しており、別途パッケージを有効にする必要はありません。既存の状態と利用可能な操作を下に表示します。',
+  reasonDuplicateEntry: 'このパッケージは既存の設定行を重複して読み込みます。既存のバンドルまたはパッチの競合 ID を確認し、宣言を一つにしてください。',
   'reasonUnsupportedPlatform': 'このプラグインはDSHを実行しているホストOSに対応していません。',
   'panel': 'プラグイン',
   'settingsEntry': 'プラグイン管理',
@@ -913,6 +922,9 @@ export const ja = {
 
 /** Spanish dictionary, checked against the English keys. */
 export const es = {
+  statusProvided: 'Incluido en otro paquete',
+  providedDescription: 'Estos componentes los proporciona {names}; no es necesario activar otro paquete. Abajo se muestran sus estados y los controles disponibles.',
+  reasonDuplicateEntry: 'Este paquete duplicaría filas de configuración existentes. Revise los ID en conflicto en el paquete o parche existente y conserve una sola declaración.',
   reasonUnsupportedPlatform: 'Este complemento no es compatible con el sistema operativo que ejecuta DSH.',
   panel: 'Complementos',
   settingsEntry: 'Complementos',
@@ -1214,6 +1226,9 @@ export const es = {
 
 /** French dictionary, checked against the English keys. */
 export const fr = {
+  statusProvided: 'Fourni par un autre paquet',
+  providedDescription: 'Ces composants sont fournis par {names} ; aucune activation de paquet supplémentaire n’est nécessaire. Leurs états et les commandes disponibles figurent ci-dessous.',
+  reasonDuplicateEntry: 'Ce paquet dupliquerait des lignes de configuration existantes. Vérifiez les identifiants en conflit dans le paquet ou le correctif existant et conservez une seule déclaration.',
   reasonUnsupportedPlatform: 'Ce plugin ne prend pas en charge le système d’exploitation sur lequel DSH s’exécute.',
   panel: 'Plugins',
   settingsEntry: 'Plugins',
@@ -1515,6 +1530,9 @@ export const fr = {
 
 /** German dictionary, checked against the English keys. */
 export const de = {
+  statusProvided: 'Von anderem Paket bereitgestellt',
+  providedDescription: 'Diese Komponenten werden von {names} bereitgestellt; eine weitere Paketaktivierung ist nicht nötig. Ihre Zustände und verfügbaren Steuerelemente stehen unten.',
+  reasonDuplicateEntry: 'Dieses Paket würde vorhandene Konfigurationszeilen duplizieren. Prüfen Sie die widersprüchlichen IDs im vorhandenen Paket oder Patch und behalten Sie nur eine Deklaration.',
   reasonUnsupportedPlatform: 'Dieses Plugin unterstützt das Betriebssystem, auf dem DSH läuft, nicht.',
   panel: 'Plugins',
   settingsEntry: 'Plugins',
@@ -1816,6 +1834,9 @@ export const de = {
 
 /** Russian dictionary, checked against the English keys. */
 export const ru = {
+  statusProvided: 'Предоставлено другим пакетом',
+  providedDescription: 'Эти компоненты предоставляет {names}; отдельно включать пакет не нужно. Их состояния и доступные элементы управления показаны ниже.',
+  reasonDuplicateEntry: 'Этот пакет продублирует существующие строки конфигурации. Проверьте конфликтующие ID в существующем пакете или патче и оставьте одно объявление.',
   reasonUnsupportedPlatform: 'Этот плагин не поддерживает операционную систему, в которой работает DSH.',
   panel: 'Плагины',
   settingsEntry: 'Плагины',
@@ -2117,6 +2138,9 @@ export const ru = {
 
 /** Portuguese dictionary, checked against the English keys. */
 export const pt = {
+  statusProvided: 'Fornecido por outro pacote',
+  providedDescription: 'Estes componentes são fornecidos por {names}; não é necessário ativar outro pacote. Os estados e controles disponíveis aparecem abaixo.',
+  reasonDuplicateEntry: 'Este pacote duplicaria linhas de configuração existentes. Verifique os IDs em conflito no pacote ou patch existente e mantenha uma única declaração.',
   reasonUnsupportedPlatform: 'Este plugin não oferece suporte ao sistema operacional em que o DSH está sendo executado.',
   panel: 'Plug-ins',
   settingsEntry: 'Plug-ins',

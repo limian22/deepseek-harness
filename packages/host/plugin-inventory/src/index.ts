@@ -5,6 +5,7 @@ import type {} from '@deepseek-ai/cordis-plugin-loader'
 // Type-only: the optional agent-preset roster resolved through `ctx.get`.
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import type {} from '@deepseek-ai/dsh-app-boot'
+import type { PluginLocalizedMeta } from '@deepseek-ai/dsh-package-manifest'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 // Typert-generated ./typert and ./remote artifacts import Zod at runtime.
 import type {} from 'zod'
@@ -75,17 +76,41 @@ export class PluginInventoryGateway extends TypertRemoteService {
 
 export default PluginInventoryGateway
 
-/** Read current Loader entries and optional preset compositions.
+/** How much of the current Loader state one read projects. */
+export interface ReadPluginInventoryOptions {
+  /**
+   * Whether the snapshot also carries each composed agent preset's composition. A caller that
+   * reads only Loader entries passes false and skips the roster's composition and row reads.
+   * Defaults to true.
+   */
+  readonly includePresets?: boolean
+}
+
+/**
+ * Read current Loader entries and optional preset compositions.
+ *
+ * Display metadata is read once per resolution base and module specifier within one snapshot, so
+ * rows naming the same module — preset rows mirroring Loader entries included — share one locale
+ * and icon read. A later snapshot reads those files again.
  * @param ctx Context with the Loader service.
+ * @param options Whether the snapshot also carries agent-preset compositions.
  * @returns Current inventory with optional display metadata and no separate runtime cache.
  */
-export async function readPluginInventory(ctx: Context): Promise<PluginInventorySnapshot> {
+export async function readPluginInventory(
+  ctx: Context, options: ReadPluginInventoryOptions = {},
+): Promise<PluginInventorySnapshot> {
   const entries: PluginInventoryEntry[] = []
   const packages = ctx.get('pluginPackages')
+  const displayed = new Map<string, PluginLocalizedMeta | undefined>()
+  const metaOf = (specifier: string, base: string | undefined): PluginLocalizedMeta | undefined => {
+    if (base === undefined || packages === undefined) return undefined
+    const key = `${base}\u0000${specifier}`
+    if (!displayed.has(key)) displayed.set(key, packages.metaOf(specifier, base))
+    return displayed.get(key)
+  }
   for (const entry of ctx.loader.entries()) {
     if (entry.options.group) continue
-    const base = entry.parent.tree.ctx.baseUrl
-    const meta = base === undefined ? undefined : packages?.metaOf(entry.options.name, base)
+    const meta = metaOf(entry.options.name, entry.parent.tree.ctx.baseUrl)
     const fiber = entry.fiber
     const fiberPhase = fiber === undefined ? null : FIBER_PHASE[fiber.state]
     let diagnostic: string | undefined
@@ -101,14 +126,14 @@ export async function readPluginInventory(ctx: Context): Promise<PluginInventory
       ...meta === undefined ? {} : { meta },
     })
   }
-  const presets = ctx.get('agentPresets')
   const management = ctx.get('pluginManager') === undefined ? {} : { managementAvailable: true }
+  const presets = options.includePresets === false ? undefined : ctx.get('agentPresets')
   if (presets === undefined) return { entries, ...management }
   const agentPresets: AgentPresetPluginGroup[] = (await presets.compositionInventory()).map(
     composition => ({
       ...composition,
       rows: composition.rows.map(({ fiberState, ...row }) => {
-        const meta = ctx.baseUrl === undefined ? undefined : packages?.metaOf(row.moduleName, ctx.baseUrl)
+        const meta = metaOf(row.moduleName, ctx.baseUrl)
         return {
           ...row,
           fiberPhase: fiberState === undefined ? null : FIBER_PHASE[fiberState],

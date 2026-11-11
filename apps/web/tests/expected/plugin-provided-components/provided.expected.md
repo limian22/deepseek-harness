@@ -1,0 +1,1 @@
+- status: 这些组件已由 @fixture/memory-starter 提供，无需再次启用独立插件包。下方列出已有组件的状态与可用控制项

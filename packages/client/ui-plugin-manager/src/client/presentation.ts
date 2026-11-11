@@ -57,6 +57,7 @@ const CODE_KEYS = {
   'not-removable': 'reasonNotRemovable',
   'stop-profile': 'reasonStopProfile',
   'bundle-in-use': 'reasonBundleInUse',
+  'duplicate-entry': 'reasonDuplicateEntry',
   'stale-approval': 'reasonStaleApproval',
   'incompatible-version': 'reasonIncompatibleVersionUnnamed',
   'unsupported-platform': 'reasonUnsupportedPlatform',
@@ -75,7 +76,8 @@ const FAILED_KEYS = {
 
 /**
  * What a management error reads as: the code's sentence; for an incompatibility, one sentence per
- * package it names, then the remedy for an install or for an installed plugin; or, for an operation error, the Host's diagnostic as it is.
+ * package it names, then its remedy. Duplicate entries name the conflicting rows and layers;
+ * operation errors retain the Host's diagnostic.
  * @param error - the Host's code, its diagnostic, and the packages an incompatibility names.
  * @param t - the manager's translate seat.
  * @returns the sentence.
@@ -96,6 +98,9 @@ export function managementText(error: {
         requirements: Object.entries(plugin.requirements).map(([name, range]) => `${name} ${range}`).join(', '),
       }))
     return [...sentences, t(error.installing ? 'reasonIncompatibleInstall' : 'reasonIncompatibleInstalled')].join(t('sentenceSeparator'))
+  }
+  if (error.code === 'duplicate-entry' && error.diagnostic) {
+    return `${t('reasonDuplicateEntry')} ${error.diagnostic}`
   }
   if (error.code !== 'operation-error') return t(CODE_KEYS[error.code])
   return error.diagnostic === undefined || error.diagnostic === '' ? t('reasonOperationError') : error.diagnostic

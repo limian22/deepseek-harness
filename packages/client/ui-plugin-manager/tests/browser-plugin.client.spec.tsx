@@ -17,8 +17,6 @@ import { PluginRefreshToast, type PluginRefreshToastFace } from '../src/client/P
 import { PluginsPanelIcon } from '../src/client/PluginsPanelIcon.tsx'
 import type { PluginManagerFace } from '../src/client/manager-store.ts'
 import type { createNavigationStore } from '../src/client/navigation-store.ts'
-import type { PluginsSettingsLinkInjected } from '../src/client/PluginsSettingsLink.tsx'
-import type { ClientSyncFace } from '../src/client/PluginManagerPage.tsx'
 
 usePinnedBrowserLanguages('zh-CN')
 beforeEach(() => { localStorage.clear() })
@@ -79,27 +77,23 @@ async function bench(allows: ((action: string) => boolean) | 'switchable' = () =
     }
   }
   new LocaleHolder(ctx)
-  const list = vi.fn(() => Promise.resolve({ ok: true as const, value: { entries: [], managementAvailable: true } }))
+  const plugins = {
+    listBundles: vi.fn(() => Promise.resolve({ ok: true as const, value: [] })),
+    listPlugins: vi.fn(() => Promise.resolve({ ok: true as const, value: [] })),
+    registries: vi.fn(() => Promise.resolve({ ok: true as const, value: { registry: null, fallbackRegistries: [], resolved: null } })),
+    readBundleDetail: vi.fn(() => Promise.resolve({ ok: true as const, value: { status: 'none' as const } })),
+  }
   const remote = new TestRemote(ctx, {
     settings: { describe: vi.fn(async () => ({ ok: true as const, value: { writable: true, hasDocument: true, namespaces: [] } })) },
-    pluginInventory: { list },
     pluginRegistryProbe: { fastest: vi.fn(async () => ({ ok: true as const, value: null })) },
-    pluginManager: {
-      listBundles: vi.fn(() => Promise.resolve({ ok: true as const, value: [] })),
-      listPlugins: vi.fn(() => Promise.resolve({ ok: true as const, value: [] })),
-      registries: vi.fn(() => Promise.resolve({ ok: true as const, value: { registry: null, fallbackRegistries: [], resolved: null } })),
-      readBundleDetail: vi.fn(() => Promise.resolve({ ok: true as const, value: { status: 'none' as const } })),
-    },
+    pluginManager: plugins,
   })
   const panelInfo = createSnapshotStore<PanelInfo>({ activePanelId: null })
   const selectPanel = vi.fn<ILayout['selectPanel']>((activePanelId) => { panelInfo.set({ activePanelId }) })
-  const clientSync = createSnapshotStore({ syncing: false, failures: [] as { id: string; message: string }[] })
-  const retryClient = vi.fn(() => Promise.resolve())
-  ctx.provide('modules', { entries: { state: clientSync, retry: retryClient } })
   ctx.provide('layout', { panelInfo, selectPanel, beginNavigation: () => new AbortController().signal,
     toggleSidebar: vi.fn(), openRightbar: vi.fn(), closeRightbar: vi.fn() })
   await ctx.plugin(settings).await()
-  return { ctx, slots: ctx.get('slots') as SlotRegistry, locale, list, remote, selectPanel, panelInfo, access, clientSync, retryClient }
+  return { ctx, slots: ctx.get('slots') as SlotRegistry, locale, plugins, remote, selectPanel, panelInfo, access }
 }
 
 function declare(slots: SlotRegistry): () => void {
@@ -162,43 +156,7 @@ describe('ui-plugin-manager browser plugin', () => {
     expect(b.panelInfo.getSnapshot().activePanelId).toBe(PANEL_ID)
     expect(navigation.getSnapshot()).toEqual({ tab: 'installed', view: { kind: 'list' } })
     expect(face.hooks.pluginManager.getSnapshot().install.open).toBe(false)
-    expect(b.list).not.toHaveBeenCalled()
-  })
-
-  it('keeps a Settings entry that opens the Plugins list while the page is registered', async () => {
-    const b = await bench()
-    const removeRoot = b.slots.register({
-      name: 'root',
-      children: {
-        'main': { kind: 'keyed', scope: 'root' },
-        'shell.overlay': { kind: 'list', scope: 'root' },
-        'sidebar.panellist': { kind: 'list', scope: 'root' },
-        'settings.section': { kind: 'list', scope: 'root' },
-      },
-    } as never, () => null)
-    await b.ctx.plugin({ inject: [...inject], apply }).await()
-    const link = b.slots.entries('settings.section')[0]!
-    expect(link.options).toMatchObject({ id: PANEL_ID, order: 15 })
-    expect(resolveSlotLabel(link.options.label)).toBe('插件管理')
-    const navigation = (b.slots.entries('main')[0]!.store as ReturnType<typeof createNavigationStore>).create()
-    navigation.actions.setView({ kind: 'more' })
-    const linkInjected: object = link.inject!()
-    ;(linkInjected as PluginsSettingsLinkInjected).openPlugins()
-    expect(b.panelInfo.getSnapshot().activePanelId).toBe(PANEL_ID)
-    expect(navigation.getSnapshot()).toEqual({ tab: 'installed', view: { kind: 'list' } })
-    // The page reads this page's client synchronization from the module system and retries through it.
-    const pageInjected: object = b.slots.entries('main')[0]!.inject!()
-    const sync = pageInjected as ClientSyncFace
-    expect(sync.hooks.clientSync).toBe(b.clientSync)
-    sync.retryClient()
-    expect(b.retryClient).toHaveBeenCalledOnce()
-    const logged = vi.spyOn(b.ctx.logger('ui-plugin-manager'), 'error')
-    b.retryClient.mockRejectedValueOnce(new Error('retry failed'))
-    sync.retryClient()
-    await vi.waitFor(() => { expect(b.retryClient).toHaveBeenCalledTimes(2) })
-    removeRoot()
-    expect(b.slots.entries('settings.section')).toEqual([])
-    logged.mockRestore()
+    expect(b.plugins.listBundles).not.toHaveBeenCalled()
   })
 
   it('shares refresh failures with the overlay after navigation and releases both registrations across reloads', async () => {
@@ -216,7 +174,7 @@ describe('ui-plugin-manager browser plugin', () => {
     face.ensure()
     await vi.waitFor(() => { expect(face.hooks.pluginManager.getSnapshot().status).toBe('ready') })
     b.selectPanel(PANEL_ID)
-    b.list.mockRejectedValueOnce(new Error('offline'))
+    b.plugins.listBundles.mockRejectedValueOnce(new Error('offline'))
     face.refresh()
     b.selectPanel(null)
     await vi.waitFor(() => { expect(overlay.hooks.pluginManager.getSnapshot().notice?.kind).toBe('refresh-failed') })
@@ -238,7 +196,7 @@ describe('ui-plugin-manager browser plugin', () => {
   })
 
   it('declares only the services the page and its Remote methods use', () => {
-    expect(inject).toEqual(['slots', 'locale', 'remote', 'remote.pluginManager', 'remote.pluginInventory', 'remote.pluginRegistryProbe', 'configForms', 'layout', 'remoteAccess', 'modules'])
+    expect(inject).toEqual(['slots', 'locale', 'remote', 'remote.pluginManager', 'remote.pluginRegistryProbe', 'configForms', 'layout', 'remoteAccess'])
   })
 
   it('reads the Host again on a later grant after showing the page, and not while access is withdrawn', async () => {
@@ -249,17 +207,17 @@ describe('ui-plugin-manager browser plugin', () => {
     const face = injected as PluginManagerFace
     face.ensure()
     await vi.waitFor(() => { expect(face.hooks.pluginManager.getSnapshot().status).toBe('ready') })
-    expect(b.list).toHaveBeenCalledTimes(1)
+    expect(b.plugins.listBundles).toHaveBeenCalledTimes(1)
 
     b.access!.set(false)
     expect(b.slots.entries('main')).toEqual([])
     b.remote.emit('plugin-manager/changed', [{ reason: 'install' }])
     await Promise.resolve()
-    expect(b.list).toHaveBeenCalledTimes(1)
+    expect(b.plugins.listBundles).toHaveBeenCalledTimes(1)
 
     b.access!.set(true)
     expect(b.slots.entries('main')).toHaveLength(1)
-    await vi.waitFor(() => { expect(b.list).toHaveBeenCalledTimes(2) })
+    await vi.waitFor(() => { expect(b.plugins.listBundles).toHaveBeenCalledTimes(2) })
   })
 
   it('contributes the entry, page, and navigation only while the current Peer may list bundles, and observes changes either way', async () => {
@@ -325,15 +283,15 @@ describe('ui-plugin-manager browser plugin', () => {
     b.locale.setLocale('en')
     expect(face.resolveText(text)).toBe('Local tools')
     b.locale.setLocale('zh')
-    expect(face.hooks.configLedger.getSnapshot()).toEqual({ items: [], bundles: new Set(), rows: new Set(), sections: [] })
+    expect(face.hooks.configLedger.getSnapshot()).toEqual({ items: [], bundles: new Set(), rows: new Set() })
     // A Host change before the first render is not a reason to read.
     b.remote.emit('plugin-manager/changed', [{ reason: 'install' }])
     b.ctx.emit('connection/reset')
     await Promise.resolve()
-    expect(b.list).not.toHaveBeenCalled()
+    expect(b.plugins.listBundles).not.toHaveBeenCalled()
     face.ensure()
     await vi.waitFor(() => { expect(face.hooks.pluginManager.getSnapshot().status).toBe('ready') })
-    expect(b.list).toHaveBeenCalledTimes(1)
+    expect(b.plugins.listBundles).toHaveBeenCalledTimes(1)
     // A profile change invalidates reads without withdrawing the displayed document.
     face.loadDetail('dsh-a', '1.0.0', 'en', false)
     await vi.waitFor(() => { expect(Object.values(face.hooks.bundleDetails.getSnapshot())[0]?.status).toBe('ready') })
@@ -342,10 +300,10 @@ describe('ui-plugin-manager browser plugin', () => {
     expect(face.detailImage('dsh-a', 'README.md', 'a.png', false)).toContain('api/plugin-manager/detail-file?bundle=dsh-a')
     expect(face.hooks.locale.getSnapshot().active).toBe('zh')
     b.remote.emit('plugin-manager/changed', [{ reason: 'bundle' }])
-    await vi.waitFor(() => { expect(b.list).toHaveBeenCalledTimes(2) })
+    await vi.waitFor(() => { expect(b.plugins.listBundles).toHaveBeenCalledTimes(2) })
     expect(face.hooks.bundleDetails.getSnapshot()).toEqual(loadedDetails)
     b.ctx.emit('connection/reset')
-    await vi.waitFor(() => { expect(b.list).toHaveBeenCalledTimes(3) })
+    await vi.waitFor(() => { expect(b.plugins.listBundles).toHaveBeenCalledTimes(3) })
 
     // Install output folds into an open run only.
     face.openInstall()
@@ -365,6 +323,6 @@ describe('ui-plugin-manager browser plugin', () => {
     expect(b.slots.entries('sidebar.panellist')).toHaveLength(0)
     b.remote.emit('plugin-manager/changed', [{ reason: 'install' }])
     await Promise.resolve()
-    expect(b.list).toHaveBeenCalledTimes(3)
+    expect(b.plugins.listBundles).toHaveBeenCalledTimes(3)
   })
 })

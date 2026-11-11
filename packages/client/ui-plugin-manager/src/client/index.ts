@@ -8,8 +8,6 @@
  */
 import type {} from '@deepseek-ai/dsh-client-product-analytics/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-// Type-only: the ctx.modules Context merge.
-import type {} from '@deepseek-ai/dsh-client-modules/client'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // Type-only: the root `main` keyed slot the page registers into, declared by
 // ui-layout with the panel id brand, and the `sidebar.panellist` list the
@@ -29,7 +27,6 @@ import { PluginManagerPage } from './PluginManagerPage.tsx'
 import { createPluginHeaderRef } from './header-scroll.ts'
 import { PluginRefreshToast, type PluginRefreshToastFace } from './PluginRefreshToast.tsx'
 import { PluginsPanelIcon } from './PluginsPanelIcon.tsx'
-import { PluginsSettingsLink, type PluginsSettingsLinkInjected } from './PluginsSettingsLink.tsx'
 import { configLedgerSource } from './config-ledger.ts'
 import { tabLedgerSource } from './tab-ledger.ts'
 import { PluginManagerController } from './manager-store.ts'
@@ -64,11 +61,11 @@ declare module '@deepseek-ai/cordis' {
 }
 
 export type { PluginManagerPageProps } from './PluginManagerPage.tsx'
-export type { ConfigLedger, OfficialItem, SettingsSectionItem } from './config-ledger.ts'
+export type { ConfigLedger, OfficialItem } from './config-ledger.ts'
 export type { PluginManagerFace } from './manager-store.ts'
 export type { PluginManagerLocaleKey } from './locales.ts'
 export type {
-  ConfigPageForm, PluginActivationOwnerProps, PluginAddActionsProps, PluginTabInstall, PluginTabProps, PluginTabUpdate,
+  ConfigPageForm, PluginActivationOwnerProps, PluginAddActionsProps, PluginTabInstall, PluginTabProps,
   PluginConfigViewProps, PluginDetailProps, PluginPackageRef, PluginRowRef, PluginsSubject,
 } from './slot-contract.ts'
 
@@ -85,8 +82,8 @@ export const NS = 'pluginManager'
 /** The id shared by the sidebar entry and the main panel it opens. */
 export const PANEL_ID = 'plugins' as MainPanelId
 
-/** Services required by the sidebar registration, the Remote methods, and access; the inventory says whether the Host manages a profile. */
-export const inject = ['slots', 'locale', 'remote', 'remote.pluginManager', 'remote.pluginInventory', 'remote.pluginRegistryProbe', 'configForms', 'layout', 'remoteAccess', 'modules']
+/** Services for sidebar registration, management Remotes, and access; the manager reports profile availability. */
+export const inject = ['slots', 'locale', 'remote', 'remote.pluginManager', 'remote.pluginRegistryProbe', 'configForms', 'layout', 'remoteAccess']
 
 /**
  * Contribute the Plugins entry to the sidebar with the management page it
@@ -137,12 +134,7 @@ export function apply(ctx: ClientContext): void {
         key: PANEL_ID,
         locale: NS,
         store,
-        inject: () => ({
-          ...face,
-          createHeaderRef: createPluginHeaderRef,
-          hooks: { ...face.hooks, clientSync: ctx.modules.entries.state },
-          retryClient: () => { void ctx.modules.entries.retry().catch((error: unknown) => { ctx.logger.error(error) }) },
-        }),
+        inject: () => ({ ...face, createHeaderRef: createPluginHeaderRef }),
         children: {
           'plugins.add.actions': { kind: 'list', scope: 'root' },
           'plugins.tab': { kind: 'list', scope: 'root' },
@@ -158,13 +150,12 @@ export function apply(ctx: ClientContext): void {
       yield ctx.layout.panelInfo.subscribe(() => {
         if (ctx.layout.panelInfo.getSnapshot().activePanelId !== PANEL_ID) instance.actions.setView({ kind: 'list' })
       })
-      const openList = (): void => {
-        ctx.layout.selectPanel(PANEL_ID)
-        instance.actions.setTab('installed')
-        instance.actions.setView({ kind: 'list' })
-      }
       const disposeNavigation = ctx.reflect.provide('pluginNavigation', {
-        openList,
+        openList: () => {
+          ctx.layout.selectPanel(PANEL_ID)
+          instance.actions.setTab('installed')
+          instance.actions.setView({ kind: 'list' })
+        },
         openBundle: (packageName: string) => {
           ctx.layout.selectPanel(PANEL_ID)
           instance.actions.setTab('installed')
@@ -172,14 +163,6 @@ export function apply(ctx: ClientContext): void {
         },
       })
       yield () => { void disposeNavigation() }
-      // Settings lists one entry that leads here.
-      yield ctx.slots.inject('settings.section', () => ctx.slots.register({
-        name: 'settings.section',
-        id: PANEL_ID,
-        order: 15,
-        label: () => t('settingsEntry'),
-        inject: (): PluginsSettingsLinkInjected => ({ openPlugins: openList }),
-      }, PluginsSettingsLink))
     })
     yield ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
       name: 'sidebar.panellist',
