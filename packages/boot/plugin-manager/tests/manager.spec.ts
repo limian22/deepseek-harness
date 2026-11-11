@@ -1850,7 +1850,7 @@ it('shares one official-target reading across all listed catalog entries', async
 
 it('walks the composed rows once however many layers the profile stacks', async () => {
   const layers = ['layer-a', 'layer-b', 'layer-c', 'layer-d', 'layer-e', 'layer-f']
-  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+  const { manager } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
     for (const name of layers) writeBundle(dir, name, [{ insert: [] }])
     const manifest = readProfileManifest('test', dir)
     manifest.dsh = { profile: { bundles: ['core', 'extra', ...layers] } }
