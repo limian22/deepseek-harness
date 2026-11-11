@@ -1576,15 +1576,20 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     persistenceBinding: PersistenceBinding,
     limit = request.limit,
   ): SearchRow[] {
-    const selected = selectedDocumentsSql()
     const sessionWhere = buildSessionWhere(request.sessionFilters)
     const eventWhere = buildEventWhere(request.eventFilters)
     assertFts5OuterPredicateCount(sessionWhere.predicateCount + eventWhere.predicateCount)
     const where = [sessionWhere.sql, eventWhere.sql].filter(Boolean).join(' AND ')
+    const selected = selectedDocumentsSql(true)
+    const filterParams = [...sessionWhere.params, ...eventWhere.params]
     const bindings = [
-      ...selectedDocumentsParams(request.query, this._persistedContentVisible(persistenceBinding)),
-      ...sessionWhere.params,
-      ...eventWhere.params,
+      ...candidateBindings(
+        true,
+        request.query,
+        this._persistedContentVisible(persistenceBinding),
+        Math.max(limit + offset + 1, SESSION_SEARCH_CANDIDATE_LIMIT),
+      ),
+      ...filterParams,
       limit + 1,
       offset,
     ]
@@ -1614,14 +1619,14 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     persistenceBinding: PersistenceBinding,
     limit = request.limit,
   ): SearchRow[] {
-    const selected = selectedDocumentsSql()
     const eventWhere = buildEventWhere(request.filters)
     assertFts5OuterPredicateCount(1 + eventWhere.predicateCount)
     const where = ['session_id = ?', eventWhere.sql].filter(Boolean).join(' AND ')
+    const selected = selectedDocumentsSql(false)
+    const filterParams = [request.sessionId, ...eventWhere.params]
     const bindings = [
-      ...selectedDocumentsParams(request.query, this._persistedContentVisible(persistenceBinding)),
-      request.sessionId,
-      ...eventWhere.params,
+      ...candidateBindings(false, request.query, this._persistedContentVisible(persistenceBinding), 0),
+      ...filterParams,
       limit + 1,
       offset,
     ]
@@ -1738,7 +1743,43 @@ function headerBindings(
   ]
 }
 
-function selectedDocumentsSql(): { sql: string } {
+/**
+ * Bound on how many FTS matches reach the highlight stage. `highlight()` is
+ * computed per matched row, so a frequent token over a large corpus otherwise
+ * costs a full scan of every match before ranking; the candidate subquery keeps
+ * that work proportional to the ask instead of the corpus.
+ */
+const SESSION_SEARCH_CANDIDATE_LIMIT = 2000
+
+function selectedDocumentsSql(bounded: boolean): { sql: string } {
+  // A corpus-wide search ranks by bm25 and picks candidates before computing
+  // `highlight()`, so a frequent token costs the asked page instead of every
+  // matching document. A single-session event search is already restricted to
+  // that session's matches, so it highlights directly.
+  const persistedBound = bounded
+    ? `
+        AND pd.rowid IN (
+          SELECT rowid
+          FROM persisted_docs
+          WHERE persisted_docs MATCH ?
+            AND ? = 1
+            AND NOT EXISTS (
+              SELECT 1 FROM temp.live_sessions AS ls2 WHERE ls2.id = persisted_docs.session_id
+            )
+          ORDER BY bm25(persisted_docs)
+          LIMIT ?
+        )`
+    : ''
+  const liveBound = bounded
+    ? `
+        AND ld.rowid IN (
+          SELECT rowid
+          FROM temp.live_docs
+          WHERE live_docs MATCH ?
+          ORDER BY bm25(live_docs)
+          LIMIT ?
+        )`
+    : ''
   return {
     sql: `WITH candidates AS (
       SELECT
@@ -1762,7 +1803,7 @@ function selectedDocumentsSql(): { sql: string } {
       JOIN persisted_sessions AS ps ON ps.id = pd.session_id
       WHERE persisted_docs MATCH ?
         AND ? = 1
-        AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = pd.session_id)
+        AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = pd.session_id)${persistedBound}
       UNION ALL
       SELECT
         ld.session_id AS session_id,
@@ -1783,7 +1824,7 @@ function selectedDocumentsSql(): { sql: string } {
         CAST(ld.codepoint_length AS INTEGER) AS document_length
       FROM temp.live_docs AS ld
       JOIN temp.live_sessions AS ls ON ls.id = ld.session_id
-      WHERE live_docs MATCH ?
+      WHERE live_docs MATCH ?${liveBound}
     ), matched AS (
       SELECT *,
         (
@@ -1795,9 +1836,33 @@ function selectedDocumentsSql(): { sql: string } {
   }
 }
 
-function selectedDocumentsParams(query: string, persistenceVisible: boolean): Array<string | number> {
+function candidateBindings(
+  bounded: boolean,
+  query: string,
+  persistenceVisible: boolean,
+  limit: number,
+): Array<string | number> {
   const expression = quoteFtsData(query)
   const visible = persistenceVisible ? 1 : 0
+  const tail = [FTS_HIGHLIGHT_START, Buffer.byteLength(FTS_HIGHLIGHT_START, 'utf8')]
+  if (bounded) {
+    return [
+      FTS_HIGHLIGHT_START,
+      FTS_HIGHLIGHT_END,
+      expression,
+      visible,
+      expression,
+      visible,
+      limit,
+      visible,
+      FTS_HIGHLIGHT_START,
+      FTS_HIGHLIGHT_END,
+      expression,
+      expression,
+      limit,
+      ...tail,
+    ]
+  }
   return [
     FTS_HIGHLIGHT_START,
     FTS_HIGHLIGHT_END,
@@ -1807,8 +1872,7 @@ function selectedDocumentsParams(query: string, persistenceVisible: boolean): Ar
     FTS_HIGHLIGHT_START,
     FTS_HIGHLIGHT_END,
     expression,
-    FTS_HIGHLIGHT_START,
-    Buffer.byteLength(FTS_HIGHLIGHT_START, 'utf8'),
+    ...tail,
   ]
 }
 
