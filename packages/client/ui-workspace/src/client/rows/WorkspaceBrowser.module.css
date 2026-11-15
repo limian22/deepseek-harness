@@ -153,6 +153,10 @@
     visibility 0s linear;
 }
 
+.headerActionsWithRetry {
+  max-width: 92px;
+}
+
 .headerActionsHidden {
   max-width: 0;
   opacity: 0;

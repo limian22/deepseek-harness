@@ -74,6 +74,27 @@ describe('SessionManager instances', () => {
     },
   )
 
+  it('loads unopened titles and plugin projections without a fixed key filter', async ({ mock, remote }) => {
+    const manager = makeManager(mock, remote)
+    onTestFinished(() => manager.dispose())
+    const values = { title: 'Cold title', agentPreset: 'standard' }
+    remote.session.list.mockImplementation(async (request) => {
+      if (!request) throw new Error('Expected session list request')
+      return ok({ items: [{
+        ...summary(S1),
+        projections: { kind: 'cached', asOfSeq: 2, values: request.projectionKeys === undefined
+          ? values : { title: values.title } },
+      }] })
+    })
+
+    await manager.refreshList()
+
+    expect(manager.getListSnapshot().items[0]).toMatchObject({
+      title: 'Cold title', projectionValues: values,
+    })
+    expect(remote.session.list).toHaveBeenCalledWith({})
+  })
+
   it('retains acceptance while an unlisted Session remains resident, then forgets it on drop', async ({ mock, remote }) => {
     const manager = makeManager(mock, remote)
     onTestFinished(() => manager.dispose())
@@ -885,8 +906,8 @@ describe('subagent catalogs', () => {
           mode: 'continuable',
         },
         activate: true, assistantStream: true,
-        maxMessages: 500,
-        turnWindow: { minMessages: 50, minTurns: 2 },
+        maxMessages: 120,
+        turnWindow: { minMessages: 20, minTurns: 1 },
       },
     ])
     expect(mock.log.requests('session/page')).toEqual([])

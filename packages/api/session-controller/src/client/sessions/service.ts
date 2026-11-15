@@ -66,6 +66,8 @@ export interface SessionListState {
   byId: Record<SessionId, SessionSummary>
   /** Arrival lifecycle projected 1:1 from the manager snapshot (see SessionListPhase): empty-with-ready means "truly no sessions". */
   phase: SessionListPhase
+  /** Loading or failed listing; absent after success. Display titles may retain the last observed label until success. */
+  refresh?: 'loading' | 'error'
   /** Shared projection values and explicit-read state, including unopened Sessions. */
   projectionsBySession: Readonly<Record<SessionId, SessionProjectionSnapshot>>
 }
@@ -646,15 +648,19 @@ export class ClientSessions implements ISessions {
   private projectList(): void {
     const previousById = this.list.getSnapshot().byId
     const {
-      items, phase, projectionsBySession,
+      items, phase, state, projectionsBySession,
     } = this.manager.getListSnapshot()
     const ids: SessionId[] = []
     const byId: Record<SessionId, SessionSummary> = {}
     for (const entry of items) {
       ids.push(entry.sessionId)
+      // A reconnect invalidates projection watermarks, not the last displayed label. Explicit new title values and a
+      // completed listing supersede the hint; it never enters projectionValues or the manager's sequence comparisons.
+      const title = entry.title ?? (state !== 'idle' && entry.projectionValues?.title === undefined
+        ? previousById[entry.sessionId]?.title : undefined)
       byId[entry.sessionId] = {
         id: entry.sessionId,
-        displayTitle: displayTitleOf(entry.title, entry.cwd, entry.sessionId),
+        displayTitle: displayTitleOf(title, entry.cwd, entry.sessionId),
         running: entry.running,
         retainedBy: this.retentionSnapshot(entry.sessionId).retainedBy,
         blank: entry.blank,
@@ -663,7 +669,7 @@ export class ClientSessions implements ISessions {
         ...(entry.projectionValues === undefined
           ? {}
           : { projectionValues: entry.projectionValues }),
-        ...(entry.title !== undefined ? { title: entry.title } : {}),
+        ...(title !== undefined ? { title } : {}),
         ...(entry.cwd !== undefined ? { cwd: entry.cwd } : {}),
         ...(entry.parentSessionId !== undefined ? { parentId: entry.parentSessionId } : {}),
         ...(entry.origin !== undefined ? { origin: entry.origin } : {}),
@@ -715,7 +721,7 @@ export class ClientSessions implements ISessions {
         ...(title === undefined ? {} : { title, displayTitle: title }),
       }
     }
-    this.list.set({ ids, byId, phase, projectionsBySession })
+    this.list.set({ ids, byId, phase, projectionsBySession, ...(state === 'idle' ? {} : { refresh: state }) })
   }
 
   private startScopeDrop(

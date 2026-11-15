@@ -198,18 +198,21 @@ export class ApiSessionList {
   /**
    * Read every visible attached and persisted Session without activating an Agent.
    * @param signal - optional cancellation for persistence reads and summary generation.
+   * @param projectionKeys - projection keys each summary must carry; omitted keeps every key.
    * @returns visible Session summaries ordered by activity.
    */
-  async list(signal?: AbortSignal): Promise<SessionSummary[]> {
+  async list(signal?: AbortSignal, projectionKeys?: readonly string[]): Promise<SessionSummary[]> {
     signal?.throwIfAborted()
     const records = await this.ctx.sessionQuery.listSessions(signal)
     signal?.throwIfAborted()
     const items: SessionSummary[] = []
     const cold: SessionRecord[] = []
+    // One service read per listing: each `ctx.sessions` access passes the Cordis traceable proxy.
+    const sessions = this.ctx.sessions
     let yieldDeadline = performance.now() + this.workSliceMs
     for (const record of records) {
       signal?.throwIfAborted()
-      const live = this.ctx.sessions.get(record.header.id)
+      const live = sessions.get(record.header.id)
       if (live !== undefined) {
         items.push(this.summaryFor(live))
       } else if (record.header.cwd !== undefined) {
@@ -236,7 +239,7 @@ export class ApiSessionList {
     // its first read by one macrotask, so first paint never waits for history.
     this.coldRecords = cold
     this.backfill?.schedule(cold)
-    return items
+    return projectionKeys === undefined ? items : items.map(item => narrowProjections(item, projectionKeys))
   }
 
   summarizeCold({ header, formatStatus }: SessionRecord): SessionSummary {
@@ -408,6 +411,24 @@ function hintsOf(
   // Listing hints contain every summary wire value the source holds; cached
   // hints remain partial because missing cache rows are never folded here.
   return { kind, asOfSeq: block.asOfSeq, values: block.values }
+}
+
+/**
+ * Restrict one summary's projection values to the keys the caller renders.
+ * @param summary - built summary whose block may carry every registered key.
+ * @param projectionKeys - requested keys; unknown keys are skipped.
+ * @returns the summary with a narrowed block, or the summary itself when it has no block.
+ */
+function narrowProjections(summary: SessionSummary, projectionKeys: readonly string[]): SessionSummary {
+  const projections = summary.projections
+  if (projections === undefined) return summary
+  const requested = new Set(projectionKeys)
+  const values: SessionProjectionHints['values'] = {}
+  for (const [key, value] of Object.entries(projections.values)) {
+    if (!requested.has(key)) continue
+    Object.assign(values, { [key]: value })
+  }
+  return { ...summary, projections: { ...projections, values } }
 }
 
 function normalizeSearchQuery(query: string): string {

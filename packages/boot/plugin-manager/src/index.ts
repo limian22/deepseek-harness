@@ -1,6 +1,6 @@
 /** Current-profile plugin and bundle management over shared dsh plugin operations. */
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -270,6 +270,33 @@ function bundleSelection(manifest: ProfileManifest): readonly string[] {
   return manifest.dsh?.profile?.bundles ?? []
 }
 
+/** How many listing units one synchronous chunk reads before the loop yields to the event loop. */
+const LISTING_CHUNK = 4
+
+/** Let queued I/O callbacks and other requests run before the next listing chunk. */
+const yieldTurn = (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+
+/** Identity of a profile file, or `absent`; a listing compares these instead of trusting one long read. */
+function fileIdentity(file: string): string {
+  try {
+    const stats = statSync(file)
+    return `${String(stats.mtimeMs)}:${String(stats.size)}`
+  } catch (_error) {
+    // A file the listing expected can disappear between the read and the check; that is drift too.
+    return 'absent'
+  }
+}
+
+/** The profile layer files one listing's answer depends on: selection, dependencies, and the patch layers. */
+function profileGeneration(profile: Pick<ProfileContext, 'dir' | 'patchPath' | 'home' | 'installAnchor'>): string {
+  return [
+    join(profile.dir, 'package.json'),
+    profile.patchPath,
+    join(profile.home, PROFILE_PATCH_FILENAME),
+    profile.installAnchor,
+  ].map(file => `${file}=${fileIdentity(file)}`).join('\n')
+}
+
 /**
  * Bundle facts one listing or one selection reads: each package's manifest, directory, patches, and display metadata at
  * most once. A caller keeps it in a local variable, so a later call reads the profile again and nothing here outlives the
@@ -280,6 +307,8 @@ class BundleFacts {
   private readonly directories = new Map<string, string>()
   private readonly patches = new Map<string, PatchOptions[]>()
   private readonly metas = new Map<string, ReturnType<typeof readPluginMeta>>()
+  /** Identity of each bundle file this listing read, taken right after reading it. */
+  private readonly observed = new Map<string, string>()
 
   constructor(private readonly profile: Pick<ProfileContext, 'dir' | 'installAnchor'>) {}
 
@@ -287,6 +316,19 @@ class BundleFacts {
   manifest(name: string): ProfileManifest | undefined {
     if (!this.manifests.has(name)) this.manifests.set(name, bundleManifest(name, this.profile.dir, this.profile.installAnchor))
     return this.manifests.get(name)
+  }
+
+  /**
+   * Bundle files whose content changed since this listing read them, so its answer would mix two moments.
+   * @returns The drifted file paths, empty when every observed file still matches.
+   */
+  drift(): string[] {
+    return [...this.observed].filter(([file, identity]) => fileIdentity(file) !== identity).map(([file]) => file)
+  }
+
+  /** Remember one file's identity as of the read that consumed it. */
+  private observe(file: string): void {
+    this.observed.set(file, fileIdentity(file))
   }
 
   /** The bundle package's directory. */
@@ -303,10 +345,12 @@ class BundleFacts {
     const cached = this.patches.get(name)
     if (cached !== undefined) return cached
     const info = this.manifest(name)
-    const patches = info?.dsh?.bundle === undefined
-      ? []
-      : bundlePatchPaths(this.directory(name), info.dsh.bundle).flatMap(file => loadOverlayPatches('dsh', file))
+    const files = info?.dsh?.bundle === undefined ? [] : bundlePatchPaths(this.directory(name), info.dsh.bundle)
+    const patches = files.flatMap(file => loadOverlayPatches('dsh', file))
     this.patches.set(name, patches)
+    // The manifest and every patch file this listing consumed: a later change means the answer spans two moments.
+    this.observe(join(this.directory(name), 'package.json'))
+    for (const file of files) this.observe(file)
     return patches
   }
 
@@ -592,12 +636,29 @@ export class PluginManager extends TypertRemoteService {
    * providing bundle names in `providedBy`; `enabled` stays the saved selection, not successful activation.
    */
   @Remote
-  listBundles(): Promise<BundleInfo[]> {
-    return Promise.resolve(this.readBundles().map(bundle => ({ ...bundle, updatable: typeof updateRefusal(bundle, bundle.name) !== 'string' })))
+  async listBundles(): Promise<BundleInfo[]> {
+    const bundles = await this.readBundles()
+    return bundles.map(bundle => ({ ...bundle, updatable: typeof updateRefusal(bundle, bundle.name) !== 'string' }))
   }
 
-  /** The bundle inventory before update eligibility, which is derived from each listed bundle. */
-  private readBundles(): Omit<BundleInfo, 'updatable'>[] {
+  /**
+   * The bundle inventory before update eligibility, which is derived from each listed bundle.
+   * Chunks yield to the event loop, so a concurrent profile write can land in the middle of a listing. A generation
+   * fingerprint is taken around the work, plus the identity of every bundle file read, and a changed profile or file
+   * repeats the listing once: the answer then describes one moment instead of mixing two.
+   */
+  private async readBundles(): Promise<Omit<BundleInfo, 'updatable'>[]> {
+    const generation = profileGeneration(this.profile)
+    const facts = new BundleFacts(this.profile)
+    const bundles = await this.readBundleListing(facts)
+    if (generation === profileGeneration(this.profile) && facts.drift().length === 0) return bundles
+    // One more pass describes the profile as it stands now; a profile still being rewritten by another process is
+    // reported as read, because a listing never waits on a writer it does not own.
+    return this.readBundleListing(new BundleFacts(this.profile))
+  }
+
+  /** One listing pass, sharing its bundle facts with the composition it derives. */
+  private async readBundleListing(facts: BundleFacts): Promise<Omit<BundleInfo, 'updatable'>[]> {
     const manifest = readProfileManifest('dsh', this.profile.dir)
     const exemptions = readProfileVersionExemptions(this.profile.dir)
     const selected = bundleSelection(manifest)
@@ -607,12 +668,12 @@ export class PluginManager extends TypertRemoteService {
     const catalog = new Map(OFFICIAL_ON_DEMAND_CATALOG.map(entry => [entry.packageName, entry]))
     const names = [...new Set([...selected, ...dependencies, ...Object.keys(installation.dependencies ?? {}), ...catalog.keys()])]
     const bundles: Omit<BundleInfo, 'updatable'>[] = []
-    const facts = new BundleFacts(this.profile)
-    const composition = this.composition(facts)
+    const composition = await this.composition(facts)
     const repeated = repeatedRowIds(composition.rows)
     const runtimeVersion = getDshRuntimeVersion()
     const officialTargets = officialBundleInstallTargets(this.profile.installAnchor, runtimeVersion)
-    for (const name of names) {
+    for (const [index, name] of names.entries()) {
+      if (index > 0 && index % LISTING_CHUNK === 0) await yieldTurn()
       const installed = dependencies.includes(name)
       const optional = OPTIONAL_BUNDLES.includes(name)
       const enabled = selected.includes(name)
@@ -1215,7 +1276,7 @@ export class PluginManager extends TypertRemoteService {
    * @returns The composed rows with the bundles' and the trailing patches, each layer's surviving rows, and every id the
    *   composition holds.
    */
-  private composition(facts: BundleFacts = new BundleFacts(this.profile)): Composition {
+  private async composition(facts: BundleFacts = new BundleFacts(this.profile)): Promise<Composition> {
     const manifest = readProfileManifest('dsh', this.profile.dir)
     const exemptions = readProfileVersionExemptions(this.profile.dir)
     const sources: { label: string; base: string; bundle: boolean; self?: LayerPackage; patches: PatchOptions[] }[] = []
@@ -1234,6 +1295,8 @@ export class PluginManager extends TypertRemoteService {
           label: name, base: pathToFileURL(join(dir, 'package.json')).href, bundle: true,
           self: { name: info.name ?? name, dir }, patches: facts.patchList(name),
         })
+        // A selected bundle is one read chunk: the manifest, directory, and patches above stay one observation.
+        await yieldTurn()
       } catch (_error) {
         // A selected bundle the launcher skips contributes no layer and mounts no row.
         continue
@@ -1261,11 +1324,13 @@ export class PluginManager extends TypertRemoteService {
         owners.set(rowIdentity(row), { layer: index, row })
         groups.set(row.rowId, row.group)
       }
+      if (index > 0 && index % LISTING_CHUNK === 0) await yieldTurn()
     }
     const inserted = insertedRows(rows, () => '')
     const held = new Set(inserted.map(rowIdentity))
     const kept: CompositionLayer[] = sources.map(source => ({ layer: source.label, bundle: source.bundle, rows: [] }))
     const keyed: ((row: EntryOptions) => string)[] = []
+    let resolved = 0
     for (const [identity, owner] of owners) {
       if (!held.has(identity)) continue
       const layer = sources[owner.layer]
@@ -1273,8 +1338,9 @@ export class PluginManager extends TypertRemoteService {
       if (layer === undefined) continue
       const keyOf = keyed[owner.layer] ??= this.moduleKeys(layer.base, layer.self)
       kept[owner.layer]?.rows.push({ ...owner.row, moduleKey: keyOf({ id: owner.row.rowId, name: owner.row.specifier }) })
-    }
-    return {
+      // Module identities resolve through the filesystem; a large profile yields so requests are not held.
+      if (++resolved % LISTING_CHUNK === 0) await yieldTurn()
+    }    return {
       bundlePatches: sources.filter(source => source.bundle).flatMap(source => source.patches),
       trailingPatches: sources.filter(source => !source.bundle).flatMap(source => source.patches),
       rows,
@@ -1438,7 +1504,7 @@ export class PluginManager extends TypertRemoteService {
           this.bundleRows(name)
         } else {
           const facts = new BundleFacts(this.profile)
-          const composition = this.composition(facts)
+          const composition = await this.composition(facts)
           const collisions = collidingRows(this.selectionRows(name, composition, facts), composition.layers, name)
           if (collisions.length > 0) throw new ManagementFailure('duplicate-entry', undefined, duplicateEntryDiagnostic(collisions))
         }

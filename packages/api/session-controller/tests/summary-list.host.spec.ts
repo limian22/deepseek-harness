@@ -131,8 +131,24 @@ describe('session.list summary payload', () => {
     expect(snapshot.projections.values.imageLimits).toEqual(ctx.attachments.imageLimits)
   })
 
-  it('drops the excluded units from the list while a Session is still attached', async () => {
+  it('narrows every row to the projection keys the caller renders', async () => {
     const { ctx } = await harness()
+    const { id } = seedSession(ctx)
+    const everyWireKey = Object.keys(ctx.sessionProjections.snapshot(ctx.sessions.get(id)!).values)
+
+    const response = await (await remote(ctx)).list({ projectionKeys: ['sessionListMetadata'] })
+    if (!response.ok) throw new Error('unreachable')
+    const row = response.value.items.find(item => item.sessionId === id)
+    expect(Object.keys(row?.projections?.values ?? {})).toEqual(['sessionListMetadata'])
+    expect(row?.projections?.values.sessionListMetadata).toMatchObject({ blank: false })
+    // The same listing without keys serves every wire key, so narrowing removed something.
+    expect(everyWireKey.length).toBeGreaterThan(1)
+    // The row skeleton is untouched by narrowing.
+    expect(row?.running).toBe(false)
+    expect(row?.cwd).toBe('/workspace')
+  })
+
+  it('drops the excluded units from the list while a Session is still attached', async () => {    const { ctx } = await harness()
     const { id } = seedSession(ctx)
     // Two consecutive pulls: a refresh must not reintroduce a dropped unit.
     for (const attempt of [0, 1]) {

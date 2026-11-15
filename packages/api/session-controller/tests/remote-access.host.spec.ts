@@ -188,7 +188,7 @@ describe('Session Controller access', () => {
     await ctx.plugin(TypertGatewayService)
     const held = guestPolicy(ctx, LIST_CALLS, READS_SHARED)
     const rows = async (): Promise<SessionId[]> => {
-      const value = await guestCall(ctx, 'list', { _request: {} }) as { readonly items: readonly { readonly sessionId: SessionId }[] }
+      const value = await guestCall(ctx, 'list', {}) as { readonly items: readonly { readonly sessionId: SessionId }[] }
       return value.items.map(item => item.sessionId)
     }
     await expect(rows()).resolves.toEqual([SHARED])

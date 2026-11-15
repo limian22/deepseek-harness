@@ -18,6 +18,7 @@ import { createServer as createSecureServer } from 'node:https'
 import { isIP, type AddressInfo } from 'node:net'
 import { resolve } from 'node:path'
 import type { Duplex } from 'node:stream'
+import { constants } from 'node:zlib'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol'
@@ -190,21 +191,29 @@ export interface Config {
    * over plain HTTP.
    */
   tls?: TlsConfig
-  /** Response compression for socket-backed HTTP requests. @default 'none' */
+  /** Response compression for socket-backed HTTP requests: a client that offers Brotli receives Brotli, and one that
+   * offers only gzip receives gzip. @default 'none' */
   compression?: 'none' | 'gzip'
-  /** Gzip DEFLATE level from 0 through 9. @default 1 */
+  /** Gzip DEFLATE level from 0 through 9. @default 6 */
   compressionLevel?: number
-  /** Minimum known response length eligible for gzip; unknown-length streams are eligible. @default 1024 */
+  /** Brotli quality from 0 through 11; higher compresses better and costs more CPU. @default 5 */
+  brotliQuality?: number
+  /** Minimum known response length eligible for compression; unknown-length streams are eligible. @default 1024 */
   compressionThresholdBytes?: number
 }
 
 const DEFAULT_COMPRESSION = 'none' as const
-const DEFAULT_COMPRESSION_LEVEL = 1
+const DEFAULT_COMPRESSION_LEVEL = 6
+const DEFAULT_BROTLI_QUALITY = 5
 const DEFAULT_COMPRESSION_THRESHOLD_BYTES = 1024
+
+/** Encodings offered to a client in preference order; `compression` answers with the first it shares. */
+const COMPRESSION_ENCODINGS = ['br', 'gzip', 'identity'] as const
 
 interface ResolvedConfig extends Config {
   compression: 'none' | 'gzip'
   compressionLevel: number
+  brotliQuality: number
   compressionThresholdBytes: number
 }
 
@@ -316,6 +325,7 @@ function createGzipMiddleware(config: ResolvedConfig): NodeMiddleware {
   const middleware = compressionMiddleware({
     level: config.compressionLevel,
     threshold: config.compressionThresholdBytes,
+    brotli: { params: { [constants.BROTLI_PARAM_QUALITY]: config.brotliQuality } },
     filter(request, response) {
       if (response.getHeader('content-range') !== undefined) return false
       const contentType = response.getHeader('content-type')
@@ -331,12 +341,14 @@ function createGzipMiddleware(config: ResolvedConfig): NodeMiddleware {
       next()
       return
     }
-    const encoding = new Negotiator(req).encoding(['gzip', 'identity'])
-    const gzipRequest = Object.create(req) as IncomingMessage
-    Object.defineProperty(gzipRequest, 'headers', {
-      value: { ...req.headers, 'accept-encoding': encoding === 'gzip' ? 'gzip' : 'identity' },
+    // `compression` picks the encoding itself; it must see the one chosen here so the negotiated `Vary` and the
+    // stream it builds agree on Brotli before gzip.
+    const encoding = new Negotiator(req).encoding([...COMPRESSION_ENCODINGS])
+    const compressionRequest = Object.create(req) as IncomingMessage
+    Object.defineProperty(compressionRequest, 'headers', {
+      value: { ...req.headers, 'accept-encoding': encoding ?? 'identity' },
     })
-    middleware(gzipRequest, res, next)
+    middleware(compressionRequest, res, next)
   }
 }
 
@@ -447,6 +459,7 @@ export class WebServer extends Service {
     }).default(undefined as never),
     compression: z.union([z.const('none'), z.const('gzip')]).default(DEFAULT_COMPRESSION),
     compressionLevel: z.number().step(1).min(0).max(9).default(DEFAULT_COMPRESSION_LEVEL),
+    brotliQuality: z.number().step(1).min(0).max(11).default(DEFAULT_BROTLI_QUALITY),
     compressionThresholdBytes: z.natural().default(DEFAULT_COMPRESSION_THRESHOLD_BYTES),
   })
 

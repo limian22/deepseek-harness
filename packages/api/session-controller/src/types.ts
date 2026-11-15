@@ -238,6 +238,11 @@ export interface SkillListValue {
 /** Session list request. */
 export interface SessionListRequest {
   readonly cursor?: string
+  /**
+   * Projection keys every summary carries. Omitted sends every registered key; an empty list sends none. Callers
+   * that render a fixed set of row fields should name them, because projection values dominate the listing payload.
+   */
+  readonly projectionKeys?: readonly string[]
 }
 
 /** Session list response value. */

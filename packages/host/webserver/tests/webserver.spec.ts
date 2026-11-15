@@ -605,12 +605,13 @@ describe('real Loader composition', () => {
   })
 
 
-  it('applies gzip only to eligible socket-backed HTTP responses', { timeout: 60_000 }, async () => {
+  it('applies gzip or brotli only to eligible socket-backed HTTP responses', { timeout: 60_000 }, async () => {
     expect(HttpServer.Config({ host: '127.0.0.1', port: 0 })).toEqual({
       host: '127.0.0.1',
       port: 0,
       compression: 'none',
-      compressionLevel: 1,
+      compressionLevel: 6,
+      brotliQuality: 5,
       compressionThresholdBytes: 1024,
     })
     expect(() => HttpServer.Config({
@@ -675,9 +676,13 @@ describe('real Loader composition', () => {
 
     const compressed = await request(server.port, '/text', { headers: { 'accept-encoding': 'br, gzip, deflate' } })
     expect(compressed).toMatchObject({ status: 200, body: body.slice(0, 80) })
-    expect(compressed.headers.get('content-encoding')).toBe('gzip')
+    expect(compressed.headers.get('content-encoding')).toBe('br')
     expect(compressed.headers.get('content-length')).toBeNull()
     expect(compressed.headers.get('vary')).toBe('Accept-Encoding')
+    // A client that offers no Brotli still gets the historical gzip answer.
+    const gzipOnly = await request(server.port, '/text', { headers: { 'accept-encoding': 'gzip, deflate' } })
+    expect(gzipOnly).toMatchObject({ status: 200, body: body.slice(0, 80) })
+    expect(gzipOnly.headers.get('content-encoding')).toBe('gzip')
     const streamed = await request(server.port, '/stream', { headers: { 'accept-encoding': 'gzip' } })
     expect(streamed).toMatchObject({ body: body.slice(0, 80) })
     expect(streamed.headers.get('content-encoding')).toBe('gzip')
@@ -1163,7 +1168,8 @@ describe('real Loader composition', () => {
       port: 0,
       tls,
       compression: 'none',
-      compressionLevel: 1,
+      compressionLevel: 6,
+      brotliQuality: 5,
       compressionThresholdBytes: 1024,
     })
 

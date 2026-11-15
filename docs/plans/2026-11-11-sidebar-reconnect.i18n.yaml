@@ -1,0 +1,22 @@
+# Bilingual-pair consistency record for 2026-11-11-sidebar-reconnect.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/plans/2026-11-11-sidebar-reconnect.md
+/sidebar-reconnect-implementation-plan:
+  en: 7575a21c6d036202
+  zh: 491815040f34f2fe
+/sidebar-reconnect-implementation-plan/confirmed-behavior:
+  en: 49d2d85522dac7fd
+  zh: 68e0e711bddc54a2
+/sidebar-reconnect-implementation-plan/task-1-display-adapter-regression:
+  en: 950b437ccd2d954e
+  zh: a2cbd92df66c5909
+/sidebar-reconnect-implementation-plan/task-2-workspace-feedback:
+  en: b90e1df3baf4363d
+  zh: 5f59ac78751ac973
+/sidebar-reconnect-implementation-plan/task-3-verification:
+  en: 55b12b68bc6dc0b0
+  zh: f6e002f0a6ce2d21
+/sidebar-reconnect-implementation-plan/execution-receipt:
+  en: a6cd60dc1cced087
+  zh: 1397cc435ade8395

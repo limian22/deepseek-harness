@@ -1832,7 +1832,7 @@ export interface Config {
 
 ## `@deepseek-ai/dsh-host-webserver`
 
-- `source`: [`packages/host/webserver/src/index.ts:97`](../packages/host/webserver/src/index.ts)
+- `source`: [`packages/host/webserver/src/index.ts:98`](../packages/host/webserver/src/index.ts)
 
 ```ts config-catalog
 /** Web server listen, TLS, and response-compression config. */
@@ -1858,11 +1858,14 @@ export interface Config {
    * over plain HTTP.
    */
   tls?: TlsConfig
-  /** Response compression for socket-backed HTTP requests. @default 'none' */
+  /** Response compression for socket-backed HTTP requests: a client that offers Brotli receives Brotli, and one that
+   * offers only gzip receives gzip. @default 'none' */
   compression?: 'none' | 'gzip'
-  /** Gzip DEFLATE level from 0 through 9. @default 1 */
+  /** Gzip DEFLATE level from 0 through 9. @default 6 */
   compressionLevel?: number
-  /** Minimum known response length eligible for gzip; unknown-length streams are eligible. @default 1024 */
+  /** Brotli quality from 0 through 11; higher compresses better and costs more CPU. @default 5 */
+  brotliQuality?: number
+  /** Minimum known response length eligible for compression; unknown-length streams are eligible. @default 1024 */
   compressionThresholdBytes?: number
 }
 
@@ -2703,7 +2706,7 @@ export interface PlanModeConfig {
 
 - `inject`: `loader` · `profileContext`
 - `refs`: [`NpmFileSource`](subsystems/boot.md)
-- `source`: [`packages/boot/plugin-manager/src/index.ts:54`](../packages/boot/plugin-manager/src/index.ts)
+- `source`: [`packages/boot/plugin-manager/src/index.ts:58`](../packages/boot/plugin-manager/src/index.ts)
 
 ```ts config-catalog
 /** The pnpm executable, registries, and limits for diagnostics, lookups and connection checks. */
