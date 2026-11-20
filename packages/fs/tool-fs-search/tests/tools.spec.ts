@@ -608,6 +608,17 @@ describe('exit semantics and failure classification', () => {
     expect(text(result)).toContain('IO error')
   })
 
+  it.each([
+    'rg: root: IO error for operation on root: Permission denied (os error 5)',
+    'rg: root/child: IO error for operation on root/child: No such file or directory (os error 2)',
+  ])('preserves generic failures when stderr does not identify a missing root: %s', async (stderr) => {
+    const { ctx, subprocess } = await setup()
+    subprocess.handler = () => runResult('', { exitCode: 2, stderr: { text: stderr } })
+    const result = await call(ctx, 'grep', { pattern: 'x', path: 'root' })
+    expect(result.error).toMatchObject({ info: { code: 'SEARCH_FAILED' } })
+    expect(text(result)).toContain(stderr)
+  })
+
   it('a nonzero exit with EMPTY stderr still reports the exit code', async () => {
     const { ctx, subprocess } = await setup()
     subprocess.handler = () => runResult('', { exitCode: 3 })

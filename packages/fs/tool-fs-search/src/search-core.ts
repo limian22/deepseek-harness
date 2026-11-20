@@ -19,10 +19,9 @@
  * @module @deepseek-ai/dsh-tool-fs-search/search-core
  */
 
-import { isAbsolute, relative, sep } from 'node:path'
+import { existsSync } from 'node:fs'
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import { spawnRipgrep } from '@deepseek-ai/dsh-util-ripgrep'
-export { resolveRgPath } from '@deepseek-ai/dsh-util-ripgrep'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import { ItemRetainer, TextRetainer } from '@deepseek-ai/dsh-output-retention'
 import type { RetainedItems } from '@deepseek-ai/dsh-output-retention'
@@ -69,7 +68,8 @@ export const SEARCH_META_MAX_BYTES = 65_536
  * Stable, machine-routable codes for search failures. Package-owned (not
  * `FsErrorCode`) because these tools are spawn-backed discovery, not `ctx.fs`
  * provider operations: `SEARCH_INVALID_PATTERN` — ripgrep rejected the regex or
- * glob; `SEARCH_FAILED` — the search could not run or its output could not be
+ * glob; `SEARCH_PATH_NOT_FOUND` — ripgrep could not find the explicit search
+ * target; `SEARCH_FAILED` — the search could not run or its output could not be
  * parsed (a failed `rg` launch, inaccessible target, signal kill, malformed
  * `--json`); `SEARCH_RAW_OUTPUT_OVERFLOW` — raw `rg` output exceeded
  * `rawOutputMaxBytes` or stayed truncated after that requested stdout budget;
@@ -78,6 +78,7 @@ export const SEARCH_META_MAX_BYTES = 65_536
  */
 export type SearchErrorCode =
   | 'SEARCH_INVALID_PATTERN'
+  | 'SEARCH_PATH_NOT_FOUND'
   | 'SEARCH_FAILED'
   | 'SEARCH_RAW_OUTPUT_OVERFLOW'
   | 'SEARCH_ABORTED'
@@ -122,8 +123,25 @@ function stderrExcerpt(stderrText: string, truncated: boolean): string {
  * no shell layer, so an exit 127 or shell "command not found" text cannot
  * occur — a launch failure rejects at spawn (see {@link runRipgrep}).
  */
-function classifyRunFailure(toolName: string, exitCode: number, stderrText: string, stderrTruncated: boolean): SearchError {
+function classifyRunFailure(
+  toolName: string,
+  exitCode: number,
+  stderrText: string,
+  stderrTruncated: boolean,
+  workdir: string,
+  target: string | undefined,
+): SearchError {
   const stderr = stderrExcerpt(stderrText, stderrTruncated)
+  if (target !== undefined && exitCode === 2) {
+    const prefix = `rg: ${target}: IO error for operation on ${target}: `
+    // Match the explicit root and numeric OS codes. The OS message can be localized.
+    if (stderr.startsWith(prefix) && /^[^\r\n]*\(os error (2|3|20)\)$/.test(stderr.slice(prefix.length))) {
+      return new SearchError(
+        `${toolName} search path not found: ${resolve(workdir, target)}. Verify the path and retry.`,
+        'SEARCH_PATH_NOT_FOUND',
+      )
+    }
+  }
   if (/regex parse error|error parsing glob/i.test(stderr)) {
     return new SearchError(`${toolName} pattern rejected by ripgrep: ${stderr}`, 'SEARCH_INVALID_PATTERN')
   }
@@ -153,6 +171,35 @@ function completeStdout(toolName: string, stdout: SubprocessOutputRead, rawOutpu
     `${toolName} produced more raw output than the subprocess seam retained within the ${rawOutputMaxBytes}-byte cap; ${narrow}`,
     'SEARCH_RAW_OUTPUT_OVERFLOW',
   )
+}
+
+let rgPathPromise: Promise<string> | undefined
+
+/**
+ * The packaged ripgrep binary path, resolved lazily once per process.
+ *
+ * A single-file runtime uses the executable's `-rg` sidecar because a native
+ * helper cannot be spawned from pkg's virtual filesystem. Node-mode builds
+ * fall back to the platform package selected by `@vscode/ripgrep`. Resolving
+ * at the call boundary keeps a missing or corrupt binary at the first search
+ * call as `SEARCH_FAILED`, rather than failing the Loader composition.
+ *
+ * @returns the packaged binary's absolute path; the memoized promise rejects
+ *   when the platform package cannot be resolved.
+ */
+export function resolveRgPath(): Promise<string> {
+  rgPathPromise ??= Promise.resolve().then(async () => {
+    const executable = parse(process.execPath)
+    const executableSidecar = process.platform === 'win32'
+      ? join(executable.dir, `${executable.name}-rg.exe`)
+      : `${process.execPath}-rg`
+    if ('pkg' in process && existsSync(executableSidecar)) return executableSidecar
+    const dependency = (await import('@vscode/ripgrep')).rgPath
+    return process.versions.electron === undefined
+      ? dependency
+      : dependency.replace(/\.asar(?=[\\/])/u, '.asar.unpacked')
+  })
+  return rgPathPromise
 }
 
 /**
@@ -189,6 +236,7 @@ function completeStdout(toolName: string, stdout: SubprocessOutputRead, rawOutpu
  * @param rawOutputMaxBytes - cap on the complete raw stdout the tool will parse.
  * @param graceMs - the seam's terminate-escalation grace period.
  * @param stderrMaxBytes - cap on the retained stderr diagnostic tail.
+ * @param target - explicit search path for root failure diagnostics.
  * @returns the complete stdout, the zero-result flag, and the resolved workdir.
  */
 export async function runRipgrep(
@@ -199,6 +247,7 @@ export async function runRipgrep(
   rawOutputMaxBytes: number,
   graceMs: number,
   stderrMaxBytes: number,
+  target?: string,
 ): Promise<RipgrepRun> {
   if (exec.signal.aborted) {
     throw new SearchError(`${toolName} was aborted before completion (tool timeout or caller cancellation)`, 'SEARCH_ABORTED')
@@ -208,8 +257,8 @@ export async function runRipgrep(
     : await ctx.workingDirectory.ensure(exec.agent, exec.signal)
   let handle: SubprocessHandle
   try {
-    handle = await spawnRipgrep(ctx.subprocess, {
-      argv,
+    handle = ctx.subprocess.spawn({
+      argv: [await resolveRgPath(), '--no-config', ...argv],
       cwd: workdir,
       stdio: {
         stdin: 'ignore',
@@ -252,7 +301,7 @@ export async function runRipgrep(
     throw new SearchError(`${toolName} search command was killed by signal ${outcome.signal ?? '(unknown)'}`, 'SEARCH_FAILED')
   }
   if (outcome.exitCode !== 0 && outcome.exitCode !== 1) {
-    throw classifyRunFailure(toolName, outcome.exitCode, stderr.text, stderr.lossy)
+    throw classifyRunFailure(toolName, outcome.exitCode, stderr.text, stderr.lossy, workdir, target)
   }
   const text = completeStdout(toolName, stdout, rawOutputMaxBytes)
   return { stdout: text, noMatches: outcome.exitCode === 1, workdir }
