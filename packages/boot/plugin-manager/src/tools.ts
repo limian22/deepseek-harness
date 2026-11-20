@@ -85,9 +85,9 @@ export const inject = ['tools', 'pluginManager', 'sandboxPolicy']
 export function apply(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'plugin_manager',
-    description: 'List plugins or bundles in the current profile, enable or disable them, install a bundle, or remove an installed bundle. Every action requires danger-full-access permission or approval for this call. Approval does not change the session permission mode. Changes affect every session in this profile. List first to obtain exact identifiers. Package installation can execute allowed build scripts. Live profiles apply changes immediately, including upgrades of installed packages; a change result that is not applied carries nextStep, which says what to do or tell the user. Unmet DSH version requirements (engines.dsh, else DSH peer dependencies) block installation and activation. Version exemptions risk crashes and data loss: warn the user and obtain explicit permission for the exact plugin and runtime versions before granting one.',
+    description: 'Inspect or manage the current profile. For current state, use list_plugins for runtime entries, list_bundles for bundle inventory, or check_profile_dependency to check an exact package name in the current manifest. Do not infer current configuration from recursive searches of profile directories or backups. Every action requires danger-full-access permission or approval for this call. Approval does not change the session permission mode. Changes affect every session in this profile. List first to obtain exact identifiers. Package installation can execute allowed build scripts. Live profiles apply changes immediately, including upgrades of installed packages; a change result that is not applied carries nextStep, which says what to do or tell the user. Unmet DSH version requirements (engines.dsh, else DSH peer dependencies) block installation and activation. Version exemptions risk crashes and data loss: warn the user and obtain explicit permission for the exact plugin and runtime versions before granting one.',
     parameters: {
-      action: { type: 'string', required: true, enum: ['list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'list_version_exemptions', 'set_version_exemption'], description: 'Management operation.' },
+      action: { type: 'string', required: true, enum: ['list_plugins', 'list_bundles', 'check_profile_dependency', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'list_version_exemptions', 'set_version_exemption'], description: 'Management operation.' },
       target: { type: 'string', description: 'Plugin entry id, bundle package name, or installation spec, according to action. For an Official catalog entry, pass list_bundles installTarget.spec to install_bundle.' },
       enabled: { type: 'boolean', description: 'Required for set operations; defaults to true for installation. For set_version_exemption, true grants and false revokes.' },
       runtimeVersion: { type: 'string', description: 'For set_version_exemption: exact DSH version from list_version_exemptions. Target must be the manifest package-name@version, not an alias or version range.' },
@@ -111,6 +111,13 @@ export function apply(ctx: Context): void {
       exec.signal.throwIfAborted()
       const manager = ctx.pluginManager
       switch (args.action) {
+        case 'check_profile_dependency': {
+          const name = args.target
+          if (name === undefined || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(name)) {
+            throw new Error('target must be an exact package name')
+          }
+          return JSON.stringify({ source: 'current-profile-manifest', name, declared: manager.hasProfileDependency(name) })
+        }
         case 'list_version_exemptions':
           return JSON.stringify({ runtimeVersion: getDshRuntimeVersion(), ...manager.listVersionExemptions() })
         case 'set_version_exemption':
@@ -158,6 +165,9 @@ export function apply(ctx: Context): void {
         default: return assertNever(args.action)
       }
     },
-    presentCall: args => ({ card: 'generic', title: 'Manage profile plugins', kind: args.action.startsWith('list_') ? 'read' : 'other', rawInput: args }),
+    presentCall: args => ({
+      card: 'generic', title: 'Manage profile plugins', rawInput: args,
+      kind: args.action.startsWith('list_') || args.action === 'check_profile_dependency' ? 'read' : 'other',
+    }),
   }))
 }
