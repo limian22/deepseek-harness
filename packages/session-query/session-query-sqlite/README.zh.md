@@ -72,6 +72,8 @@ kind: "package-reference"
 
 启用 `syncMode: background` 后，搜索从不等待持久化列举或冷日志读取。它从当前派生索引作答，并请求实例自有的后台任务对账来源；该任务在服务活动期间每 `syncIntervalMs` 也对账一次，并合并重叠请求。已校验会话按有界批次提交（`syncBatchSessions`，每批一个事务、一个世代步进），派生索引使用 `synchronous = NORMAL`（可重建），从而把提交开销移出每会话路径；中断的批次在下一轮重新读取。来源修订已变化的世代在其通过校验的替代内容提交前保持隐藏；只有在完整的成功列举未包含某会话后才删除它。使用 `openAt: first-search` 时，后台同步从首次搜索开始，而不是在激活时开始。
 
+搜索在返回前刷新实时会话索引。对于已有索引的实时会话，刷新会保留事件展示状态未变的 FTS 行，只写入新增文档和已变化的展示状态。新接入的实时会话仍需首次建索引。
+
 每个后台页面都携带 `coverage`，按请求的全部会话谓词计算：在索引针对当前来源校验完成前 `state` 为 `initializing`；扫描运行或有已列举会话等待读取时为 `syncing`；出现隔离的来源失败后为 `degraded`；可枚举语料库完成索引后为 `ready`。`checkedAt` 是最后一次成功的完整观察。`indexedSessions`、`pendingSessions` 与 `failedSessions` 是限定在请求过滤器内的计数，绝不包含请求过滤之外的会话。在列举尚未建立范围之前省略计数；经过验证的计数包含可搜索的仅实时会话，且不会重复计算其持久化基库。捕获分页保留第一页的 coverage，因此续页绝不会报告比其捕获更新的状态；`on-search` 页面不携带 coverage。
 
 重新打开持久索引时，持久命中会保持隐藏，直到一次完整列举校验当前来源元数据，因此被替换的来源绝不会提供前一个存储的行；如果该校验无法完成，状态保持 `initializing`，而不是虚假的 `ready`。对仍处于 pending 世代的已列举来源做会话内搜索时，返回该会话的 header、空页面以及 `syncing` 或 `degraded` 的 coverage 状态，而不是 `SESSION_QUERY_SESSION_NOT_FOUND`；只有来源从未列举过的 id 才以该错误失败。
