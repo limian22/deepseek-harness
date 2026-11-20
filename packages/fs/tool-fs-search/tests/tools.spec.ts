@@ -291,10 +291,10 @@ describe('registration', () => {
     expect(ctx.tools.get('grep')?.timeoutMs).toBe(30_000)
   })
 
-  it('describes the modification-time head when over-cap sampling is disabled', async () => {
+  it('describes the path-ordered head when over-cap sampling is disabled', async () => {
     const { ctx } = await setup({ config: { sampleOverCapGlobResults: false } })
     const glob = ctx.tools.schemas().find(schema => schema.name === 'glob')
-    expect(glob?.description).toContain('Returns up to 100 paths in modification-time order; a larger result keeps the first paths')
+    expect(glob?.description).toContain('Returns up to 100 paths in path order by default; a larger result keeps the first paths')
     expect(glob?.description).not.toContain('sampled across top-level entries')
   })
 })
@@ -345,7 +345,6 @@ describe('command construction (plain argv)', () => {
     expect(buildGlobCommand({ pattern: '**/*.ts' })).toEqual([
       '--files',
       '--glob=**/*.ts',
-      '--sort=modified',
       '--no-ignore',
       '--hidden',
       '--glob=!**/.git', '--glob=!**/.git/**',
@@ -358,7 +357,7 @@ describe('command construction (plain argv)', () => {
   })
 
   it('glob: the search root rides behind -- as a plain element', () => {
-    expect(buildGlobCommand({ pattern: '*.md', path: 'docs dir' })).toEqual(['--files', '--glob=*.md', '--sort=modified', '--no-ignore', '--hidden',
+    expect(buildGlobCommand({ pattern: '*.md', path: 'docs dir' })).toEqual(['--files', '--glob=*.md', '--no-ignore', '--hidden',
       '--glob=!**/.git', '--glob=!**/.git/**',
       '--glob=!**/.svn', '--glob=!**/.svn/**',
       '--glob=!**/.hg', '--glob=!**/.hg/**',
@@ -748,8 +747,8 @@ describe('glob results', () => {
     subprocess.handler = () => runResult('/sessions/s1/src/a.ts\n/elsewhere/b.ts\nrel/c.ts\n')
     const result = await call(ctx, 'glob', { pattern: '*' }, { agent: agent('/sessions/s1') })
     if (result.isError) throw new Error('expected glob success')
-    expect(result.value).toEqual({ root: '.', paths: [join('src', 'a.ts'), '/elsewhere/b.ts', 'rel/c.ts'] })
-    expect(text(result)).toBe(`${join('src', 'a.ts')}\n/elsewhere/b.ts\nrel/c.ts`)
+    expect(result.value).toEqual({ root: '.', paths: ['/elsewhere/b.ts', 'rel/c.ts', join('src', 'a.ts')] })
+    expect(text(result)).toBe(`/elsewhere/b.ts\nrel/c.ts\n${join('src', 'a.ts')}`)
   })
 
   it('validates arguments (blank pattern, blank path)', async () => {
@@ -758,12 +757,24 @@ describe('glob results', () => {
     expect(text(await call(ctx, 'glob', { pattern: '*', path: ' ' }))).toContain('path must be a non-empty string')
   })
 
+  it('returns the same path order regardless of discovery order', async () => {
+    const { ctx, subprocess } = await setup()
+    subprocess.handler = () => runResult('z.ts\na.ts\nm.ts\n')
+    const first = await call(ctx, 'glob', { pattern: '*.ts' })
+    subprocess.handler = () => runResult('m.ts\nz.ts\na.ts\n')
+    const second = await call(ctx, 'glob', { pattern: '*.ts', sort: 'path' })
+    expect(text(first)).toBe('a.ts\nm.ts\nz.ts')
+    expect(text(second)).toBe(text(first))
+    expect(subprocess.spawns).toHaveLength(2)
+    for (const spawn of subprocess.spawns) expect(spawn.argv).not.toContain('--sort=modified')
+  })
+
   it('threads a valid path through to the spawn as the plain search root element', async () => {
     const { ctx, subprocess } = await setup()
     subprocess.handler = () => runResult('sub/a.ts\n')
     const result = await call(ctx, 'glob', { pattern: '*.ts', path: 'sub' })
     expect(result.isError).toBe(false)
-    expect(subprocess.spawns[0]?.argv).toEqual([rgPath, '--no-config', '--files', '--glob=*.ts', '--sort=modified', '--no-ignore', '--hidden',
+    expect(subprocess.spawns[0]?.argv).toEqual([rgPath, '--no-config', '--files', '--glob=*.ts', '--no-ignore', '--hidden',
       '--glob=!**/.git', '--glob=!**/.git/**',
       '--glob=!**/.svn', '--glob=!**/.svn/**',
       '--glob=!**/.hg', '--glob=!**/.hg/**',
@@ -781,7 +792,7 @@ describe('glob results', () => {
         content: [{ type: 'text', text: 'glob context' }], source: { kind: 'test' },
       })],
     }))
-    subprocess.handler = () => runResult('a.ts\nb.ts\nc.ts\nd.ts\n')
+    subprocess.handler = () => runResult('c.ts\nd.ts\nb.ts\na.ts\n')
     const result = await call(ctx, 'glob', { pattern: '*.ts' }, { agent: agent('/w') })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected glob success')
@@ -806,19 +817,19 @@ describe('glob results', () => {
     const { ctx, subprocess } = await setup({ config: { globMaxResults: 3 } })
     subprocess.handler = () => runResult(['vendor/a.ts', 'vendor/b.ts', 'vendor/c.ts', 'src/d.ts', 'guide/e.md', 'top.txt'].map(w).join('\n'))
     const result = await call(ctx, 'glob', { pattern: '*' }, { agent: agent('/w') })
-    expect(text(result)).toBe(['vendor/a.ts', 'src/d.ts', 'guide/e.md'].map(w).join('\n') + '\n\n'
+    expect(text(result)).toBe(['guide/e.md', 'src/d.ts', 'top.txt'].map(w).join('\n') + '\n\n'
       + '(Showing 3 of 6 paths, sampled across 3 of the 4 top-level entries this pattern matched '
-      + 'instead of taken in modification-time order. Narrow path to inspect a specific subtree. '
+      + 'instead of taking the first paths. Narrow path to inspect a specific subtree. '
       + 'The complete result could not be saved; narrow pattern or path to see more.)')
   })
 
-  it('keeps the modification-time head when over-cap sampling is disabled', async () => {
+  it('keeps the path-ordered head when over-cap sampling is disabled', async () => {
     const { ctx, subprocess } = await setup({
       config: { globMaxResults: 3, sampleOverCapGlobResults: false },
     })
     subprocess.handler = () => runResult(['vendor/a.ts', 'vendor/b.ts', 'vendor/c.ts', 'src/d.ts', 'guide/e.md'].join('\n'))
     expect(text(await call(ctx, 'glob', { pattern: '*' }, { agent: agent('/w') })))
-      .toBe('vendor/a.ts\nvendor/b.ts\nvendor/c.ts\n\n'
+      .toBe('guide/e.md\nsrc/d.ts\nvendor/a.ts\n\n'
         + '(Showing 3 of 5 paths. The complete result could not be saved; narrow pattern or path to see more.)')
   })
 
@@ -831,7 +842,7 @@ describe('glob results', () => {
       'workspace/guides/d.md',
     ].map(w).join('\n'))
     const result = await call(ctx, 'glob', { pattern: '*', path: w('workspace') }, { agent: agent('/w') })
-    expect(text(result)).toContain(['workspace/vendor/a.ts', 'workspace/source/c.ts', 'workspace/guides/d.md'].map(w).join('\n'))
+    expect(text(result)).toContain(['workspace/guides/d.md', 'workspace/source/c.ts', 'workspace/vendor/a.ts'].map(w).join('\n'))
     expect(text(result)).toContain('sampled across 3 of the 3 top-level entries')
   })
 
@@ -844,7 +855,7 @@ describe('glob results', () => {
       '/w/workspace/guides/d.md',
     ].map(w).join('\n'))
     const result = await call(ctx, 'glob', { pattern: '*', path: w('/w/workspace') }, { agent: agent(w('/w')) })
-    expect(text(result)).toContain(['workspace/vendor/a.ts', 'workspace/source/c.ts', 'workspace/guides/d.md'].map(w).join('\n'))
+    expect(text(result)).toContain(['workspace/guides/d.md', 'workspace/source/c.ts', 'workspace/vendor/a.ts'].map(w).join('\n'))
     expect(text(result)).toContain('sampled across 3 of the 3 top-level entries')
   })
 
@@ -852,17 +863,18 @@ describe('glob results', () => {
     const { ctx, subprocess } = await setup({ config: { globMaxResults: 3 } })
     subprocess.handler = () => runResult(['vendor/a.ts', 'vendor/b.ts', 'vendor/c.ts', 'src/d.ts'].map(w).join('\n'))
     expect(text(await call(ctx, 'glob', { pattern: '*' }, { agent: agent('/w') })))
-      .toBe(['vendor/a.ts', 'vendor/b.ts', 'src/d.ts'].map(w).join('\n') + '\n\n'
+      .toBe(['src/d.ts', 'vendor/a.ts', 'vendor/b.ts'].map(w).join('\n') + '\n\n'
         + '(Showing 3 of 4 paths, sampled across 2 of the 2 top-level entries this pattern matched '
-        + 'instead of taken in modification-time order. '
+        + 'instead of taking the first paths. '
         + 'The complete result could not be saved; narrow pattern or path to see more.)')
   })
 
   it('keeps modification-time order untouched when the whole result fits', async () => {
     const { ctx, subprocess } = await setup({ config: { globMaxResults: 4 } })
     subprocess.handler = () => runResult('vendor/a.ts\nvendor/b.ts\nsrc/c.ts\n')
-    expect(text(await call(ctx, 'glob', { pattern: '*' }, { agent: agent('/w') })))
+    expect(text(await call(ctx, 'glob', { pattern: '*', sort: 'modified' }, { agent: agent('/w') })))
       .toBe('vendor/a.ts\nvendor/b.ts\nsrc/c.ts')
+    expect(subprocess.spawns[0]?.argv).toContain('--sort=modified')
   })
 
   it('keeps the plain footer for a flat result, where the sample is the modification-time head', async () => {
