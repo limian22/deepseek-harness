@@ -57,7 +57,7 @@ This table connects model-visible tool names to the plugin package and service s
 
 ### `plugin_manager`
 
-List plugins or bundles in the current profile, enable or disable them, install a bundle, or remove an installed bundle. Every action requires danger-full-access permission or approval for this call. Approval does not change the session permission mode. Changes affect every session in this profile. List first to obtain exact identifiers. IM-owned callers and their attached descendants may only list: profile mutations are blocked to avoid self-unload deadlocks. Use external Web settings or a controlled maintenance restart after the turn ends. Package installation can execute allowed build scripts. Live profiles apply changes immediately, including upgrades of installed packages; a change result that is not applied carries nextStep, which says what to do or tell the user. Unmet DSH version requirements (engines.dsh, else DSH peer dependencies) block installation and activation. Version exemptions risk crashes and data loss: warn the user and obtain explicit permission for the exact plugin and runtime versions before granting one.
+Inspect or manage the current profile. For current state, use list_plugins for runtime entries, list_bundles for bundle inventory, or check_profile_dependency to check an exact package name in the current manifest. Do not infer current configuration from recursive searches of profile directories or backups. Every action requires danger-full-access permission or approval for this call. Approval does not change the session permission mode. Changes affect every session in this profile. List first to obtain exact identifiers. IM-owned callers and their attached descendants may only list: profile mutations are blocked to avoid self-unload deadlocks. Use external Web settings or a controlled maintenance restart after the turn ends. Package installation can execute allowed build scripts. Live profiles apply changes immediately, including upgrades of installed packages; a change result that is not applied carries nextStep, which says what to do or tell the user. Unmet DSH version requirements (engines.dsh, else DSH peer dependencies) block installation and activation. Version exemptions risk crashes and data loss: warn the user and obtain explicit permission for the exact plugin and runtime versions before granting one.
 
 ```json
 {
@@ -69,6 +69,7 @@ List plugins or bundles in the current profile, enable or disable them, install 
       "enum": [
         "list_plugins",
         "list_bundles",
+        "check_profile_dependency",
         "set_plugin",
         "set_bundle",
         "install_bundle",

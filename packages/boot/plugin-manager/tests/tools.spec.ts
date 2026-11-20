@@ -28,6 +28,7 @@ async function fixture(mode: 'read-only' | 'workspace-write' | 'danger-full-acce
   const ctx = new Context()
   onTestFinished(() => ctx.fiber.dispose())
   const manager = {
+    hasProfileDependency: vi.fn((name: string) => name === 'bundle'),
     listPlugins: vi.fn(async () => Array.from({ length: 30 }, (_, i) => ({ entryId: `include:${i}`, enabled: true }))),
     listBundles: vi.fn(async () => [{ name: 'bundle', enabled: true }]),
     setPluginEnabled: vi.fn(async () => ({ changed: true, application: 'applied' })),
@@ -183,11 +184,12 @@ it.each(['read-only', 'workspace-write'] as const)('approves each action once in
   for (const action of ['list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'list_version_exemptions', 'set_version_exemption']) {
     expect((await call({ action, target: 'bundle@1.0.0', enabled: true, runtimeVersion: '0.1.7-alpha.1', acceptRisk: true }, agent)).isError).toBe(false)
   }
-  expect(prompted).toHaveBeenCalledTimes(8)
+  expect((await call({ action: 'check_profile_dependency', target: 'bundle' }, agent)).isError).toBe(false)
+  expect(prompted).toHaveBeenCalledTimes(9)
   for (const method of Object.values(manager)) expect(method).toHaveBeenCalledTimes(1)
   expect(ctx.sandboxPolicy.resolve({ session: agent.session }).mode).toBe(mode)
   const audit = agent.session.snapshotEvents().filter(event => event.type.startsWith('approval/'))
-  expect(audit).toHaveLength(16)
+  expect(audit).toHaveLength(18)
   expect(audit[0]).toMatchObject({ type: 'approval/asked', data: {
     toolName: 'plugin_manager', callId: 'manager-call',
   } })
@@ -249,6 +251,15 @@ it('does not apply a grant when the call was cancelled before dispatch', async (
   expect(manager.installBundle).not.toHaveBeenCalled()
 })
 
+it('reports whether the current profile declares an exact package name', async () => {
+  const { call, manager } = await fixture()
+  for (const [name, declared] of [['bundle', true], ['@local/hermes-loop-dev', false]] as const) {
+    const result = await call({ action: 'check_profile_dependency', target: name })
+    expect(JSON.parse(resultText(result))).toEqual({ source: 'current-profile-manifest', name, declared })
+    expect(manager.hasProfileDependency).toHaveBeenLastCalledWith(name)
+  }
+})
+
 it('paginates inventories with an explicit continuation and total', async () => {
   const { call } = await fixture()
   const first = await call({ action: 'list_plugins' })
@@ -295,6 +306,8 @@ it('forwards all mutation actions and renders the returned outcome', async () =>
 
 it.each([
   { action: 'unknown_action' },
+  { action: 'check_profile_dependency' },
+  { action: 'check_profile_dependency', target: 'bundle@1.0.0' },
   { action: 'list_plugins', offset: -1 },
   { action: 'list_plugins', offset: 0.5 },
   { action: 'list_bundles', limit: 101 },
