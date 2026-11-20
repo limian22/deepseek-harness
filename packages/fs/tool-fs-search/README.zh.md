@@ -27,7 +27,7 @@ kind: "package-reference"
 
 搜索使用 Session 的当前工作目录，包括通过 `working_directory` 切换后的目录。
 
-在 `ctx.subprocess` 后端之后挂载工具；无需宿主 `rg` 安装，也无需文件系统提供方。模型随后获得按修改时间排序的文件发现与按行组织的内容搜索，两者都有界并受超时防护。
+在 `ctx.subprocess` 后端之后挂载工具；无需宿主 `rg` 安装，也无需文件系统提供方。模型随后获得按路径排序的文件发现与按行组织的内容搜索，两者都有界并受超时防护。
 
 ### 最小组合
 
@@ -47,7 +47,7 @@ kind: "package-reference"
 
 | 工具 | 参数 | 行为 |
 |---|---|---|
-| `glob` | `pattern`、`path?` | 查找路径匹配 glob 模式的文件，包含隐藏与忽略文件但排除 VCS 元数据；不含 `/` 的模式匹配任意深度的基名，因此 `*` 匹配整棵树；完整结果保持按修改时间排序 |
+| `glob` | `pattern`、`path?`、`sort?` | 查找路径匹配 glob 模式的文件，包含隐藏与忽略文件但排除 VCS 元数据；不含 `/` 的模式匹配任意深度的基名，因此 `*` 匹配整棵树；默认按路径排序，`sort: modified` 按修改时间从旧到新排序 |
 | `grep` | `pattern`、`path?`、`include?` | 用 ripgrep 正则搜索文件内容，并按文件分组返回 `Line N: <preview>` 匹配；省略 `include` 或传入空字符串时不限制文件类型；否则 `include` 是一个正向 glob 过滤器，仅含空白的值、逗号分隔列表与否定值会被前置拒绝 |
 
 常规预算不进入面向模型的 schema：需要周边上下文的模型用 `read` 读取匹配文件，需要后续结果的模型遵循返回的 spill locator 检索提示。
@@ -58,7 +58,7 @@ kind: "package-reference"
 
 | 键 | 默认值 | 含义 |
 |---|---|---|
-| `sampleOverCapGlobResults` | 无（必填） | `true` 在顶层条目之间对超过上限的 `glob` 页面采样；`false` 保留按修改时间排序的前部 |
+| `sampleOverCapGlobResults` | 无（必填） | `true` 在顶层条目之间对超过上限的 `glob` 页面采样；`false` 保留所选排序下的前几条 |
 | `globMaxResults` | `100` | 一次 `glob` 调用内联展示的最大路径数 |
 | `grepMaxMatches` | `250` | 一次 `grep` 调用内联保留的最大平铺匹配数；后续匹配写入格式化 spill 产物 |
 | `grepMaxLineBytes` | `2000` | 每条匹配行预览的字节上限，保留 UTF-8 边界 |
@@ -107,7 +107,7 @@ Node 部署在受支持的 macOS、Linux 与 Windows 目标上获得 `@vscode/ri
 
 ### 搜索如何运行
 
-未显式提供 `path` 时，如果目录部分的每一项都是普通相对名称且不属于 VCS 元数据目录，`glob` 会为 `packages/core/src/*.ts` 这样的模式跳过无关子树。按顺序添加的 ripgrep glob 先排除目录树，再按前缀中去重后的名称放行目录，最后应用原始文件模式。其他位置的同名目录也可能被遍历，但文件仍只按原模式匹配。新增参数上限为 8 KiB，超过时沿用原遍历方式。搜索根目录、路径分隔符、符号链接处理、匹配规则和修改时间排序保持不变；其他模式仍按原方式遍历。
+未显式提供 `path` 时，如果目录部分的每一项都是普通相对名称且不属于 VCS 元数据目录，`glob` 会为 `packages/core/src/*.ts` 这样的模式跳过无关子树。按顺序添加的 ripgrep glob 先排除目录树，再按前缀中去重后的名称放行目录，最后应用原始文件模式。其他位置的同名目录也可能被遍历，但文件仍只按原模式匹配。新增参数上限为 8 KiB，超过时沿用原遍历方式。搜索根目录、路径分隔符、符号链接处理、匹配规则和所选排序方式保持不变；其他模式仍按原方式遍历。
 
 每次调用解析打包二进制（`@vscode/ripgrep`，或 pkg 单文件运行时中可执行程序的 `-rg` 伴随文件），前置 `--no-config`，使宿主的 `RIPGREP_CONFIG_PATH` 无法向不受约束的 spawn 注入 `--pre` 预处理器，并把每个模型控制的值作为普通 argv 元素传入——不存在 shell 层，因此不涉及 shell 引号处理。collect 模式预算限制完整 stdout 与 stderr 尾部；lossy stdout 读取以 `SEARCH_RAW_OUTPUT_OVERFLOW` 失败，而不是解析静默不完整的流。工具从不读取原始 spill 路径。
 
@@ -195,7 +195,7 @@ glob 描述声明了配置的超过上限排序方式。生成的 [`glob` 和 `g
 
 #### 模型看到的内容
 
-`glob` 每行返回一个路径；`grep` 在每个路径下分组展示 `Line <line>: <preview>` 匹配。空搜索返回 `No files found` 或 `No matches found`。达到上限的结果以省略计数结尾，并附 spill locator 与后端检索提示，或说明完整结果无法保存。启用 `sampleOverCapGlobResults: true` 时，超过上限的 `glob` 页面按实际搜索根正下方的条目轮转取路径，页脚说明采样依据及其覆盖的顶层条目数；`false` 时页面是按修改时间排序的前部，并保留普通的上限结果页脚。spill 产物始终持有按修改时间排序的完整列表。
+`glob` 每行返回一个路径；`grep` 在每个路径下分组展示 `Line <line>: <preview>` 匹配。空搜索返回 `No files found` 或 `No matches found`。达到上限的结果以省略计数结尾，并附 spill locator 与后端检索提示，或说明完整结果无法保存。启用 `sampleOverCapGlobResults: true` 时，超过上限的 `glob` 页面按实际搜索根正下方的条目轮转取路径，页脚说明采样依据及其覆盖的顶层条目数；`false` 时页面是所选排序下的前几条，并保留普通的上限结果页脚。spill 产物始终持有按所选顺序排列的完整列表。
 
 #### Token 影响
 
