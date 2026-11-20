@@ -27,7 +27,7 @@ Use `dsh-tool-fs-search` to give models `glob` file discovery and `grep` content
 
 Searches use the Session's current working directory, including changes made with `working_directory`.
 
-Mount the tools after a `ctx.subprocess` backend; no host `rg` install is needed, and no filesystem provider is required. The model then gets modification-time-ordered file discovery and line-oriented content search, each bounded and timeout-guarded.
+Mount the tools after a `ctx.subprocess` backend; no host `rg` install is needed, and no filesystem provider is required. The model then gets path-ordered file discovery and line-oriented content search, each bounded and timeout-guarded.
 
 ### Minimal composition
 
@@ -47,7 +47,7 @@ A subprocess backend, then the tools; the spill backend is optional and makes ca
 
 | Tool | Arguments | Behavior |
 |---|---|---|
-| `glob` | `pattern`, `path?` | Finds files whose paths match a glob pattern, including hidden and ignored files but excluding VCS metadata; a pattern with no `/` matches basenames at any depth, so `*` matches the whole tree; complete results stay modification-time ordered |
+| `glob` | `pattern`, `path?`, `sort?` | Finds files whose paths match a glob pattern, including hidden and ignored files but excluding VCS metadata; a pattern with no `/` matches basenames at any depth, so `*` matches the whole tree; defaults to path order, and `sort: modified` orders oldest first |
 | `grep` | `pattern`, `path?`, `include?` | Searches file contents with a ripgrep regex and returns matches grouped by file as `Line N: <preview>`; omitted or exact empty `include` applies no file filter; otherwise `include` is one positive glob, with whitespace-only values, comma-separated lists, and negated values rejected up front |
 
 Routine budgets stay out of the model-facing schema: a model that needs surrounding context reads the matched file with `read`, and one that needs later results follows the returned spill locator's retrieval hint.
@@ -58,7 +58,7 @@ Routine budgets stay out of the model-facing schema: a model that needs surround
 
 | Key | Default | Meaning |
 |---|---|---|
-| `sampleOverCapGlobResults` | none (required) | `true` samples an over-cap `glob` page across top-level entries; `false` keeps the modification-time-ordered head |
+| `sampleOverCapGlobResults` | none (required) | `true` samples an over-cap `glob` page across top-level entries; `false` keeps the first paths in the requested order |
 | `globMaxResults` | `100` | Max paths one `glob` call shows inline |
 | `grepMaxMatches` | `250` | Max flat matches one `grep` call retains inline; later matches go to the formatted spill artifact |
 | `grepMaxLineBytes` | `2000` | Byte cap per matched-line preview, preserving UTF-8 boundaries |
@@ -107,7 +107,7 @@ Local workspace discovery is naturally a process-backed `rg` workflow, and putti
 
 ### How a search runs
 
-Without an explicit `path`, `glob` prunes unrelated subtrees for patterns such as `packages/core/src/*.ts` when every directory component is a plain relative name outside VCS metadata. Ordered ripgrep globs exclude the tree, admit directories with the prefix's distinct names, then apply the original file pattern. Same-named directories elsewhere may also be traversed, but only the original pattern admits files. The added arguments are capped at 8 KiB; larger sets use the original traversal. The search root, path separators, symlink handling, matching, and modification-time ordering stay unchanged; other patterns retain the original traversal.
+Without an explicit `path`, `glob` prunes unrelated subtrees for patterns such as `packages/core/src/*.ts` when every directory component is a plain relative name outside VCS metadata. Ordered ripgrep globs exclude the tree, admit directories with the prefix's distinct names, then apply the original file pattern. Same-named directories elsewhere may also be traversed, but only the original pattern admits files. The added arguments are capped at 8 KiB; larger sets use the original traversal. The search root, path separators, symlink handling, matching, and requested ordering stay unchanged; other patterns retain the original traversal.
 
 Each call resolves the packaged binary (`@vscode/ripgrep`, or the executable's `-rg` sidecar in a pkg single-file runtime), prepends `--no-config` so a host `RIPGREP_CONFIG_PATH` cannot inject a `--pre` preprocessor into the unconfined spawn, and passes every model-controlled value as a plain argv element — no shell layer exists, so no quoting applies. Collect-mode budgets bound complete stdout and a stderr tail; a lossy stdout read fails as `SEARCH_RAW_OUTPUT_OVERFLOW` rather than parsing a silently-partial stream. The tools never read a raw spill path.
 
@@ -195,7 +195,7 @@ Prefix-stable while tool visibility and definitions are unchanged. Registration 
 
 #### What the model sees
 
-`glob` returns one path per line; `grep` groups `Line <line>: <preview>` matches beneath each path. Empty searches return `No files found` or `No matches found`. A capped result ends with its omission count plus the spill locator and backend retrieval hint, or says the complete result could not be saved. With `sampleOverCapGlobResults: true`, an over-cap `glob` page takes paths round-robin across entries immediately beneath the actual search root, and the footer states the sampled basis and how many top-level entries it reached; with `false`, the page is the modification-time-ordered head and keeps the plain capped-result footer. The spill artifact always holds the complete list in modification-time order.
+`glob` returns one path per line; `grep` groups `Line <line>: <preview>` matches beneath each path. Empty searches return `No files found` or `No matches found`. A capped result ends with its omission count plus the spill locator and backend retrieval hint, or says the complete result could not be saved. With `sampleOverCapGlobResults: true`, an over-cap `glob` page takes paths round-robin across entries immediately beneath the actual search root, and the footer states the sampled basis and how many top-level entries it reached; with `false`, the page is the first paths in the requested order and keeps the plain capped-result footer. The spill artifact always holds the complete list in the requested order.
 
 #### Token effect
 

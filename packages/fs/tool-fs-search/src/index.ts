@@ -72,7 +72,7 @@ export const inject = ['tools', 'systemPrompt', 'subprocess', 'workingDirectory'
 
 /** Plugin config; over-cap glob sampling is an explicit deployment choice and the remaining fields have defaults. */
 export interface Config {
-  /** Whether an over-cap `glob` page is sampled across top-level entries instead of taking the modification-time head. */
+  /** Whether an over-cap `glob` page is sampled across top-level entries instead of taking the first paths in the requested order. */
   sampleOverCapGlobResults: boolean
   /** Max paths one `glob` call retains inline; later paths go to the formatted spill file. */
   globMaxResults?: number
