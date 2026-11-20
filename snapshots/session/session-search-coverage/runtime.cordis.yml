@@ -1,0 +1,26 @@
+# Scenario overlay for the model-visible session-search coverage.
+#
+# The index opens on the first search and synchronization starts from that same
+# call, so the first search is answered before any pass can complete and reports
+# `initializing` deterministically. No wall-clock value reaches the result text:
+# the tool renders the coverage state, never `checkedAt`.
+- id: session-query-sqlite
+  name: '@deepseek-ai/dsh-session-query-sqlite'
+  config:
+    path: ':memory:'
+    openAt: first-search
+    syncMode: background
+    syncIntervalMs: 5000
+    syncReadConcurrency: 1
+
+# Pin the replay route so the recorded request header does not depend on the
+# profile default.
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash
+
+- insert:
+    - id: tool-session-query
+      name: '@deepseek-ai/dsh-tool-session-query'

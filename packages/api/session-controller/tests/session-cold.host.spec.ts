@@ -19,7 +19,16 @@ import { createInboxStub, mountAgentLoopTestDependencies, mountAgentLoopTestHarn
 import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import AttachmentStore from '@deepseek-ai/dsh-attachment'
-import type { SessionPromptRequest, SessionRequestId } from '../src/types.ts'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import Storage from '@deepseek-ai/dsh-storage'
+import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
+import * as StorageJson from '@deepseek-ai/dsh-storage-json'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import SessionProjectionCache from '@deepseek-ai/dsh-session-projection-cache'
+import SessionTitleService, { titleProjectionDefinition } from '@deepseek-ai/dsh-session-title'
+import type { SessionPromptRequest, SessionRequestId, SessionSummary } from '../src/types.ts'
 import {
   SessionPersistenceRevision,
   type SessionPersistenceSnapshot,
@@ -1052,6 +1061,208 @@ describe('sessions.prompt synchronous rejection', () => {
         code: 'session/agent-busy',
         details: { reason: 'use subagent delivery for this child session' },
       })
+    }
+  })
+})
+
+describe('cold title backfill', () => {
+  it('recovers durable titles for never-opened sessions without activating them', { timeout: 20_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-title-backfill-'))
+    const cacheRoot = join(root, 'cache')
+    const logRoot = join(root, 'logs')
+    const headerFor = (value: string, createdAt: number): SessionHeader => ({
+      version: SESSION_FORMAT_VERSION,
+      id: sid(value),
+      createdAt,
+      isSeeded: false,
+      cwd: root,
+    })
+    const titled = headerFor('historical-titled', 10)
+    const untitled = headerFor('historical-untitled', 20)
+    const empty = headerFor('historical-empty', 30)
+    const inaccessible = headerFor('historical-inaccessible', 40)
+    const paths = new Map<string, string>()
+    const bytes = new Map<string, string>()
+    try {
+      // Seed the durable store directly; the backfill must recover from the
+      // history file without any Host ever having opened these Sessions.
+      {
+        const seedCtx = new Context()
+        await seedCtx.plugin(JsonlSessionPersistence, { root: logRoot, compression: 'none' })
+        const seed = async (header: SessionHeader, events: SessionEvent[]): Promise<void> => {
+          const handle = await seedCtx.sessionPersistence.create(header)
+          if (events.length > 0) await handle.append(events)
+          await handle.flush()
+          await handle.close()
+          const snapshot = await seedCtx.sessionPersistence.stat(header.id)
+          if (snapshot?.location === undefined) throw new Error('stored session has no location')
+          paths.set(header.id, snapshot.location.path)
+          bytes.set(header.id, await readFile(snapshot.location.path, 'utf8'))
+        }
+        await seed(titled, [
+          { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+          {
+            type: 'session/title',
+            seq: SessionSeq(1),
+            time: 2,
+            data: { title: 'Historical title', messageSeqs: [], source: { kind: 'user' } },
+          },
+        ])
+        await seed(untitled, [
+          { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+        ])
+        await seed(empty, [])
+        await seed(inaccessible, [])
+        await seedCtx.fiber.dispose()
+      }
+
+      const ctx = new Context()
+      try {
+        await ctx.plugin(Storage)
+        await ctx.plugin(StorageJson, { root: cacheRoot })
+        await ctx.plugin(StorageDomain, { backend: 'json' })
+        await ctx.plugin(SessionStore)
+        await ctx.plugin(SessionProjectionRegistry)
+        await ctx.plugin(AgentRegistry)
+        await ctx.sessionProjections.register(titleProjectionDefinition)
+        await ctx.plugin(JsonlSessionPersistence, { root: logRoot, compression: 'none' })
+        await ctx.plugin(SessionProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 60_000 })
+        const added: SessionSummary[] = []
+        ctx.on('api-session/added', (summary) => { added.push(summary) })
+        const remote = await createSessionTestRemote(ctx, {
+          defaultModelSelection: () => ({ provider: 'p', model: 'm' }),
+          cwd: root,
+        })
+        const storedOpen = ctx.sessionPersistence.open.bind(ctx.sessionPersistence)
+        const open = vi.spyOn(ctx.sessionPersistence, 'open').mockImplementation((id, ...args) => {
+          if (id === inaccessible.id) return Promise.reject(new Error('fixture read unavailable'))
+          return storedOpen(id, ...args)
+        })
+        const debug = vi.spyOn(ctx.logger, 'debug')
+
+        const listed = await remote.list(request({}))
+        if (!listed.ok) throw new Error('list failed')
+        // The first listing stays metadata-only: the cold row has no cached
+        // projection block yet and no history was opened for it.
+        expect(listed.value.items.find(item => item.sessionId === titled.id)?.projections).toBeUndefined()
+
+        await vi.waitFor(() => {
+          for (const header of [titled, untitled, empty]) {
+            expect(ctx.sessionProjectionCache.cachedSnapshot(header, ['title'])).toBeDefined()
+          }
+        }, { timeout: 10_000 })
+        await vi.waitFor(() => {
+          expect(added.some(summary => summary.sessionId === titled.id
+            && (summary.projections?.values as { title?: unknown } | undefined)?.title === 'Historical title'))
+            .toBe(true)
+        }, { timeout: 10_000 })
+
+        // Recovery never publishes a Session or activates an Agent.
+        expect(ctx.sessions.get(titled.id)).toBeUndefined()
+        expect(ctx.agents.get(titled.id)).toBeUndefined()
+        // The append-only history file is untouched by the recovery read.
+        for (const header of [titled, untitled, empty]) {
+          expect(await readFile(paths.get(header.id)!, 'utf8')).toBe(bytes.get(header.id))
+        }
+
+        // One read per stored session; the next listing consumes the durable
+        // rows without reopening any history.
+        await vi.waitFor(() => {
+          expect(debug).toHaveBeenCalledWith(expect.stringContaining('fixture read unavailable'))
+        })
+        const opensAfterBackfill = open.mock.calls.length
+        expect(opensAfterBackfill).toBe(4)
+        const again = await remote.list(request({}))
+        if (!again.ok) throw new Error('second list failed')
+        expect(again.value.items.find(item => item.sessionId === titled.id)?.projections)
+          .toMatchObject({ kind: 'cached', values: { title: 'Historical title' } })
+        expect(open.mock.calls.length).toBe(opensAfterBackfill)
+      } finally {
+        await ctx.fiber.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    }
+  })
+
+  it.each([false, true])('creates the title backfill after a first list and late services (late title: %s)', { timeout: 20_000 }, async (lateTitle) => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-title-late-mount-'))
+    const cacheRoot = join(root, 'cache')
+    const logRoot = join(root, 'logs')
+    const header: SessionHeader = {
+      version: SESSION_FORMAT_VERSION,
+      id: sid('late-mounted-title'),
+      createdAt: 10,
+      isSeeded: false,
+      cwd: root,
+    }
+    try {
+      {
+        const seedCtx = new Context()
+        await seedCtx.plugin(JsonlSessionPersistence, { root: logRoot, compression: 'none' })
+        try {
+          const handle = await seedCtx.sessionPersistence.create(header)
+          await handle.append([
+            { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+            {
+              type: 'session/title',
+              seq: SessionSeq(1),
+              time: 2,
+              data: { title: 'Late mounted title', messageSeqs: [], source: { kind: 'user' } },
+            },
+          ])
+          await handle.close()
+        } finally {
+          await seedCtx.fiber.dispose()
+        }
+      }
+
+      const ctx = new Context()
+      try {
+        // The controller and its list projection initialize while both the
+        // persistence backend and the cache are still absent.
+        await ctx.plugin(SessionStore)
+        await ctx.plugin(SessionProjectionRegistry)
+        await ctx.plugin(AgentRegistry)
+        if (!lateTitle) await ctx.sessionProjections.register(titleProjectionDefinition)
+        const added: SessionSummary[] = []
+        ctx.on('api-session/added', (summary) => { added.push(summary) })
+        const remote = await createSessionTestRemote(ctx, {
+          defaultModelSelection: () => ({ provider: 'p', model: 'm' }),
+          cwd: root,
+        })
+
+        // A first list can arrive after persistence mounts but before the cache.
+        // Mounting the cache must recover that list without a second browser pull.
+        await ctx.plugin(JsonlSessionPersistence, { root: logRoot, compression: 'none' })
+        const listed = await remote.list(request({}))
+        if (!listed.ok) throw new Error('list failed')
+        expect(listed.value.items.some(item => item.sessionId === header.id)).toBe(true)
+        await ctx.plugin(Storage)
+        await ctx.plugin(StorageJson, { root: cacheRoot })
+        await ctx.plugin(StorageDomain, { backend: 'json' })
+        await ctx.plugin(SessionProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 60_000 })
+        if (lateTitle) {
+          // Let the first background attempt see the missing title projection.
+          await new Promise(resolve => setTimeout(resolve, 0))
+          await ctx.plugin(SessionTitleService, { fallbackMaxWords: 12, fallbackMaxBytes: 120, maxTitleBytes: 160 })
+        }
+        await vi.waitFor(() => {
+          expect(ctx.sessionProjectionCache.cachedSnapshot(header, ['title'])).toBeDefined()
+        }, { timeout: 10_000 })
+        await vi.waitFor(() => {
+          expect(added.some(summary => summary.sessionId === header.id
+            && (summary.projections?.values as { title?: unknown } | undefined)?.title === 'Late mounted title'))
+            .toBe(true)
+        }, { timeout: 10_000 })
+
+        expect(ctx.sessions.get(header.id)).toBeUndefined()
+        expect(ctx.agents.get(header.id)).toBeUndefined()
+      } finally {
+        await ctx.fiber.dispose()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     }
   })
 })

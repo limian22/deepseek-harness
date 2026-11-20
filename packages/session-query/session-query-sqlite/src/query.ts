@@ -69,6 +69,7 @@ export interface NormalizedSessionRequest {
   sessionFilters: readonly SessionResultFilter[]
   eventFilters: readonly SessionEventMetadataFilter[]
   limit: number
+  snapshot: boolean
   cursor?: SessionSearchCursor
 }
 
@@ -78,6 +79,7 @@ export interface NormalizedEventRequest {
   query: string
   filters: readonly SessionEventMetadataFilter[]
   limit: number
+  snapshot: boolean
   cursor?: SessionSearchCursor
 }
 
@@ -109,6 +111,7 @@ export function normalizeSessionRequest(
     sessionFilters,
     eventFilters,
     limit: normalizeLimit(request.limit, limits),
+    snapshot: request.snapshot === true,
     ...cursor === undefined ? {} : { cursor },
   }
 }
@@ -133,6 +136,7 @@ export function normalizeEventRequest(
     query: normalizeQuery(request.query),
     filters,
     limit: normalizeLimit(request.limit, limits),
+    snapshot: request.snapshot === true,
     ...cursor === undefined ? {} : { cursor },
   }
 }
@@ -249,6 +253,7 @@ export function requestFingerprint(request: NormalizedSessionRequest | Normalize
       query: request.query,
       filters: canonicalFilters(request.filters),
       limit: request.limit,
+      snapshot: request.snapshot,
     })
   }
   return JSON.stringify({
@@ -257,6 +262,7 @@ export function requestFingerprint(request: NormalizedSessionRequest | Normalize
     sessionFilters: canonicalFilters(request.sessionFilters),
     eventFilters: canonicalFilters(request.eventFilters),
     limit: request.limit,
+    snapshot: request.snapshot,
   })
 }
 

@@ -25,6 +25,7 @@ import type {
   SessionEvent,
   SessionHeader,
   SessionId,
+  SessionSeqCursor,
 } from '@deepseek-ai/dsh-session'
 import type {
   ProjectionCheckpoint,
@@ -57,6 +58,22 @@ type CurrentCheckpointIdentity = CheckpointIdentity & {
 
 const PREDECESSOR_TITLE_KEY = 'title' as Extract<keyof SessionProjectionMap, string>
 
+/**
+ * The projection keys a cold title recovery restores.
+ *
+ * The background title backfill only needs the display title and the list
+ * metadata that carries blankness and recency; folding every other registered
+ * unit over the whole stored log is the expensive, unrelated work this face
+ * exists to avoid. Both keys are spelled here because the owning domain
+ * packages' `SessionProjectionMap` augmentations are not in this package's
+ * type graph; the registry's read face treats a key it has no live unit for as
+ * absent, and this face keeps that key's stored row untouched.
+ */
+const COLD_BACKFILL_KEYS: ProjectionKeySelection = [
+  'title' as Extract<keyof SessionProjectionMap, string>,
+  'sessionListMetadata' as Extract<keyof SessionProjectionMap, string>,
+]
+
 export { checkpointIdentity, checkpointRecord, checkpointRow, projectionCacheDomainSpec } from './spec.ts'
 export type { CheckpointIdentity, CheckpointRecord } from './spec.ts'
 
@@ -85,6 +102,17 @@ export const Config: z<Config> = z.object({
   writeIntervalMs: z.natural().min(1).required(),
 })
 
+/**
+ * Options for {@link SessionProjectionCache.coldSnapshotDurable}.
+ */
+export interface ColdSnapshotDurableOptions {
+  /**
+   * Re-checked after the fold and immediately before the durable replacement.
+   * Returning false abandons the checkpoint without writing.
+   */
+  readonly guard?: () => boolean | Promise<boolean>
+}
+
 /** Per-session write-behind bookkeeping (live sessions only; dropped at retire). */
 interface DirtyState {
   /** Committed events since the last durable write. */
@@ -109,6 +137,13 @@ export class SessionProjectionCache extends Service {
 
   private table?: KvTable<SessionId, CheckpointRecord>
   private readonly dirty = new Map<Session, DirtyState>()
+  /**
+   * Monotonic per-session write epoch. A cold durable checkpoint captures it
+   * before folding and rechecks it before replacing the record, so a live
+   * checkpoint queued in between wins even when its domain-table mutation has
+   * not become visible yet.
+   */
+  private readonly epochs = new Map<SessionId, number>()
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, 'sessionProjectionCache')
@@ -306,6 +341,86 @@ export class SessionProjectionCache extends Service {
     return restored.snapshot
   }
 
+  /**
+   * Durably checkpoint one cold-read prefix while refusing to overtake a
+   * newer writer.
+   *
+   * The caller must supply a prefix that is contiguous from seq `0` and ends
+   * exactly at {@link durableThroughSeq}; the method therefore cannot write a
+   * row beyond the caller-declared durable watermark. The caller owns the
+   * proof that the prefix is durable (for example a stored read whose artifact
+   * revision held still); this face only enforces the structural watermark and
+   * the cache's own write-order guards:
+   *
+   * - `guard` is rechecked after the fold (a live appender may have appeared);
+   * - the session must not be live in the store;
+   * - no other checkpoint may have been put since the fold began (per-session
+   *   write epoch), so a queued live checkpoint always wins;
+   * - an identity-matching record already holding a newer row is never
+   *   replaced by an older cut.
+   *
+   * Only the backfill's own keys (title and list metadata) are folded, so an
+   * unrelated projection never pays a whole-log fold for a title recovery.
+   * The refreshed rows are merged over the identity-matching record's other
+   * rows, which are preserved verbatim: a recovery never drops projections it
+   * did not fold, and in particular never blanks the list metadata's
+   * recency/blankness row. A record from another lifecycle is replaced (its
+   * rows could not seed this fold).
+   *
+   * Unlike {@link coldSnapshot}, the write is awaited and failures reject;
+   * background callers contain them. `undefined` means a guard refused the
+   * replacement and nothing was written.
+   * @param meta - the stored session header (identity witness).
+   * @param inheritedEventCount - exact inherited prefix length for identity.
+   * @param durableThroughSeq - inclusive last seq the caller proved durable.
+   * @param events - stored events from seq 0 through `durableThroughSeq`.
+   * @param options - optional pre-put recheck.
+   * @returns the title/list-metadata cut after durability, or `undefined` when a guard refused it.
+   */
+  async coldSnapshotDurable(
+    meta: SessionHeader,
+    inheritedEventCount: SessionLogOffset,
+    durableThroughSeq: SessionSeqCursor,
+    events: readonly SessionEvent[],
+    options: ColdSnapshotDurableOptions = {},
+  ): Promise<ProjectionSnapshot | undefined> {
+    const lastSeq = events.at(-1)?.seq ?? -1
+    if (lastSeq !== durableThroughSeq) {
+      throw new Error(
+        `session projection cache: durable cold checkpoint for "${meta.id}" must end at seq ${String(durableThroughSeq)}, got ${String(lastSeq)}`,
+      )
+    }
+    for (const [index, event] of events.entries()) {
+      if (event.seq !== index) {
+        throw new Error(
+          `session projection cache: durable cold checkpoint for "${meta.id}" must be contiguous from seq 0, got seq ${String(event.seq)} at index ${String(index)}`,
+        )
+      }
+    }
+    const identity = identityOf(meta, inheritedEventCount)
+    const epoch = this.epochOf(meta.id)
+    const restored = this.ctx.sessionProjections.restore(
+      this.recordFor(meta.id, identity)?.rows ?? {},
+      events,
+      SessionLogOffset(0),
+      meta,
+      inheritedEventCount,
+      COLD_BACKFILL_KEYS,
+    )
+    if (options.guard !== undefined && !(await options.guard())) return undefined
+    if (this.ctx.sessions.get(meta.id) !== undefined) return undefined
+    if (this.epochOf(meta.id) !== epoch) return undefined
+    const existing = this.requireTable().get(meta.id)
+    let rows = restored.checkpoint
+    if (existing !== undefined && identityMatches(existing.identity, identity)) {
+      if (highestRowSeq(existing.rows) > durableThroughSeq) return undefined
+      // Selected keys were just refreshed; every other row stays exactly as
+      // the last writer of this lifecycle left it.
+      rows = { ...existing.rows, ...restored.checkpoint }
+    }
+    await this.put(meta.id, identity, rows)
+    return restored.snapshot
+  }
 
   // --- write-behind (throttle + mandatory points) ---
 
@@ -388,6 +503,9 @@ export class SessionProjectionCache extends Service {
 
   /** Replace one session's stored record with its log identity and a detached snapshot of `rows`. */
   private async put(id: SessionId, identity: CheckpointIdentity, rows: ProjectionCheckpoint): Promise<void> {
+    // Synchronous with the caller's decision: a cold durable checkpoint that
+    // captured this epoch earlier sees the change before it replaces the row.
+    this.epochs.set(id, this.epochOf(id) + 1)
     const detached = snapshotJsonValue(rows)
     if (detached === undefined) {
       throw new TypeError('projection checkpoint is not losslessly JSON-serializable (a unit state violates the plain-JSON contract)')
@@ -400,6 +518,20 @@ export class SessionProjectionCache extends Service {
     if (this.table === undefined) throw new Error('session projection cache is not initialized')
     return this.table
   }
+
+  /** Current in-process write epoch for one session id. */
+  private epochOf(id: SessionId): number {
+    return this.epochs.get(id) ?? 0
+  }
+}
+
+/** Highest stored row watermark in one checkpoint; `-1` for an empty checkpoint. */
+function highestRowSeq(rows: ProjectionCheckpoint): SessionSeqCursor {
+  let highest: SessionSeqCursor = -1
+  for (const row of Object.values(rows)) {
+    if (row.seq > highest) highest = row.seq
+  }
+  return highest
 }
 
 /** Project a header onto the identity fields a header alone can witness. */

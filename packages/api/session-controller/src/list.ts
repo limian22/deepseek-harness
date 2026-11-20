@@ -8,9 +8,16 @@ import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type { ProjectionHandle, ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-session-projection-cache'
-import { SessionQueryError, type SessionRecord, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
+import type {} from '@deepseek-ai/dsh-session-title'
+import {
+  readStableColdLog,
+  SessionQueryError,
+  type SessionRecord,
+  type SessionSearchCursor,
+} from '@deepseek-ai/dsh-session-query'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { z } from 'zod'
+import { ColdTitleBackfill } from './title-backfill.ts'
 import {
   SESSION_SEARCH_RESULT_LIMIT,
   SESSION_SEARCH_SNIPPET_MAX_CODE_POINTS,
@@ -77,6 +84,9 @@ export function truncateUnicodeCodePoints(value: string, maximum: number): strin
 /** Owns list projection registration, bounded cold summaries, and authorized search. */
 export class ApiSessionList {
   private listMetadata!: ProjectionHandle<SessionListMetadata>
+  private backfill: ColdTitleBackfill | undefined
+  /** Last requested cold catalog, replayed if optional cache services mount later. */
+  private coldRecords: readonly SessionRecord[] = []
 
   /**
    * @param ctx - Host context carrying Session, query, persistence, and projection services.
@@ -109,6 +119,54 @@ export class ApiSessionList {
       },
       stateVersion: 1,
     })
+    // Warm cold rows only when both the stored read and the durable cache are
+    // mounted. The controller does not require either service (degenerate
+    // compositions keep the metadata-only listing), so wait for both instead
+    // of sampling them once: a later cache/persistence mount must still create
+    // the backfill, and a remount replaces it.
+    const backfillFiber = this.ctx.inject(['sessionPersistence', 'sessionProjectionCache'], (childCtx) => {
+      const persistence = childCtx.sessionPersistence
+      const cache = childCtx.sessionProjectionCache
+      const backfill = new ColdTitleBackfill({
+        read: (id, signal) => readStableColdLog(persistence, id, signal),
+        cache,
+        titleReady: () => this.ctx.sessionProjections.summaryKeys().has('title'),
+        isLive: id => this.ctx.sessions.get(id) !== undefined,
+        verify: async (log, signal) => {
+          // The stat revision held still for the read itself; recheck it
+          // immediately before the durable replacement: a removal, recreation,
+          // or migration publication must win over a stale prefix.
+          // ColdTitleBackfill.verify already checked liveness synchronously;
+          // its final guard checks again after this asynchronous stat.
+          const after = await persistence.stat(log.header.id, { signal })
+          return after !== undefined
+            && after.formatStatus === 'current'
+            && after.revision === log.revision
+            && after.header.id === log.header.id
+            && after.header.createdAt === log.header.createdAt
+            && after.header.cwd === log.header.cwd
+            && after.header.isSeeded === log.header.isSeeded
+        },
+        summarize: record => this.summarizeCold(record),
+        notify: (summary) => { this.ctx.emit('api-session/added', summary) },
+        onDebug: (message) => { this.ctx.logger.debug(message) },
+      })
+      this.backfill = backfill
+      backfill.schedule(this.coldRecords)
+      childCtx.effect(() => () => {
+        /* v8 ignore next -- a stale optional-service disposer cannot clear a replacement; matches SessionCorpus's binding guard. */
+        if (this.backfill === backfill) this.backfill = undefined
+        backfill.dispose()
+      }, 'api-session.list-backfill')
+    })
+    this.ctx.effect(() => () => backfillFiber.dispose(), 'api-session.list-backfill-inject')
+    // The title service publishes its projection before becoming available.
+    // If it arrives after the first list, retry that catalog without waiting
+    // for another browser pull. Cache mount handles the opposite arrival order.
+    const titleFiber = this.ctx.inject(['sessionTitle'], () => {
+      this.backfill?.schedule(this.coldRecords)
+    })
+    this.ctx.effect(() => () => titleFiber.dispose(), 'api-session.list-title-ready')
   }
 
   /**
@@ -174,10 +232,14 @@ export class ApiSessionList {
     }
     signal?.throwIfAborted()
     items.sort((left, right) => right.updatedAt - left.updatedAt)
+    // Queue recovery after the listing response is ready. The backfill defers
+    // its first read by one macrotask, so first paint never waits for history.
+    this.coldRecords = cold
+    this.backfill?.schedule(cold)
     return items
   }
 
-  private summarizeCold({ header, formatStatus }: SessionRecord): SessionSummary {
+  summarizeCold({ header, formatStatus }: SessionRecord): SessionSummary {
     const projections = this.projectionsFor(header, undefined)
     const metadata = projections?.values.sessionListMetadata
     return {
@@ -235,6 +297,7 @@ export class ApiSessionList {
         try {
           page = await provider.searchSessions({
             query: normalizedQuery,
+            snapshot: true,
             eventFilters: [
               { kind: 'type', values: ['user/message', 'assistant/message'] },
               { kind: 'surface', values: ['current'] },

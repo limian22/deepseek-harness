@@ -1,0 +1,13 @@
+version: 1
+scenario: session-search-coverage
+profile: headless
+composition: default
+recording: authored
+header:
+  class: session-search-coverage
+  pin: true
+input:
+  task: Search earlier sessions for the marker phrase.
+replay:
+  override: true
+platform: posix

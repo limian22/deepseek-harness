@@ -697,16 +697,24 @@ export class SessionProjectionRegistry extends Service {
    * log, so a discarded row with `baseSeq > 0` throws (the caller re-reads
    * from seq 0, e.g. after a crash-repair truncation shrank the log below
    * a row's watermark).
+   *
+   * A key selection narrows the fold: only live units whose key is selected
+   * are validated, folded, viewed, and returned as refreshed rows. An
+   * unselected unit therefore costs nothing, and its checkpoint row is left
+   * for the caller to keep — the refreshed checkpoint covers the selected
+   * keys only, so a write-back must merge it with the rows it preserves.
+   * Omitted keys fold every live unit, the original contract.
    * @param checkpoint - persisted rows for one session (possibly stale or empty).
    * @param events - the stored events with `seq >= baseSeq`, in seq order.
    * @param baseSeq - the seq `events` starts at (its first event's seq when non-empty).
    * @param header - immutable metadata for the Session being restored.
    * @param inheritedEventCount - exact fork-inherited prefix length supplied to unit initialization.
+   * @param keys - optional keys to fold; omitted folds every live unit.
    * @returns the snapshot cut at the supplied log end (`asOfSeq` is the last
    *   supplied event's seq, `baseSeq - 1` for an empty tail) plus the
    *   refreshed checkpoint rows at that cut, ready for a durable write-back.
-   *   The rows cover live units only: a released unit has no cell for a log
-   *   folded without a live `Session`, so a write-back of them omits it.
+   *   The rows cover the selected live units only: omitted keys and released
+   *   units contribute no row.
    */
   restore(
     checkpoint: ProjectionCheckpoint,
@@ -714,15 +722,18 @@ export class SessionProjectionRegistry extends Service {
     baseSeq: SessionLogOffset,
     header: SessionHeader,
     inheritedEventCount: SessionLogOffset,
+    keys?: ProjectionKeySelection,
   ):
   { snapshot: ProjectionSnapshot; checkpoint: ProjectionCheckpoint } {
     const endSeq: SessionSeqCursor = events.at(-1)?.seq ?? cursorBefore(baseSeq)
     const beforeBase = cursorBefore(baseSeq)
+    const selected = selectedKeys(keys)
     const values: Record<string, unknown> = {}
     const refreshed: ProjectionCheckpoint = {}
     for (const registration of this.registrations.values()) {
       if (registration.refs === 0) continue
       const def = registration.def
+      if (selected !== undefined && !selected.has(def.key)) continue
       const row = checkpoint[def.key]
       const usable = row !== undefined
         && row.ver === def.stateVersion

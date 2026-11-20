@@ -843,6 +843,89 @@ describe('SessionProjectionRegistry drive', () => {
     expect(currentCheckpoint['test/count']).toEqual({ ver: 1, seq: 4, val: 5 })
   })
 
+  it('restore with a key selection folds only the selected units', async () => {
+    const { ctx } = await harness()
+    await ctx.sessionProjections.register(marksUnit())
+    const countApply = vi.fn((state: number) => state + 1)
+    await ctx.sessionProjections.register({ ...countUnit(), apply: countApply })
+    const events: SessionEvent[] = [
+      { type: 'turn/start', seq: SessionSeq(0), time: 0, data: { turn: 1 } },
+      { type: 'test/mark', seq: SessionSeq(1), time: 1, data: { marks: ['selected'] } },
+    ]
+
+    const restored = ctx.sessionProjections.restore(
+      {},
+      events,
+      SessionLogOffset(0),
+      RESTORE_HEADER,
+      SessionLogOffset(0),
+      ['test/marks'],
+    )
+
+    // The unselected unit is not folded: a selective cold read pays only the
+    // units it needs, whatever the rest of the registry costs.
+    expect(countApply).not.toHaveBeenCalled()
+    expect(restored.snapshot).toEqual({ asOfSeq: 1, values: { 'test/marks': { marks: ['selected'] } } })
+    // The refreshed checkpoint covers exactly the selection, so a write-back
+    // merges it with the rows the caller keeps rather than replacing them.
+    expect(restored.checkpoint).toEqual({
+      'test/marks': { ver: 1, seq: SessionSeq(1), val: { marks: ['selected'] } },
+    })
+  })
+
+  it('restore without a key selection still folds every registered unit', async () => {
+    const { ctx } = await harness()
+    await ctx.sessionProjections.register(marksUnit())
+    await ctx.sessionProjections.register(countUnit())
+    const events: SessionEvent[] = [
+      { type: 'turn/start', seq: SessionSeq(0), time: 0, data: { turn: 1 } },
+      { type: 'test/mark', seq: SessionSeq(1), time: 1, data: { marks: ['all'] } },
+    ]
+
+    const restored = ctx.sessionProjections.restore(
+      {},
+      events,
+      SessionLogOffset(0),
+      RESTORE_HEADER,
+      SessionLogOffset(0),
+    )
+
+    expect(restored.snapshot).toEqual({ asOfSeq: 1, values: { 'test/marks': { marks: ['all'] } } })
+    expect(restored.checkpoint).toEqual({
+      'test/marks': { ver: 1, seq: SessionSeq(1), val: { marks: ['all'] } },
+      'test/count': { ver: 1, seq: SessionSeq(1), val: 2 },
+    })
+  })
+
+  it('restore with a key selection ignores an unusable unselected row on a suffix read', async () => {
+    const { ctx } = await harness()
+    await ctx.sessionProjections.register(marksUnit())
+    await ctx.sessionProjections.register(countUnit())
+    const rows = {
+      'test/marks': { ver: 1, seq: SessionSeq(2), val: { marks: ['old'] } },
+      // Version-mismatched; folded by default this would force a full re-read,
+      // but a read that does not select the key must not pay that cost.
+      'test/count': { ver: 99, seq: SessionSeq(2), val: 3 },
+    }
+    const tail: SessionEvent[] = [
+      { type: 'test/mark', seq: SessionSeq(3), time: 3, data: { marks: ['new'] } },
+    ]
+
+    const restored = ctx.sessionProjections.restore(
+      rows,
+      tail,
+      SessionLogOffset(3),
+      RESTORE_HEADER,
+      SessionLogOffset(0),
+      ['test/marks'],
+    )
+
+    expect(restored.snapshot).toEqual({ asOfSeq: 3, values: { 'test/marks': { marks: ['new'] } } })
+    expect(restored.checkpoint).toEqual({
+      'test/marks': { ver: 1, seq: SessionSeq(3), val: { marks: ['new'] } },
+    })
+  })
+
   it('viewCheckpoint serves version-matching rows without any log and skips mismatched keys', async () => {
     const { ctx } = await harness()
     await ctx.sessionProjections.register(marksUnit())

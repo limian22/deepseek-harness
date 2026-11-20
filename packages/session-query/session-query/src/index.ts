@@ -68,8 +68,8 @@ export {
   SESSION_QUERY_READ_WINDOW_MAX,
   SessionQueryError,
 } from './config.ts'
-export { readColdSessionLog } from './cold-read.ts'
-export type { ColdSessionLog } from './cold-read.ts'
+export { readColdSessionLog, readStableColdLog } from './cold-read.ts'
+export type { ColdSessionLog, StableColdLog } from './cold-read.ts'
 export { extractSessionEventText } from './extraction.ts'
 export { buildSessionEventRecords, buildSessionEventSearchDocuments } from './documents.ts'
 export {
@@ -148,7 +148,8 @@ export abstract class SessionQueryEngine extends Service {
    * Search the live-preferred logical corpus and group by session.
    * @param request - query text, metadata filters, page size, and cursor.
    * @param exec - optional cancellation control.
-   * @returns session hits ranked by their strongest matching event.
+   * @returns session hits ranked by their strongest matching event. Asynchronous
+   *   providers include scoped coverage and may return partial indexed history.
    */
   abstract searchSessions(
     request: SessionSearchRequest,
@@ -160,6 +161,7 @@ export abstract class SessionQueryEngine extends Service {
    * @param request - target session, query text, filters, page size, and cursor.
    * @param exec - optional cancellation control.
    * @returns matching event hits and their target header from one indexed generation.
+   *   Asynchronous providers include coverage when indexing is pending or incomplete.
    */
   abstract searchEvents(
     request: SessionEventSearchRequest,

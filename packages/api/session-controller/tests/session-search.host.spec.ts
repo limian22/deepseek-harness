@@ -172,6 +172,7 @@ describe('session.search', () => {
     ]
     expect(query).toEqual({
       query: 'matching answer',
+      snapshot: true,
       eventFilters: [
         {
           kind: 'type',

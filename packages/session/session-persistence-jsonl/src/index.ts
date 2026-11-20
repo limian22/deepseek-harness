@@ -46,6 +46,14 @@ import {
 } from './zstd.ts'
 import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
 import { verifyCurrentGenerationInWorker } from './migration-verifier.ts'
+import {
+  JsonlReadWorkerClient,
+  JsonlReadWorkerDecodeError,
+  JsonlReadWorkerSourceChangedError,
+  READ_WORKER_SOURCE_CHANGE_ATTEMPTS,
+  type ReadLogWorkerResult,
+} from './read-worker-client.ts'
+import { fileRevision } from './revision.ts'
 import { prepareCatalogFacts } from './catalog-migration.ts'
 import {
   JsonlGenerationSourceChangedError,
@@ -90,7 +98,7 @@ export const JsonlCompressionSchema: z<JsonlCompression> = z.union([
 /** Default maximum listing filesystem operations in flight per backend. */
 const DEFAULT_LIST_CONCURRENCY = 3
 
-/** Plugin config for the JSONL backend's root, physical encoding, and listing concurrency. */
+/** Plugin config for the JSONL backend's root, physical encoding, listing concurrency, and optional read worker. */
 export interface Config {
   /**
    * Root directory for all session files. Required (no default): a default of
@@ -108,6 +116,15 @@ export interface Config {
    * fingerprints). Defaults to 3.
    */
   listConcurrency?: number
+  /**
+   * Decode and validate cold `read` opens of the selected current generation in
+   * one long-lived Worker Thread instead of the opening thread. The worker runs
+   * this same provider over the same root and only opens read handles; the
+   * public `SessionPersistence` handle API is unchanged. Defaults to false, and
+   * a worker failure surfaces to the caller rather than silently returning to
+   * in-process decoding. Historical generations always decode in-process.
+   */
+  readWorker?: boolean
 }
 
 /** Logical header paired with the catalog's selected physical-generation classification. */
@@ -194,17 +211,6 @@ interface MigrationPreparation {
   readonly promise: Promise<PreparedStoredLog>
   settled: boolean
   waiters: number
-}
-
-/** Build the stat-derived best-effort change token shared by full and lightweight reads. */
-function fileRevision(identity: JsonlPhysicalIdentity): PersistenceRevision {
-  return SessionPersistenceRevision([
-    identity.dev,
-    identity.ino,
-    identity.size,
-    identity.mtimeNs,
-    identity.ctimeNs,
-  ].join(':'))
 }
 
 /** Whether a filesystem error means absence; every non-ENOENT failure must surface. */
@@ -312,6 +318,11 @@ class JsonlSessionPersistence extends SessionPersistence {
   private readonly coldLogMemo = new Map<SessionId, StoredLog>()
   /** One joinable decode/migration operation per selected historical Session file revision. */
   private readonly migrationPreparations = new Map<SessionId, MigrationPreparation>()
+  /**
+   * Owns the optional cold-read Worker Thread. The worker is spawned on the
+   * first worker-eligible open and reused; this owner terminates it on dispose.
+   */
+  private readonly readWorkerClient: JsonlReadWorkerClient | undefined
 
   constructor(ctx: Context, public config: Config, private readonly tracker: JsonlBackendTracker) {
     super(ctx)
@@ -335,6 +346,17 @@ class JsonlSessionPersistence extends SessionPersistence {
         error instanceof SessionFormatUnsupportedMigrationError,
     }
     this.assertUsableRoot()
+    this.readWorkerClient = config.readWorker === true
+      ? new JsonlReadWorkerClient({ root: this.root, compression: this.compression })
+      : undefined
+  }
+
+  /**
+   * Terminate this backend instance's cold-read worker and wait for it.
+   * @returns resolution after the worker terminated, when one was spawned.
+   */
+  async disposeReadWorker(): Promise<void> {
+    await this.readWorkerClient?.dispose()
   }
 
   /**
@@ -394,6 +416,16 @@ class JsonlSessionPersistence extends SessionPersistence {
       if (pending !== undefined) {
         return this.tracker.adopt(new JsonlSessionHandle(this, id, pending.header, 'read', { cursor: 0, materialized: false, inheritedEventCount: pending.inheritedEventCount }))
       }
+      if (this.readWorkerClient !== undefined) {
+        const workerStored = await this.openReadInWorker(id, this.readWorkerClient, options?.signal)
+        if (workerStored !== undefined) {
+          return this.tracker.adopt(new JsonlSessionHandle(this, id, workerStored.meta, 'read', {
+            cursor: 0,
+            materialized: true,
+            inheritedEventCount: workerStored.inheritedEventCount,
+          }))
+        }
+      }
       let stored: StoredLog
       try {
         stored = await this.requireStoredLog(id, options?.signal)
@@ -426,6 +458,9 @@ class JsonlSessionPersistence extends SessionPersistence {
       const resolved = await this.findLog(id, options?.signal)
       if (resolved === undefined) throw new SessionPersistenceNotFoundError(id)
       lease = await this.acquireLease(id, undefined, dirname(resolved.currentPath))
+      // Worker snapshots omit physical-tail repair metadata. Reconstruct it
+      // under the write lease before any append can consume the cached log.
+      if (this.readWorkerClient !== undefined) this.coldLogMemo.delete(id)
       const prepared = await this.requireStoredLog(id, options?.signal)
       options?.signal?.throwIfAborted()
       let stored: CurrentStoredLog
@@ -462,6 +497,108 @@ class JsonlSessionPersistence extends SessionPersistence {
       }
       throw failure
     }
+  }
+
+  /**
+   * Decode the selected current generation in the read worker.
+   *
+   * The worker path applies only to the current format; a historical, future, or
+   * absent selection returns `undefined` so the existing in-process path owns the
+   * outcome. The caller re-checks the revision on both sides of the worker read
+   * and retries a bounded number of newer source revisions; a worker transport
+   * or protocol failure rejects instead of silently decoding on this thread.
+   * @param id - the stored session to open for reading.
+   * @param client - this backend instance's read worker owner.
+   * @param signal - optional cancellation propagated to the waiter.
+   * @returns the validated current log, or `undefined` to use the in-process path.
+   */
+  private async openReadInWorker(
+    id: SessionId,
+    client: JsonlReadWorkerClient,
+    signal?: AbortSignal,
+  ): Promise<CurrentStoredLog | undefined> {
+    signal?.throwIfAborted()
+    const selected = await this.findLog(id, signal)
+    if (selected === undefined) return undefined
+    if (selected.sourceVersion !== SESSION_FORMAT_VERSION) return undefined
+    let revision: PersistenceRevision
+    try {
+      revision = fileRevision(await stat(selected.sourcePath, { bigint: true }))
+    } catch (error: unknown) {
+      if (isENOENT(error)) return undefined
+      throw error
+    }
+    const memoized = this.coldLogMemo.get(id)
+    if (memoized?.status === 'current' && memoized.revision === revision) {
+      this.coldLogMemo.delete(id)
+      this.coldLogMemo.set(id, memoized)
+      return memoized
+    }
+    for (let attempt = 0; attempt < READ_WORKER_SOURCE_CHANGE_ATTEMPTS; attempt += 1) {
+      signal?.throwIfAborted()
+      let result: ReadLogWorkerResult
+      try {
+        result = await client.read({ id, path: selected.sourcePath, revision }, signal)
+      } catch (error: unknown) {
+        signal?.throwIfAborted()
+        if (error instanceof JsonlReadWorkerSourceChangedError) {
+          try {
+            revision = fileRevision(await stat(selected.sourcePath, { bigint: true }))
+          } catch (statError: unknown) {
+            if (isENOENT(statError)) return undefined
+            throw statError
+          }
+          continue
+        }
+        if (error instanceof JsonlReadWorkerDecodeError) throw this.workerReadFailure(selected, error)
+        throw error
+      }
+      signal?.throwIfAborted()
+      let after: PersistenceRevision
+      try {
+        after = fileRevision(await stat(selected.sourcePath, { bigint: true }))
+      } catch (error: unknown) {
+        if (isENOENT(error)) return undefined
+        throw error
+      }
+      if (after !== revision) {
+        revision = after
+        continue
+      }
+      await this.assertStoredIdentity(selected.sourcePath, SESSION_FORMAT_VERSION, result.header, id, signal)
+      signal?.throwIfAborted()
+      const events = validateStoredEvents(result.header, result.events, {
+        kind: 'jsonl',
+        path: selected.sourcePath,
+      })
+      const stored: CurrentStoredLog = {
+        status: 'current',
+        meta: result.header,
+        ...freezeStoredEvents(events),
+        tornTruncateTo: undefined,
+        recoveredTail: [],
+        inheritedEventCount: SessionLogOffset(result.inheritedEventCount),
+        revision,
+      }
+      this.memoizeStoredLog(id, stored)
+      return stored
+    }
+    // Only continuous source churn reaches this point; the existing stable-read
+    // path returns the committed prefix exactly as an in-process open would.
+    return undefined
+  }
+
+  /** Translate a worker-side backend failure into the persistence seam's error vocabulary. */
+  private workerReadFailure(selected: ResolvedJsonlGeneration, error: JsonlReadWorkerDecodeError): Error {
+    if (error.errorName === 'SessionPersistenceCorruptionError') {
+      return new SessionPersistenceCorruptionError(error.message, { cause: error })
+    }
+    if (error.errorName === 'SessionFormatUnsupportedError') {
+      return new SessionFormatUnsupportedError(error.message, { kind: 'jsonl', path: selected.sourcePath })
+    }
+    const failure = new Error(error.message, { cause: error })
+    if (error.errorCode !== undefined) (failure as NodeJS.ErrnoException).code = error.errorCode
+    return failure
   }
 
   /**
@@ -1811,6 +1948,7 @@ export const Config: z<Config> = z.object({
   root: z.string().required(),
   compression: JsonlCompressionSchema,
   listConcurrency: z.natural().min(1).default(DEFAULT_LIST_CONCURRENCY),
+  readWorker: z.boolean().default(false),
 })
 
 /**
@@ -1830,7 +1968,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     service = ctx.plugin({
       name: 'session-persistence-jsonl-service',
       apply(serviceCtx: Context) {
-        new JsonlSessionPersistence(serviceCtx, config, tracker)
+        const persistence = new JsonlSessionPersistence(serviceCtx, config, tracker)
+        // The worker is a backend-owned resource: dispose waits for its
+        // termination so a reload never leaves a decoding thread behind.
+        serviceCtx.effect(() => () => persistence.disposeReadWorker())
       },
     })
     yield service.dispose

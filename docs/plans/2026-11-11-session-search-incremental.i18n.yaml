@@ -1,0 +1,31 @@
+# Bilingual-pair consistency record for 2026-11-11-session-search-incremental.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/plans/2026-11-11-session-search-incremental.md
+/incremental-session-search-implementation-plan:
+  en: de66f4e6739dcf86
+  zh: 4ae70ca8bfe03d95
+/incremental-session-search-implementation-plan/global-constraints:
+  en: 43e4f19054a5506c
+  zh: 0367c36f5bad29fb
+/incremental-session-search-implementation-plan/measurement-card:
+  en: ba8659e52fb9b7cb
+  zh: c84fdfef0552a990
+/incremental-session-search-implementation-plan/task-1-establish-regression-and-shared-coverage-api:
+  en: 0fcc5239c0feeaa0
+  zh: b8f8273d97b04fea
+/incremental-session-search-implementation-plan/task-2-background-provider-with-resumable-publication:
+  en: 747e74e5b8464745
+  zh: c28519c791777212
+/incremental-session-search-implementation-plan/task-3-off-thread-preparation-and-disk-index-composition:
+  en: b6581ef39894e60a
+  zh: 0fa97888a75c0539
+/incremental-session-search-implementation-plan/task-4-model-visible-coverage-and-safe-title-enrichment:
+  en: 6b33d6ff2dca7a5f
+  zh: d2685171c5a3125a
+/incremental-session-search-implementation-plan/task-5-review-and-validation:
+  en: eb9446996fa6ac69
+  zh: e7446474ae5d2d2e
+/incremental-session-search-implementation-plan/progress-ledger:
+  en: 5a3a2dc44b1dfe8f
+  zh: 9b9bcabeede77d60

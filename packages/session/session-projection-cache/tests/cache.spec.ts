@@ -45,6 +45,7 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
     'cache-test/marks3': { marks: string[] }
     'cache-test/summary-excluded': SessionProjectionSummaryExcluded<{ n: number }>
     title: string | null
+    sessionListMetadata: { readonly blank: boolean; readonly lastPromptAt: number | null }
   }
 }
 
@@ -118,10 +119,30 @@ const titleUnit = {
   key: 'title',
   stateSchema: z.string().nullable(),
   init: () => null,
-  apply: state => state,
+  apply: (state, event) => (event.type as string) === 'session/title'
+    ? (event as unknown as { data: { title: string } }).data.title
+    : state,
   wire: { viewSchema: z.string().nullable(), view: state => state },
   stateVersion: 1,
 } satisfies ProjectionDefinition<'title', string | null>
+
+/** Mirrors the shipped list-metadata unit: blankness and last-human-prompt recency. */
+const listMetadataUnit = {
+  key: 'sessionListMetadata',
+  stateSchema: z.object({ blank: z.boolean(), lastPromptAt: z.number().nullable() }),
+  init: () => ({ blank: true, lastPromptAt: null }),
+  apply: (state, event) => {
+    const blank = state.blank && event.type !== 'turn/start'
+    const lastPromptAt = event.type === 'user/message' && event.data.source.kind === 'user'
+      ? event.time
+      : state.lastPromptAt
+    return blank === state.blank && lastPromptAt === state.lastPromptAt
+      ? state
+      : { blank, lastPromptAt }
+  },
+  wire: { viewSchema: z.object({ blank: z.boolean(), lastPromptAt: z.number().nullable() }), view: state => state },
+  stateVersion: 1,
+} satisfies ProjectionDefinition<'sessionListMetadata', { blank: boolean; lastPromptAt: number | null }>
 
 /** One session's record document on the per-record medium. */
 const recordPath = (root: string, id: Session['id']): string =>
@@ -916,6 +937,281 @@ describe('SessionProjectionCache cold-read seeding', () => {
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('cold-read write-back for "cold-fail" failed'))
     }, { timeout: 5_000 })
+  })
+})
+
+describe('SessionProjectionCache durable cold checkpoints', () => {
+  /** One stored titled log: turn/start, title, turn/end. */
+  const titledLog = (): SessionEvent[] => [
+    { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+    {
+      type: 'session/title',
+      seq: SessionSeq(1),
+      time: 2,
+      data: { title: 'Durable title', messageSeqs: [], source: { kind: 'user' } },
+    },
+    { type: 'turn/end', seq: SessionSeq(2), time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ]
+
+  it('awaits durability and serves the checkpoint through the listing read', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('durable-cold'), 9)
+    const events = titledLog()
+
+    const snapshot = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), events)
+
+    expect(snapshot?.asOfSeq).toBe(2)
+    expect(snapshot?.values).toMatchObject({ title: 'Durable title' })
+    expect(cache.cachedSnapshot(meta, ['title'])).toEqual({
+      asOfSeq: 2,
+      values: { title: 'Durable title' },
+    })
+  })
+
+  /** One stored human prompt at `time`, shaped like the real user/message event. */
+  const promptEvent = (seq: number, time: number): SessionEvent => ({
+    type: 'user/message',
+    seq: SessionSeq(seq),
+    time,
+    data: { id: `message-${String(seq)}`, role: 'user', content: [], source: { kind: 'user' } },
+  }) as unknown as SessionEvent
+
+  it('folds only the title and list-metadata units for a durable cold checkpoint', async () => {
+    const { ctx, cache, root } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const expensiveApply = vi.fn((state: number) => state + 1)
+    await ctx.sessionProjections.register({
+      key: 'cache-test/count',
+      stateSchema: z.number().int().nonnegative(),
+      init: () => 0,
+      apply: expensiveApply,
+      stateVersion: 1,
+    })
+    const meta = headerOf(SessionId('durable-scope'), 9)
+
+    await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
+
+    // Unrelated units are neither folded nor required to be registered: a
+    // title recovery must not pay every projection's full-log fold.
+    expect(expensiveApply).not.toHaveBeenCalled()
+    expect(await storedRows(root, meta.id)).toEqual({
+      title: { ver: 1, seq: SessionSeq(2), val: 'Durable title' },
+    })
+  })
+
+  it('preserves the other checkpoint rows of the same lifecycle', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-'))
+    roots.push(root)
+    await seedRecord(root, 'durable-merge', {
+      'cache-test/secret': { ver: 1, seq: SessionSeq(1), val: 'kept by another composition' },
+      // A title-only recovery (the list-metadata unit need not be registered)
+      // must not blank the row that already carries this Session's recency.
+      sessionListMetadata: { ver: 1, seq: SessionSeq(1), val: { blank: false, lastPromptAt: 900 } },
+      title: { ver: 1, seq: SessionSeq(0), val: 'stale creation title' },
+    })
+    const { ctx, cache } = await harness({ root })
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('durable-merge'))
+
+    await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
+
+    expect(await storedRows(root, meta.id)).toEqual({
+      'cache-test/secret': { ver: 1, seq: SessionSeq(1), val: 'kept by another composition' },
+      sessionListMetadata: { ver: 1, seq: SessionSeq(1), val: { blank: false, lastPromptAt: 900 } },
+      title: { ver: 1, seq: SessionSeq(2), val: 'Durable title' },
+    })
+  })
+
+  it('refreshes list metadata so blankness and prompt recency survive a title recovery', async () => {
+    const { ctx, cache, root } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    await ctx.sessionProjections.register(listMetadataUnit)
+    const events: SessionEvent[] = [
+      { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+      promptEvent(1, 1200),
+      {
+        type: 'session/title',
+        seq: SessionSeq(2),
+        time: 2,
+        data: { title: 'Recovered title', messageSeqs: [], source: { kind: 'user' } },
+      },
+      { type: 'turn/end', seq: SessionSeq(3), time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    const meta = headerOf(SessionId('durable-metadata'), 9)
+
+    await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(3), events)
+
+    // The list block is not reduced to a title-only row: a recovered Session
+    // that has prompted stays non-blank and keeps its proven recency.
+    expect(cache.cachedSnapshot(meta, ['title', 'sessionListMetadata'])).toEqual({
+      asOfSeq: 3,
+      values: {
+        title: 'Recovered title',
+        sessionListMetadata: { blank: false, lastPromptAt: 1200 },
+      },
+    })
+    expect(await storedRows(root, meta.id)).toEqual({
+      title: { ver: 1, seq: SessionSeq(3), val: 'Recovered title' },
+      sessionListMetadata: { ver: 1, seq: SessionSeq(3), val: { blank: false, lastPromptAt: 1200 } },
+    })
+  })
+
+  it('drops another lifecycle record instead of carrying its rows forward', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-'))
+    roots.push(root)
+    await seedRecord(root, 'durable-foreign', {
+      'cache-test/secret': { ver: 1, seq: SessionSeq(1), val: 'foreign lifecycle' },
+    }, {
+      formatVersion: SESSION_FORMAT_VERSION,
+      createdAt: 1,
+      isSeeded: false,
+      inheritedEventCount: SessionLogOffset(0),
+    })
+    const { ctx, cache } = await harness({ root })
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('durable-foreign'), 9)
+
+    await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
+
+    expect(await storedRows(root, meta.id)).toEqual({
+      title: { ver: 1, seq: SessionSeq(2), val: 'Durable title' },
+    })
+  })
+
+  it('rejects events that are not contiguous from seq 0', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('durable-gap'), 9)
+    const gapped: SessionEvent[] = [
+      { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+      { type: 'turn/end', seq: SessionSeq(2), time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+
+    await expect(cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), gapped))
+      .rejects.toThrow(/contiguous from seq 0/)
+    expect(cache.cachedSnapshot(meta)).toBeUndefined()
+  })
+
+  it('refuses a cut older than any row in a multi-row record', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-'))
+    roots.push(root)
+    await seedRecord(root, 'durable-multi-row', {
+      title: { ver: 1, seq: SessionSeq(5), val: 'newer title' },
+      'cache-test/secret': { ver: 1, seq: SessionSeq(1), val: 'kept' },
+    })
+    const { ctx, cache } = await harness({ root })
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('durable-multi-row'))
+
+    expect(await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog()))
+      .toBeUndefined()
+    expect(await storedRows(root, meta.id)).toEqual({
+      title: { ver: 1, seq: SessionSeq(5), val: 'newer title' },
+      'cache-test/secret': { ver: 1, seq: SessionSeq(1), val: 'kept' },
+    })
+  })
+
+  it('rejects a declared watermark that is not the last supplied event', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('durable-mismatch'), 9)
+
+    await expect(cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(1), titledLog()))
+      .rejects.toThrow(/must end at seq/)
+    expect(cache.cachedSnapshot(meta)).toBeUndefined()
+  })
+
+  it('abandons the write when the pre-put guard refuses it', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('guard-refused'), 9)
+
+    const written = await cache.coldSnapshotDurable(
+      meta,
+      SessionLogOffset(0),
+      SessionSeq(2),
+      titledLog(),
+      { guard: () => false },
+    )
+
+    expect(written).toBeUndefined()
+    expect(cache.cachedSnapshot(meta)).toBeUndefined()
+  })
+
+  it('does not overwrite an identity-matching record newer than the declared cut', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-'))
+    roots.push(root)
+    await seedRecord(root, 'newer-cold', {
+      title: { ver: 1, seq: SessionSeq(5), val: 'newer title' },
+    }, {
+      formatVersion: SESSION_FORMAT_VERSION,
+      createdAt: 9,
+      isSeeded: false,
+      inheritedEventCount: SessionLogOffset(0),
+    })
+    const { ctx, cache } = await harness({ root })
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('newer-cold'), 9)
+
+    const written = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
+
+    expect(written).toBeUndefined()
+    expect(cache.cachedSnapshot(meta, ['title'])).toEqual({
+      asOfSeq: 5,
+      values: { title: 'newer title' },
+    })
+  })
+
+  it('loses the write-chain race to another checkpoint that lands while the guard is pending', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('epoch-race'), 9)
+    const gate = Promise.withResolvers<undefined>()
+
+    const slow = cache.coldSnapshotDurable(
+      meta,
+      SessionLogOffset(0),
+      SessionSeq(2),
+      titledLog(),
+      { guard: async () => { await gate.promise; return true } },
+    )
+    const fast = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
+    gate.resolve(undefined)
+
+    expect(fast).toBeDefined()
+    expect(await slow).toBeUndefined()
+    expect(cache.cachedSnapshot(meta, ['title'])).toBeDefined()
+  })
+
+  it('refuses to write while the session is live', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('live-cold-write'), 9)
+    ctx.sessions.create(meta.id, { meta: { createdAt: meta.createdAt } })
+
+    expect(await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog()))
+      .toBeUndefined()
+  })
+
+  it('writes a negative marker for an empty stored log', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(SessionId('empty-cold'), 9)
+
+    const snapshot = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), -1, [])
+
+    expect(snapshot?.asOfSeq).toBe(-1)
+    expect(cache.cachedSnapshot(meta, ['title'])).toEqual({ asOfSeq: -1, values: { title: null } })
+  })
+
+  it('rejects when the durable write itself fails', async () => {
+    const { cache, root } = await harness()
+    const meta = headerOf(SessionId('durable-failure'), 9)
+    // A directory where the record document must land makes the put fail.
+    await mkdir(recordPath(root, meta.id), { recursive: true })
+    await expect(cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog()))
+      .rejects.toThrow()
   })
 })
 
