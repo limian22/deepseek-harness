@@ -94,6 +94,17 @@ async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, pre
   return { ctx, dir, manager: ctx.pluginManager, bundle, profile, stopHmr, overlays, connection }
 }
 
+it('looks up dependencies in the current profile manifest even when a backup declares a retired package', async () => {
+  const retired = '@local/hermes-loop-dev'
+  const { manager } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    const backup = join(dir, 'backup')
+    mkdirSync(backup)
+    writeFileSync(join(backup, 'package.json'), JSON.stringify({ dependencies: { [retired]: 'link:./retired' } }))
+  })
+  expect(manager.hasProfileDependency(retired)).toBe(false)
+  expect(manager.hasProfileDependency('extra')).toBe(true)
+})
+
 it.each(['live', 'startup'] as const)('refuses an unsupported bundle before saving or applying it with %s reload', async (reload) => {
   const { manager, dir, ctx } = await fixture(reload, false, undefined, {}, undefined, (dir) => {
     const path = join(dir, 'node_modules/extra/package.json')

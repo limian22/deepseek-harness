@@ -605,6 +605,19 @@ export class PluginManager extends TypertRemoteService {
     }), { stage: 'enable', target: packageVersion, enabled }, 'bundle', exemptionOperationIdentity(packageVersion, runtimeVersion))
   }
 
+  /** Check the active profile manifest for an exact direct dependency key.
+   * @param name Package name as declared under `dependencies`.
+   * @returns Whether the current manifest declares the package.
+   */
+  hasProfileDependency(name: string): boolean {
+    const { dependencies } = readProfileManifest('dsh', this.profile.dir)
+    if (dependencies === undefined) return false
+    if (typeof dependencies !== 'object' || dependencies === null || Array.isArray(dependencies)) {
+      throw new Error('Current profile manifest dependencies must be an object')
+    }
+    return Object.hasOwn(dependencies, name)
+  }
+
   /** Read current plugins, including why a row cannot be changed through the profile patch.
    * The listing projects Loader entries only; preset compositions belong to the inventory Remote.
    * @returns Current runtime entries with persistent patch targets.
