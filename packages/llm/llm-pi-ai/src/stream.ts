@@ -57,7 +57,7 @@ function classifyPiAiError(message: string): string {
   // truncation, not a model-level error.
   if (/stream ended (?:before|without)\b/i.test(message)) return 'TRANSPORT'
   if (/\b(?:network|connection|socket|fetch)\b|\bECONN[A-Z]+\b/i.test(message)
-    || /\b(?:other side closed|HTTP2 request did not get a response|WebSocket closed unexpectedly)\b/i.test(message)
+    || /\b(?:other side closed|HTTP2 request did not get a response|WebSocket closed(?: unexpectedly| 1012))\b/i.test(message)
     // undici renders a mid-stream socket drop as a bare `terminated` (its
     // `cause` — the real SocketError — was flattened away upstream); Node's
     // stream layer says `Premature close`.
@@ -65,6 +65,36 @@ function classifyPiAiError(message: string): string {
     return 'TRANSPORT'
   }
   return 'PI_AI_ERROR'
+}
+
+// Error context exposes only identity and enumerated transport metadata, never
+// diagnostic messages, stacks, headers, payloads, or arbitrary provider details.
+function formatPiAiError(message: AssistantMessage, text: string): string {
+  const diagnostic = message.diagnostics?.findLast(item => item.type === 'provider_transport_failure')
+  const details = diagnostic?.details
+  const transports = ['auto', 'sse', 'websocket', 'websocket-cached']
+  const configuredTransport = transports.find(value => value === details?.configuredTransport)
+  const fallbackTransport = transports.find(value => value === details?.fallbackTransport)
+  const phase = ['before_message_stream_start', 'after_message_stream_start'].find(value => value === details?.phase)
+  const code = diagnostic?.error?.code
+  const safeCode = typeof code === 'number'
+    ? Number.isInteger(code) && code >= 0 && code <= 0xFFFF
+    : typeof code === 'string' && /^(?:E(?:CONNRESET|CONNREFUSED|CONNABORTED|TIMEDOUT|NOTFOUND|AI_AGAIN|HOSTUNREACH|NETUNREACH|PIPE)|UND_ERR_(?:SOCKET|CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|ABORTED))$/.test(code)
+  const elapsedMs = diagnostic === undefined ? undefined : diagnostic.timestamp - message.timestamp
+  const context = {
+    provider: message.provider,
+    model: message.model,
+    api: message.api,
+    lastTransportFailure: diagnostic === undefined ? 'not provided' : {
+      configuredTransport: configuredTransport ?? 'not available',
+      phase: phase ?? 'not available',
+      errorCode: safeCode ? code : 'not available',
+      ...fallbackTransport === undefined ? {} : { fallbackTransport },
+      ...typeof details?.eventsEmitted === 'boolean' ? { eventsEmitted: details.eventsEmitted } : {},
+      ...elapsedMs !== undefined && elapsedMs >= 0 ? { elapsedMs } : {},
+    },
+  }
+  return `${text}\npi-ai diagnostics: ${JSON.stringify(context)}`
 }
 
 /**
@@ -75,7 +105,9 @@ function classifyPiAiError(message: string): string {
  *   `contextWindow`, and zero-output `length` usage that fills the window map
  *   to `CONTEXT_WINDOW_EXCEEDED`; a `stop` with no content blocks maps to an
  *   `EMPTY_RESPONSE` error, while terminal `pending` and `deferred` states map
- *   to non-retryable `PI_AI_ERROR` failures.
+ *   to non-retryable `PI_AI_ERROR` failures. Unclassified in-band errors retain
+ *   their text and append identity plus allowlisted transport diagnostics without
+ *   changing retry eligibility; transport history is not a terminal-cause claim.
  */
 export function mapStopReason(message: AssistantMessage, contextWindow?: number): FinishReason {
   const piAiOverflow = isContextOverflow(message, contextWindow)
@@ -122,7 +154,8 @@ export function mapStopReason(message: AssistantMessage, contextWindow?: number)
     }
     case 'error': {
       const text = message.errorMessage ?? 'pi-ai stream error'
-      return { kind: 'error', failure: { message: text, code: classifyPiAiError(text) } }
+      const code = classifyPiAiError(text)
+      return { kind: 'error', failure: { message: code === 'PI_AI_ERROR' ? formatPiAiError(message, text) : text, code } }
     }
   }
 }
