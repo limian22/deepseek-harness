@@ -150,6 +150,10 @@ interface SessionEventSearchDocument extends SessionEventRecord {
 
 The combined `ctx.sessionQuery` seam has two full-text scopes. `searchSessions()` groups the corpus by strongest matching event; `searchEvents()` searches one session. Requests bind an opaque cursor to the normalized query, metadata filters, and limit. The event text scan is intentionally absent from provider metadata filters.
 
+A request may also set `snapshot: true` to ask the provider to capture its complete ranking on the first page, so later pages keep the same results while sources keep changing. Capture support is provider-specific: a provider without it ignores the flag and continues with generation-bound cursors, and one that captures still reports `SESSION_QUERY_STALE_CURSOR` once its capture expires.
+
+An asynchronous provider also reports `coverage` on each page: the freshness of the authorized session scope that page was answered from. `state` distinguishes initial discovery, pending updates, a completed pass, and isolated source failures; `checkedAt` carries the last complete source observation; the optional session counts stay inside the request's own session predicates. A provider that reconciles its sources before returning omits `coverage`, which makes an empty page a complete answer. A page whose coverage is present and not `ready` is not a complete answer, and a consumer that presents "no matches" must check the state first. A consumer that walks several pages treats the whole result as partial when any page it received was not `ready`, and consumers must preserve that difference instead of collapsing a partial page into a complete empty result.
+
 ```ts type-equiv
 /** Provider-owned opaque continuation token returned by session search. */
 type SessionSearchCursor = Branded<'SessionSearchCursor'>
@@ -168,6 +172,12 @@ interface SessionSearchRequest {
   limit?: number
   /** Opaque cursor returned for the identical normalized request. */
   cursor?: SessionSearchCursor
+  /**
+   * Capture the complete ranking on the first page so later pages read the
+   * same results while the corpus keeps changing. Providers that cannot
+   * capture fall back to generation-bound cursors.
+   */
+  snapshot?: boolean
 }
 ```
 
@@ -184,6 +194,30 @@ interface SessionEventSearchRequest {
   limit?: number
   /** Opaque cursor returned for the identical normalized request. */
   cursor?: SessionSearchCursor
+  /**
+   * Capture the complete ranking on the first page so later pages read the
+   * same results while the session keeps appending. Providers that cannot
+   * capture fall back to generation-bound cursors.
+   */
+  snapshot?: boolean
+}
+```
+
+A page reports the provider's coverage of the authorized scope when that provider indexes in the background.
+
+```ts type-equiv
+/** Freshness of the authorized session scope represented by a search page. */
+interface SessionSearchCoverage {
+  /** Initial discovery, pending updates, completed synchronization, or isolated source failures. */
+  state: 'initializing' | 'syncing' | 'ready' | 'degraded'
+  /** Last successful complete source observation, in Unix epoch milliseconds; absent before one completes. */
+  checkedAt?: number
+  /** Valid indexed sessions matching the request's session predicates; omitted when not established. */
+  indexedSessions?: number
+  /** Sessions awaiting synchronization within the request's session predicates; omitted when unknown. */
+  pendingSessions?: number
+  /** Failed sessions within the request's session predicates; omitted when the scope cannot be established. */
+  failedSessions?: number
 }
 ```
 
@@ -194,6 +228,8 @@ interface SessionSearchPage<T> {
   items: readonly T[]
   /** Opaque continuation cursor, absent on the final page. */
   nextCursor?: SessionSearchCursor
+  /** Indexed coverage for asynchronous providers; absent when the provider reconciles sources before returning. */
+  coverage?: SessionSearchCoverage
 }
 ```
 
@@ -393,7 +429,8 @@ observeSession( sessionId: SessionId, options: SessionObservationOptions = {}, )
  * Search the live-preferred logical corpus and group by session.
  * @param request - query text, metadata filters, page size, and cursor.
  * @param exec - optional cancellation control.
- * @returns session hits ranked by their strongest matching event.
+ * @returns session hits ranked by their strongest matching event. Asynchronous
+ *   providers include scoped coverage and may return partial indexed history.
  */
 abstract searchSessions( request: SessionSearchRequest, exec?: SessionSearchExecContext, ): Promise<SessionSearchPage<SessionSearchHit>>
 
@@ -402,6 +439,7 @@ abstract searchSessions( request: SessionSearchRequest, exec?: SessionSearchExec
  * @param request - target session, query text, filters, page size, and cursor.
  * @param exec - optional cancellation control.
  * @returns matching event hits and their target header from one indexed generation.
+ *   Asynchronous providers include coverage when indexing is pending or incomplete.
  */
 abstract searchEvents( request: SessionEventSearchRequest, exec?: SessionSearchExecContext, ): Promise<SessionEventSearchPage>
 

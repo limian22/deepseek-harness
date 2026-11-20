@@ -1,0 +1,27 @@
+# Activation overlay for @deepseek-ai/dsh-experimental-session-search: keep the
+# derived content index on disk and reconcile it in the background, so a
+# deployment can enable the bundle as shipped instead of reconciling on every
+# search.
+#
+# Apply it after the bundle's own patch layer, for example:
+#   dsh --profile web --patch <this file>
+#
+# A patch replaces the targeted row's whole `config`, so this row restates
+# `openAt`. The background loop starts at readiness: with `openAt: first-search`
+# the first search opens the index and later searches read the committed
+# generations; switch `openAt` to `startup` when the deployment wants the index
+# warm before the first search.
+#
+# One process owns a derived-index path at a time: give every profile,
+# persistence source, and isolated provider its own path namespace, and change
+# that namespace whenever a composition overrides the JSONL session root. A
+# second process pointing at the same path fails its first search with
+# SESSION_QUERY_INDEX_FAILED instead of writing concurrently; ownership cannot
+# prove that a path belongs to the mounted session root.
+- id: optional-session-query-sqlite
+  config:
+    path: !!js dshHomePath('storages/session-search/session-search.db')
+    openAt: first-search
+    syncMode: background
+    syncIntervalMs: 5000
+    syncReadConcurrency: 2

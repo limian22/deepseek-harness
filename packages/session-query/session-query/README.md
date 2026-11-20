@@ -44,6 +44,12 @@ Use `ctx.sessionQuery` from application code when you need to read or search ses
 
 Body-free records expose only `SessionHeader.isSeeded`. Reads that return event bodies (`readSession`, `readSurface`, `readEvent`) and retained `SessionObservation` values also carry the exact `inheritedEventCount`, so callers can distinguish inherited and owned events without inferring a cut from the log.
 
+### Search coverage
+
+A full-text page may also carry `coverage`: how much of the authorized corpus the mounted backend had validated when it answered. `state` is `initializing` during initial discovery, `syncing` while pending updates remain, `ready` after a complete source pass, and `degraded` when some sources failed and were isolated. `checkedAt` is the last complete source observation in Unix epoch milliseconds, and `indexedSessions`, `pendingSessions`, and `failedSessions` count only sessions matching the request's own session predicates, so a scoped caller never learns corpus totals outside its scope.
+
+An absent `coverage` means the backend reconciled its sources before answering, so an empty page is a complete answer. Present coverage whose state is not `ready` means an empty page is not complete: a consumer that renders "no matches" may do so only when coverage is absent or `ready`. Coverage describes the indexed corpus rather than the returned hits, and it is reported per page, so a consumer that walks several pages treats the whole result as partial when any page it received was not `ready`.
+
 ### Filters
 
 `SessionResultFilter` narrows sessions by id, nullable cwd, created-at range, nullable parent, or source availability; `SessionEventResultFilter` narrows events by seq/time range, event type, surface, or literal text. Filter arrays are ANDed and list values within one clause are ORed; empty list values match nothing, ranges are inclusive, and malformed ranges or unknown closed-union values fail with `SESSION_QUERY_INVALID_FILTER`.
@@ -150,6 +156,7 @@ These limits define when this package is a poor fit or needs special operational
 - **No provider coordinator or fallback** — the service is abstract over search, so a composition must mount a concrete backend; there is no search-provider registry or fallback implementation.
 - **Exact reads replay whole logs** — `readSession`, `readSurface`, `filterEvents`, and event traces load and validate the complete logical log, so very large histories pay full inspection per call; `listSessions` stays lightweight.
 - **Literal text scan, not full-text search** — the `text` filter scans extracted documents with a regular expression and does not rank; ranked search requires the mounted backend.
+- **Coverage is provider-reported, not transport-carried** — a consumer whose own surface does not carry `coverage` cannot distinguish a partial search page from a complete empty result.
 
 <a id="dev-note"></a>
 ### Dev Note

@@ -20,6 +20,9 @@
 /deepseek-ai-dsh-session-query/use-this-package/what-you-can-do:
   en: 608cd6d4c5cf2c35
   zh: 23d3c5a7374b5283
+/deepseek-ai-dsh-session-query/use-this-package/search-coverage:
+  en: 635cba712ffd1902
+  zh: 682388e51d645af4
 /deepseek-ai-dsh-session-query/use-this-package/filters:
   en: 1b95403461947ca1
   zh: cffa21b03df9f0ad
@@ -57,8 +60,8 @@
   en: ca75c51c89c2c9b0
   zh: f57cc48a1b5cbfa9
 /deepseek-ai-dsh-session-query/known-limitations-and-deferred-work:
-  en: e70a64614189c09c
-  zh: 88d2a6634385c501
+  en: 572e15f7fc399a9d
+  zh: d68763d56481e982
 /deepseek-ai-dsh-session-query/known-limitations-and-deferred-work/dev-note:
   en: d2f0d68fe29fb750
   zh: 323d21ee73a9e3f6

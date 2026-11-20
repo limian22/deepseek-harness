@@ -352,6 +352,114 @@ describe('registration and schemas', () => {
   })
 })
 
+describe('search coverage reporting', () => {
+  it('reports initialization instead of a complete empty session search', async () => {
+    const mounted = await mount()
+    FakeQuery.sessionSearch = async () => ({
+      items: [],
+      coverage: { state: 'initializing', pendingSessions: 3 },
+    })
+    const output = text(await mounted.call('session_search', { query: 'needle' }))
+    expect(output).toContain('Search coverage: initializing')
+    expect(output).toContain('Results may be incomplete')
+    expect(output).not.toContain('No prior session matches found.')
+  })
+
+  it('reports degraded event coverage without claiming there are no prior matches', async () => {
+    const mounted = await mount()
+    FakeQuery.eventSearch = async request => ({
+      session: header(request.sessionId, '/work'),
+      items: [],
+      coverage: { state: 'degraded', failedSessions: 1 },
+    })
+    const output = text(await mounted.call('session_event_search', { query: 'needle' }))
+    expect(output).toContain('Search coverage: degraded')
+    expect(output).not.toContain('No prior event matches found.')
+  })
+
+  it('retains incomplete coverage across pages with a later ready page', async () => {
+    const mounted = await mount()
+    createSession(mounted.ctx, 'first', '/work')
+    createSession(mounted.ctx, 'second', '/work')
+    FakeQuery.sessionSearch = async request => request.cursor === undefined ? {
+      items: [sessionHit('first', '/work')],
+      nextCursor: SessionSearchCursor('coverage-page'),
+      coverage: { state: 'syncing', pendingSessions: 2 },
+    } : {
+      items: [sessionHit('second', '/work')],
+      coverage: { state: 'ready', checkedAt: 1000 },
+    }
+    const output = text(await mounted.call('session_search', { query: 'needle' }))
+    expect(output).toContain('Session search results (2):')
+    expect(output).toContain('Search coverage: syncing')
+    expect(output).toContain('Results may be incomplete')
+  })
+
+  it('retains coverage when the authorized result cap stops pagination', async () => {
+    const mounted = await mount({ maxSearchResults: 1 })
+    FakeQuery.sessionSearch = async () => ({
+      items: [sessionHit('first', '/work'), sessionHit('second', '/work')],
+      coverage: { state: 'syncing' },
+    })
+    const output = text(await mounted.call('session_search', { query: 'needle' }))
+    expect(output).toContain('Session search results (1):')
+    expect(output).toContain('Result cap reached.')
+    expect(output).toContain('Search coverage: syncing')
+  })
+
+  it('reports degraded coverage observed on a later page', async () => {
+    const mounted = await mount()
+    FakeQuery.sessionSearch = async request => request.cursor === undefined ? {
+      items: [sessionHit('first', '/work')],
+      nextCursor: SessionSearchCursor('degraded-page'),
+      coverage: { state: 'ready' },
+    } : {
+      items: [],
+      coverage: { state: 'degraded' },
+    }
+    const output = text(await mounted.call('session_search', { query: 'needle' }))
+    expect(output).toContain('Search coverage: degraded')
+    expect(output).toContain('Results may be incomplete')
+  })
+
+  it('does not cold-read titles for asynchronously indexed session hits', async () => {
+    const mounted = await mount()
+    const titles = vi.spyOn(mounted.ctx.sessionQuery, 'readTitleSnapshots')
+    FakeQuery.sessionSearch = async () => ({
+      items: [{ ...sessionHit('cold-result', '/work'), live: false, persisted: true }],
+      coverage: { state: 'ready', checkedAt: 1000 },
+    })
+    const output = text(await mounted.call('session_search', { query: 'needle' }))
+    expect(output).toContain('cold-result — title not loaded')
+    expect(output).toContain('needle excerpt')
+    expect(titles).not.toHaveBeenCalled()
+  })
+
+  it('does not cold-read the title while event history is initializing', async () => {
+    const mounted = await mount()
+    const titles = vi.spyOn(mounted.ctx.sessionQuery, 'readTitleSnapshots')
+    FakeQuery.eventSearch = async request => ({
+      session: header(request.sessionId, '/work'),
+      items: [],
+      coverage: { state: 'initializing' },
+    })
+    const output = text(await mounted.call('session_event_search', { query: 'needle' }))
+    expect(output).toContain('title not loaded')
+    expect(titles).not.toHaveBeenCalled()
+  })
+
+  it('keeps complete no-match text when ready coverage is supplied', async () => {
+    const mounted = await mount()
+    FakeQuery.sessionSearch = async () => ({
+      items: [],
+      coverage: { state: 'ready', checkedAt: 1000 },
+    })
+    const output = text(await mounted.call('session_search', { query: 'needle' }))
+    expect(output).toContain('No prior session matches found.')
+    expect(output).toContain('Search coverage: ready')
+  })
+})
+
 describe('input validation and translation', () => {
   it.each([
     [{ query: '   ' }, 'SESSION_QUERY_INVALID_QUERY'],
@@ -428,6 +536,7 @@ describe('input validation and translation', () => {
         { kind: 'type', values: ['plugin/open-event'] },
         { kind: 'surface', values: ['shadowed'] },
       ],
+      snapshot: true,
     })
   })
 
@@ -1295,6 +1404,19 @@ describe('search paging, prior-history bounds, titles, and cancellation', () => 
     expect(output).toContain('Parent: [outside workspace]')
     expect(output).not.toContain('outside-parent-secret')
     expect(output).toContain('Result cap reached')
+  })
+
+  it('requests captured pagination so a later page survives concurrent writes', async () => {
+    const mounted = await mount()
+    const target = createSession(mounted.ctx, 'target', '/work')
+
+    await mounted.call('session_search', { query: 'needle' })
+    await mounted.call('session_event_search', { query: 'needle', session_id: target.id })
+
+    expect(FakeQuery.sessionRequests).toHaveLength(1)
+    expect(FakeQuery.sessionRequests[0]?.snapshot).toBe(true)
+    expect(FakeQuery.eventRequests).toHaveLength(1)
+    expect(FakeQuery.eventRequests[0]?.snapshot).toBe(true)
   })
 
   it('does not report a cap when only rejected hits remain after the authorized limit', async () => {

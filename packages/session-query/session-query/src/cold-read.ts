@@ -15,6 +15,8 @@ export interface ColdSessionLog {
   readonly inheritedEventCount: SessionLogOffset
   /** Stored events plus deterministic in-memory closers for an interrupted final turn; nothing is written back. */
   readonly events: SessionEvent[]
+  /** Number of stored events before any synthesized interrupted-turn closers. */
+  readonly storedEventCount: number
 }
 
 /**
@@ -53,5 +55,6 @@ export async function readColdSessionLog(
     header: handle.header,
     inheritedEventCount: handle.inheritedEventCount,
     events: [...events, ...interruptedTurnClosers(events)],
+    storedEventCount: events.length,
   }
 }

@@ -30,18 +30,21 @@ describe('SQLite search request normalization', () => {
       sessionFilters: [],
       eventFilters: [],
       limit: 2,
+      snapshot: false,
     })
     expect(normalizeSessionRequest({
       query: 'needle',
       sessionFilters: [{ kind: 'availability', values: ['live'] }],
       eventFilters: [{ kind: 'surface', values: ['current'] }],
       limit: 3,
+      snapshot: true,
       cursor: SessionSearchCursor('next'),
     }, limits)).toEqual({
       query: 'needle',
       sessionFilters: [{ kind: 'availability', values: ['live'] }],
       eventFilters: [{ kind: 'surface', values: ['current'] }],
       limit: 3,
+      snapshot: true,
       cursor: SessionSearchCursor('next'),
     })
     expect(normalizeEventRequest({ sessionId: SessionId('s'), query: 'needle' }, limits)).toEqual({
@@ -49,17 +52,20 @@ describe('SQLite search request normalization', () => {
       query: 'needle',
       filters: [],
       limit: 2,
+      snapshot: false,
     })
     expect(normalizeEventRequest({
       sessionId: SessionId('s'),
       query: 'needle',
       filters: [{ kind: 'seq', from: 1 }],
+      snapshot: 'yes' as never,
       cursor: SessionSearchCursor('next'),
     }, limits)).toEqual({
       sessionId: SessionId('s'),
       query: 'needle',
       filters: [{ kind: 'seq', from: 1 }],
       limit: 2,
+      snapshot: false,
       cursor: SessionSearchCursor('next'),
     })
   })
@@ -210,6 +216,7 @@ describe('SQLite query identity and presentation', () => {
   it('canonicalizes request and filter ordering in both scopes', () => {
     const sessionA: NormalizedSessionRequest = {
       query: 'needle',
+      snapshot: false,
       limit: 2,
       sessionFilters: [
         { kind: 'cwd', values: ['/b', '/a'] },
@@ -221,6 +228,7 @@ describe('SQLite query identity and presentation', () => {
     }
     const sessionB: NormalizedSessionRequest = {
       query: 'needle',
+      snapshot: false,
       limit: 2,
       sessionFilters: [
         { kind: 'created-at', from: 1 },
@@ -235,12 +243,14 @@ describe('SQLite query identity and presentation', () => {
     const eventA: NormalizedEventRequest = {
       sessionId: SessionId('s'),
       query: 'needle',
+      snapshot: false,
       limit: 2,
       filters: [{ kind: 'seq' }, { kind: 'surface', values: ['shadowed', 'current'] }],
     }
     const eventB: NormalizedEventRequest = {
       sessionId: SessionId('s'),
       query: 'needle',
+      snapshot: false,
       limit: 2,
       filters: [{ kind: 'surface', values: ['current', 'shadowed'] }, { kind: 'seq' }],
     }

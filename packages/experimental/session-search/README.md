@@ -31,6 +31,12 @@ With HMR enabled, enabling or disabling the bundle registers or removes its glob
 
 This bundle enables Agent search tools. Sidebar search keeps its existing behavior.
 
+### Durable index and process ownership
+
+The shipped layer keeps the isolated provider on an in-memory index. The optional [`durable index overlay`](examples/durable-index.cordis.patch.yml) stores the index under `dshHomePath('storages/session-search/')` and reconciles it in the background (`syncMode: background`, 5000 ms interval, two concurrent reads), so a restart reuses it and searches never reconcile the corpus on demand.
+
+Apply an overlay with `dsh --patch <path>` or through the profile's patch layer. A derived index belongs to one process at a time: the provider claims the sidecar database `<path>.owner.sqlite` before it opens the index, so a second process configured with the same path fails its first search with `SESSION_QUERY_INDEX_FAILED` instead of writing concurrently. Configure a distinct path namespace for each profile, persistence source, and isolated provider, and rename that namespace whenever a composition overrides the JSONL session root: ownership refuses concurrent writers but cannot prove that a path belongs to the mounted root, so two deployments over different roots that share one path would serve each other's sessions. The ownership sidecar is never deleted, and the operating system releases its lock when the owning process exits.
+
 -----
 
 <a id="understand-the-implementation"></a>
@@ -41,7 +47,7 @@ This bundle enables Agent search tools. Sidebar search keeps its existing behavi
 
 [`cordis.patch.yml`](cordis.patch.yml) inserts the Host group `optional-session-search`, which registers the tools in the global tool layer. Later profile patches can override its rows by id. The [profile composer](../../boot/app-boot/README.md) owns patch ordering and errors.
 
-The group owns an isolated `sessionQuery` provider with a lazy `:memory:` index, released when the bundle is switched off. The host's metadata service keeps `openAt: never`.
+The group owns an isolated `sessionQuery` provider with a lazy `:memory:` index, released when the bundle is switched off. The host's metadata service keeps `openAt: never`. A configured file path also claims the sidecar database `<path>.owner.sqlite`, which carries the single-process rule for that path.
 
 </details>
 
@@ -67,7 +73,7 @@ The layer adds no request content directly; the capability implementation owns c
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- The bundle keeps one in-memory index after the first search. The index is rebuilt after restarting the application or switching the bundle off and on. Search remains restricted to authorized workspaces.
+- The shipped layer keeps one in-memory index after the first search, so the index is rebuilt after restarting the application or switching the bundle off and on. A durable path is opt-in, and one process owns each derived-index path. Search remains restricted to authorized workspaces.
 
 -----
 
