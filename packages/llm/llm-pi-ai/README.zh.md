@@ -216,6 +216,8 @@ git add packages/llm/llm-pi-ai/src/provider-data.generated.ts
 <a id="model-experience"></a>
 ## 模型体验
 
+pi-ai 单独报告的 `WebSocket error` 会映射为 `TRANSPORT`。挂载 `dsh-llm-retry` 后，是否重试仍由该路由的既有策略决定。
+
 ### 经 pi-ai 的提供方请求
 
 #### 模型看到什么
