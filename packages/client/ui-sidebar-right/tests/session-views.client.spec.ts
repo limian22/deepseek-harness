@@ -30,8 +30,10 @@ it('keeps one reference per View until the final committed root of a retired Vie
   const r = await runtime()
   const disposed = vi.fn()
   const changed = vi.fn()
+  const retain = vi.spyOn(r.sessions, 'retain')
   const view = new SidebarSessionView(A, r.sessions, disposed, changed)
   owners.push(view)
+  expect(retain).toHaveBeenCalledExactlyOnceWith(A, { source: 'sidebarView', facets: { conversation: true } })
   await view.reference.ready
   const release = vi.spyOn(view.reference, 'release')
   const firstMount = view.mount()
@@ -85,6 +87,39 @@ it('retires only unselected Views without retained bodies and rejects released r
   views.select(A)
   views.mount(a.reference)()
   expect(views.source.getSnapshot()).toEqual([])
+})
+
+it.each(['dispose', 'retire', 'unmount'] as const)('does not report an opening error when %s releases a pending reference', async (operation) => {
+  const r = await runtime()
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const view = new SidebarSessionView(A, r.sessions, vi.fn(), vi.fn())
+  owners.push(view)
+  const released = expect(view.reference.ready).rejects.toThrow('is released')
+  if (operation === 'unmount') {
+    const unmount = view.mount()
+    view.retire()
+    unmount()
+  } else {
+    view[operation]()
+  }
+  await released
+  expect(error).not.toHaveBeenCalled()
+})
+
+it('does not report cancelled openings during rapid selection changes', async () => {
+  const r = await runtime()
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const views = new SidebarSessionViews(r.sessions)
+  owners.push(views)
+  const pending: Promise<void>[] = []
+  for (let i = 0; i < 20; i += 1) {
+    views.select(i % 2 === 0 ? A : B)
+    const view = views.source.getSnapshot()[0]!
+    pending.push(expect(view.reference.ready).rejects.toThrow('is released'))
+  }
+  views.select(undefined)
+  await Promise.all(pending)
+  expect(error).not.toHaveBeenCalled()
 })
 
 it('reports opening failure and releases Views even when committed roots are still present', async () => {
