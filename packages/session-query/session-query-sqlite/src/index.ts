@@ -365,6 +365,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _persistenceEpoch = 0
   private _globalGeneration = 0
   private _localGeneration = 0
+  private readonly _liveObservations = new WeakMap<Session, { seq: SessionLogOffset; fingerprint: string }>()
   private _tail: Promise<void> = Promise.resolve()
   private _closed = false
   private _closePromise: Promise<void> | undefined
@@ -816,15 +817,23 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _publishLiveOverlay(binding: PersistenceBinding): void {
     const db = this._requireDb()
     const indexed = liveIndexRows(db)
-    const observed = new Map<SessionId, ObservedSession>()
-    for (const session of this.ctx.sessions.list()) observed.set(session.id, observeLive(session))
     const knownSources = this._knownSourceIds(binding)
-    const changes = [...observed.values()].filter((entry) => {
-      const row = indexed.get(entry.header.id)
-      const persisted = knownSources.has(entry.header.id) ? 1 : 0
-      return row?.fingerprint !== entry.fingerprint || row.persisted !== persisted
-    })
-    const deletes = [...indexed.values()].filter(row => !observed.has(row.id as SessionId))
+    const activeIds = new Set<SessionId>()
+    const changes: ObservedSession[] = []
+    for (const session of this.ctx.sessions.list()) {
+      activeIds.add(session.id)
+      const row = indexed.get(session.id)
+      const persisted = knownSources.has(session.id) ? 1 : 0
+      const seq = session.seq
+      const previous = this._liveObservations.get(session)
+      // Events are immutable and append-only on one Session instance. The
+      // index row must also match, including after a failed publication.
+      if (previous?.seq === seq && row?.fingerprint === previous.fingerprint && row.persisted === persisted) continue
+      const entry = observeLive(session)
+      this._liveObservations.set(session, { seq, fingerprint: entry.fingerprint })
+      if (row?.fingerprint !== entry.fingerprint || row.persisted !== persisted) changes.push(entry)
+    }
+    const deletes = [...indexed.values()].filter(row => !activeIds.has(row.id as SessionId))
     if (changes.length === 0 && deletes.length === 0) return
     const main = this._mainGeneration()
     let nextLocal = this._localGeneration
@@ -1580,31 +1589,22 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const eventWhere = buildEventWhere(request.eventFilters)
     assertFts5OuterPredicateCount(sessionWhere.predicateCount + eventWhere.predicateCount)
     const where = [sessionWhere.sql, eventWhere.sql].filter(Boolean).join(' AND ')
-    const selected = selectedDocumentsSql(true)
+    const selected = selectedDocumentsSql(where)
     const filterParams = [...sessionWhere.params, ...eventWhere.params]
     const bindings = [
-      ...candidateBindings(
-        true,
-        request.query,
-        this._persistedContentVisible(persistenceBinding),
-        Math.max(limit + offset + 1, SESSION_SEARCH_CANDIDATE_LIMIT),
-      ),
-      ...filterParams,
+      ...candidateBindings(request.query, this._persistedContentVisible(persistenceBinding), filterParams),
       limit + 1,
       offset,
     ]
     assertPortableBindingCount(bindings.length)
     return this._requireDb().prepare(`
       ${selected.sql},
-      filtered AS (
-        SELECT * FROM matched ${where.length === 0 ? '' : `WHERE ${where}`}
-      ),
       ranked AS (
         SELECT *, ROW_NUMBER() OVER (
           PARTITION BY session_id
           ORDER BY match_count DESC, document_length ASC, time DESC, seq DESC
         ) AS event_rank
-        FROM filtered
+        FROM matched
       )
       SELECT * FROM ranked
       WHERE event_rank = 1
@@ -1622,11 +1622,10 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const eventWhere = buildEventWhere(request.filters)
     assertFts5OuterPredicateCount(1 + eventWhere.predicateCount)
     const where = ['session_id = ?', eventWhere.sql].filter(Boolean).join(' AND ')
-    const selected = selectedDocumentsSql(false)
+    const selected = selectedDocumentsSql(where)
     const filterParams = [request.sessionId, ...eventWhere.params]
     const bindings = [
-      ...candidateBindings(false, request.query, this._persistedContentVisible(persistenceBinding), 0),
-      ...filterParams,
+      ...candidateBindings(request.query, this._persistedContentVisible(persistenceBinding), filterParams),
       limit + 1,
       offset,
     ]
@@ -1634,7 +1633,6 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     return this._requireDb().prepare(`
       ${selected.sql}
       SELECT * FROM matched
-      WHERE ${where}
       ORDER BY match_count DESC, document_length ASC, time DESC, seq DESC
       LIMIT ? OFFSET ?
     `).all(...bindings) as unknown as SearchRow[]
@@ -1743,45 +1741,11 @@ function headerBindings(
   ]
 }
 
-/**
- * Bound on how many FTS matches reach the highlight stage. `highlight()` is
- * computed per matched row, so a frequent token over a large corpus otherwise
- * costs a full scan of every match before ranking; the candidate subquery keeps
- * that work proportional to the ask instead of the corpus.
- */
-const SESSION_SEARCH_CANDIDATE_LIMIT = 2000
-
-function selectedDocumentsSql(bounded: boolean): { sql: string } {
-  // A corpus-wide search ranks by bm25 and picks candidates before computing
-  // `highlight()`, so a frequent token costs the asked page instead of every
-  // matching document. A single-session event search is already restricted to
-  // that session's matches, so it highlights directly.
-  const persistedBound = bounded
-    ? `
-        AND pd.rowid IN (
-          SELECT rowid
-          FROM persisted_docs
-          WHERE persisted_docs MATCH ?
-            AND ? = 1
-            AND NOT EXISTS (
-              SELECT 1 FROM temp.live_sessions AS ls2 WHERE ls2.id = persisted_docs.session_id
-            )
-          ORDER BY bm25(persisted_docs)
-          LIMIT ?
-        )`
-    : ''
-  const liveBound = bounded
-    ? `
-        AND ld.rowid IN (
-          SELECT rowid
-          FROM temp.live_docs
-          WHERE live_docs MATCH ?
-          ORDER BY bm25(live_docs)
-          LIMIT ?
-        )`
-    : ''
+function selectedDocumentsSql(filterSql: string): { sql: string } {
+  // Keep the correctness repair only: filter and rank the complete match set.
+  // Do not impose a lossy shortlist or force a materialized highlight stage.
   return {
-    sql: `WITH candidates AS (
+    sql: `WITH source_candidates AS (
       SELECT
         pd.session_id AS session_id,
         ps.version AS version,
@@ -1803,7 +1767,7 @@ function selectedDocumentsSql(bounded: boolean): { sql: string } {
       JOIN persisted_sessions AS ps ON ps.id = pd.session_id
       WHERE persisted_docs MATCH ?
         AND ? = 1
-        AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = pd.session_id)${persistedBound}
+        AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = pd.session_id)
       UNION ALL
       SELECT
         ld.session_id AS session_id,
@@ -1824,7 +1788,9 @@ function selectedDocumentsSql(bounded: boolean): { sql: string } {
         CAST(ld.codepoint_length AS INTEGER) AS document_length
       FROM temp.live_docs AS ld
       JOIN temp.live_sessions AS ls ON ls.id = ld.session_id
-      WHERE live_docs MATCH ?${liveBound}
+      WHERE live_docs MATCH ?
+    ), candidates AS (
+      SELECT * FROM source_candidates ${filterSql.length === 0 ? '' : `WHERE ${filterSql}`}
     ), matched AS (
       SELECT *,
         (
@@ -1837,32 +1803,13 @@ function selectedDocumentsSql(bounded: boolean): { sql: string } {
 }
 
 function candidateBindings(
-  bounded: boolean,
   query: string,
   persistenceVisible: boolean,
-  limit: number,
+  filterParams: readonly (string | number)[],
 ): Array<string | number> {
   const expression = quoteFtsData(query)
   const visible = persistenceVisible ? 1 : 0
   const tail = [FTS_HIGHLIGHT_START, Buffer.byteLength(FTS_HIGHLIGHT_START, 'utf8')]
-  if (bounded) {
-    return [
-      FTS_HIGHLIGHT_START,
-      FTS_HIGHLIGHT_END,
-      expression,
-      visible,
-      expression,
-      visible,
-      limit,
-      visible,
-      FTS_HIGHLIGHT_START,
-      FTS_HIGHLIGHT_END,
-      expression,
-      expression,
-      limit,
-      ...tail,
-    ]
-  }
   return [
     FTS_HIGHLIGHT_START,
     FTS_HIGHLIGHT_END,
@@ -1872,6 +1819,7 @@ function candidateBindings(
     FTS_HIGHLIGHT_START,
     FTS_HIGHLIGHT_END,
     expression,
+    ...filterParams,
     ...tail,
   ]
 }

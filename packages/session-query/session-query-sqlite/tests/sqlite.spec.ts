@@ -365,6 +365,83 @@ describe('SQLite session search', () => {
     expect(open).toHaveBeenCalledOnce()
   })
 
+  it('acceptance: keeps a filtered match beyond the global candidate cap', async () => {
+    const ctx = await liveContext()
+    try {
+      const noise = Array.from({ length: 2100 }, (_, index) => ({
+        ...messageEvents('needle')[0]!, seq: SessionSeq(index),
+      }))
+      ctx.sessions.create(SessionId('candidate-noise'), { seed: noise })
+      ctx.sessions.create(SessionId('candidate-target'), {
+        seed: messageEvents(`needle ${'unrelated '.repeat(100)}`), meta: { cwd: '/acceptance' },
+      })
+      const page = await ctx.sessionQuery.searchSessions({
+        query: 'needle', sessionFilters: [{ kind: 'id', values: [SessionId('candidate-target')] }],
+      })
+      expect(page.items.map(item => item.header.id)).toEqual([SessionId('candidate-target')])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('acceptance: keeps later matching sessions when one session fills the candidate cap', async () => {
+    const ctx = await liveContext()
+    try {
+      const noise = Array.from({ length: 2100 }, (_, index) => ({
+        ...messageEvents('needle')[0]!, seq: SessionSeq(index),
+      }))
+      ctx.sessions.create(SessionId('candidate-noise'), { seed: noise })
+      ctx.sessions.create(SessionId('candidate-target'), { seed: messageEvents(`needle ${'unrelated '.repeat(100)}`) })
+      const ids = await collectSessionIds(ctx, 'needle')
+      expect(new Set(ids)).toEqual(new Set([SessionId('candidate-noise'), SessionId('candidate-target')]))
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('acceptance: keeps persisted filtered matches beyond the candidate cap', async () => {
+    TestPersistence.reset([
+      { meta: header('persisted-noise'), events: Array.from({ length: 2100 }, (_, index) => ({
+        ...messageEvents('needle')[0]!, seq: SessionSeq(index),
+      })) },
+      { meta: header('persisted-target'), events: messageEvents(`needle ${'unrelated '.repeat(100)}`) },
+    ])
+    const ctx = await liveContext()
+    try {
+      await ctx.plugin(TestPersistence)
+      const page = await ctx.sessionQuery.searchSessions({
+        query: 'needle', sessionFilters: [{ kind: 'id', values: [SessionId('persisted-target')] }],
+      })
+      expect(page.items.map(item => item.header.id)).toEqual([SessionId('persisted-target')])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it.each([false, true])('acceptance: preserves match-count ranking and pagination (snapshot=%s)', async (snapshot) => {
+    const ctx = await liveContext()
+    try {
+      ctx.sessions.create(SessionId('short-documents'), {
+        seed: Array.from({ length: 2100 }, (_, index) => ({
+          ...messageEvents('needle')[0]!, seq: SessionSeq(index),
+        })),
+      })
+      ctx.sessions.create(SessionId('most-matches'), {
+        seed: messageEvents(`needle filler needle ${'unrelated '.repeat(1000)}`),
+      })
+      const first = await ctx.sessionQuery.searchSessions({ query: 'needle', limit: 1, snapshot })
+      expect(first.items.map(item => item.header.id)).toEqual([SessionId('most-matches')])
+      expect(first.nextCursor).toBeDefined()
+      const second = await ctx.sessionQuery.searchSessions({
+        query: 'needle', limit: 1, snapshot, cursor: first.nextCursor!,
+      })
+      expect(second.items.map(item => item.header.id)).toEqual([SessionId('short-documents')])
+      expect(second.nextCursor).toBeUndefined()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('searches two-character Unicode61 tokens in live-only sessions', async () => {
     const ctx = await liveContext({ path: ':memory:', snippetChars: 20 })
     const session = ctx.sessions.create(SessionId('live'), {
@@ -2386,6 +2463,43 @@ describe('SQLite background synchronization', () => {
       syncReadConcurrency: 2,
     })
     await service.close()
+  })
+
+  it('skips unchanged live histories and observes appends and replacement instances', async () => {
+    const ctx = await liveContext(BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    try {
+      const meta = header('live-revision', 1)
+      const live = ctx.sessions.prepare(meta.id, { meta, seed: messageEvents('original needle') })
+      const detach = ctx.sessions.enter(live)
+      ctx.sessions.announce(live)
+      const snapshot = vi.spyOn(live, 'snapshotEvents')
+      expect((await service.searchSessions({ query: 'original' })).items).toHaveLength(1)
+      expect(snapshot).toHaveBeenCalledTimes(1)
+      expect((await service.searchSessions({ query: 'original' })).items).toHaveLength(1)
+      expect(snapshot).toHaveBeenCalledTimes(1)
+
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'appended needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect((await service.searchSessions({ query: 'appended' })).items).toHaveLength(1)
+      expect(snapshot).toHaveBeenCalledTimes(2)
+      detach()
+
+      const replacement = ctx.sessions.prepare(meta.id, { meta, seed: messageEvents('replacement needle') })
+      const detachReplacement = ctx.sessions.enter(replacement)
+      ctx.sessions.announce(replacement)
+      replacement.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'second replacement' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect(replacement.seq).toBe(live.seq)
+      expect((await service.searchSessions({ query: 'replacement' })).items).toHaveLength(1)
+      expect((await service.searchSessions({ query: 'original' })).items).toEqual([])
+      detachReplacement()
+      expect((await service.searchSessions({ query: 'replacement' })).items).toEqual([])
+    } finally {
+      await service.close()
+    }
   })
 
   it('counts searchable live-only sessions inside the requested coverage scope', async () => {
