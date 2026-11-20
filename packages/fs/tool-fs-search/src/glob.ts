@@ -1,6 +1,6 @@
 /**
  * The model-facing `glob` tool: discover files whose paths match a glob
- * pattern, sorted by modification time. Execution spawns the packaged
+ * pattern, ordered by path or modification time. Execution spawns the packaged
  * ripgrep binary (`@vscode/ripgrep`) directly through the subprocess seam
  * with a plain argv vector — this module owns the model-facing schema,
  * argument validation, argv construction, result parsing, inline sampling,
@@ -38,7 +38,7 @@ export const GLOB_VCS_EXCLUDES: readonly string[] = ['.git', '.svn', '.hg', '.bz
 
 /** Resolved glob-tool caps — plugin config after defaulting (see `Config` in index.ts). */
 export interface GlobToolCaps {
-  /** Whether over-cap pages are sampled across top-level entries instead of taking the modification-time head. */
+  /** Whether over-cap pages are sampled across top-level entries instead of taking the ordered head. */
   sampleOverCapGlobResults: boolean
   /** Max paths retained inline; later paths go to the formatted spill file. */
   maxResults: number
@@ -58,6 +58,7 @@ export interface GlobToolCaps {
 export interface GlobInput {
   pattern: string
   path?: string
+  sort?: 'path' | 'modified'
 }
 
 /**
@@ -68,10 +69,10 @@ export interface GlobInput {
  * @param args - the schema-validated `glob` arguments.
  * @returns the accepted input, unchanged.
  */
-export function parseGlobArgs(args: { pattern: string; path?: string }): GlobInput {
+export function parseGlobArgs(args: GlobInput): GlobInput {
   if (args.pattern.trim().length === 0) throw new Error('pattern must be a non-empty string')
   if (args.path !== undefined && args.path.trim().length === 0) throw new Error('path must be a non-empty string when given')
-  return { pattern: args.pattern, ...args.path !== undefined ? { path: args.path } : {} }
+  return args
 }
 
 /**
@@ -79,7 +80,7 @@ export function parseGlobArgs(args: { pattern: string; path?: string }): GlobInp
  * model-controlled value ({@link GlobInput.pattern}, {@link GlobInput.path})
  * is a plain argv element — no shell layer exists, so no quoting applies; the
  * search root rides behind `--` so a leading-dash path can never be parsed as
- * a flag. `--sort=modified` orders by modification time, `--no-ignore
+ * a flag. Modification-time order uses `--sort=modified`. `--no-ignore
  * --hidden` searches ignored and hidden files, and
  * {@link GLOB_VCS_EXCLUDES} keeps VCS metadata out. Simple directory prefixes
  * prune unrelated subtrees through directory-name globs without changing the
@@ -105,7 +106,7 @@ export function buildGlobCommand(input: GlobInput): string[] {
     '--files',
     ...pruning,
     `--glob=${input.pattern}`,
-    '--sort=modified',
+    ...(input.sort === 'modified' ? ['--sort=modified'] : []),
     '--no-ignore',
     '--hidden',
     // Two negated globs per VCS name: the bare form prunes the directory
@@ -126,7 +127,7 @@ export function buildGlobCommand(input: GlobInput): string[] {
  * result's top level it reaches.
  */
 export interface GlobSample {
-  /** Paths to show inline: grouped by top-level entry, modification-time ordered within each group. */
+  /** Paths to show inline: grouped by top-level entry, in result order within each group. */
   items: string[]
   /** Distinct top-level entries the shown paths reach. */
   shown: number
@@ -175,9 +176,9 @@ function topLevelSegment(path: string): string {
  *
  * Every top-level entry receives a slot before any receives a second; exhausted
  * groups drop out. Group order and order within each group follow `paths`, so a
- * flat result reproduces the modification-time head.
+ * flat result reproduces the ordered head.
  *
- * @param paths - the complete result, in ripgrep's modification-time order.
+ * @param paths - the complete result, in the requested order.
  * @param maxItems - how many paths the page may hold; the caller has already established it is smaller than `paths`.
  * @param root - the search root in the same display-path space as `paths`.
  * @returns the page grouped by top-level entry, with the shown/total top-level spread.
@@ -218,7 +219,7 @@ export function sampleAcrossTopLevel(paths: readonly string[], maxItems: number,
 
 /**
  * Format a capped sampled page and its complete-result recovery path. A flat
- * result keeps the plain footer because its sample is the modification-time head.
+ * result keeps the plain footer because its sample is the ordered head.
  *
  * @param sample - the inline page and its top-level spread.
  * @param seen - how many paths the complete result holds; always more than the page.
@@ -228,7 +229,7 @@ export function sampleAcrossTopLevel(paths: readonly string[], maxItems: number,
 export function formatGlobOutput(sample: GlobSample, seen: number, spillRef: SpillRef | undefined): string {
   const basis = sample.total === seen
     ? '.'
-    : `, sampled across ${sample.shown} of the ${sample.total} top-level entries this pattern matched instead of taken in modification-time order.`
+    : `, sampled across ${sample.shown} of the ${sample.total} top-level entries this pattern matched instead of taking the first paths.`
       + (sample.shown < sample.total ? ' Narrow path to inspect a specific subtree.' : '')
   return formatGlobPage(sample.items, seen, spillRef, basis)
 }
@@ -245,7 +246,7 @@ function formatGlobPage(items: readonly string[], seen: number, spillRef: SpillR
 /** Bound and format one canonical path list for the Native surface relative to its search root. */
 function renderGlobPaths(paths: string[], caps: GlobToolCaps, root: string, spillRef?: SpillRef): string {
   if (paths.length === 0) return 'No files found'
-  // A result that fits is shown whole, untouched: modification-time order is the
+  // A result that fits is shown whole, untouched: the requested order is the
   // tool's contract, and over a complete result it is what answers age questions.
   if (paths.length <= caps.maxResults) return paths.join('\n')
   if (!caps.sampleOverCapGlobResults) {
@@ -258,10 +259,10 @@ function renderGlobPaths(paths: string[], caps: GlobToolCaps, root: string, spil
  * The inline page of paths a completed `glob` card shows, computed the SAME way
  * {@link renderGlobPaths} computes its model-facing page so the card and the text
  * agree on which paths survived the cap. A result within the cap is shown whole;
- * an over-cap result is either the modification-time head or the top-level sample,
+ * an over-cap result is either the ordered head or the top-level sample,
  * matching the deployment's `sampleOverCapGlobResults`.
  *
- * @param paths - the complete discovered path list, in modification-time order.
+ * @param paths - the complete discovered path list, in the requested order.
  * @param caps - the resolved glob caps (the inline cap and the sampling switch).
  * @param root - the search root in the same display-path space as `paths`.
  * @returns the inline page and whether the complete result was capped.
@@ -278,7 +279,7 @@ function globCardPage(paths: string[], caps: GlobToolCaps, root: string): { item
  * @param args - the raw tool arguments; `pattern` and `path` feed the title.
  * @returns the generic card view (`kind: 'search'`) shown while the call runs.
  */
-export function presentGlobCall(args: { pattern: string; path?: string }): GenericCallView {
+export function presentGlobCall(args: GlobInput): GenericCallView {
   const where = args.path !== undefined ? ` in ${args.path}` : ''
   return { card: 'generic', title: `Glob ${args.pattern}${where}`, kind: 'search', rawInput: args.pattern }
 }
@@ -294,7 +295,7 @@ export function presentGlobCall(args: { pattern: string; path?: string }): Gener
  * @param result - the final model-facing tool result carrying the projected metadata.
  * @returns the search card view, or `undefined` for the generic fallback.
  */
-export function presentGlobResult(_args: { pattern: string; path?: string }, result: ToolResult): SearchResultView | undefined {
+export function presentGlobResult(_args: GlobInput, result: ToolResult): SearchResultView | undefined {
   if (result.isError) return undefined
   const view = searchViewFromMeta(result.meta)
   if (view === undefined || view.shape !== 'paths') return undefined
@@ -321,7 +322,7 @@ export function applyGlobTool(ctx: Context, caps: GlobToolCaps): void {
   const tool = defineTool({
     name: 'glob',
     description: 'Find files, not directories, whose paths match a glob pattern, including hidden and ignored files. '
-      + `Returns up to ${caps.maxResults} paths in modification-time order; a larger result ${overCapDescription} `
+      + `Returns up to ${caps.maxResults} paths in path order by default; a larger result ${overCapDescription} `
       + 'and reports where the complete list was saved.',
     parameters: {
       pattern: {
@@ -331,6 +332,7 @@ export function applyGlobTool(ctx: Context, caps: GlobToolCaps): void {
           + 'A pattern with no "/" matches the basename at any depth, so "*" and "*.ts" both search the whole tree; include a separator to anchor the depth.',
       },
       path: { type: 'string', description: 'Directory to search in. Defaults to the session workspace; a relative path resolves against it.' },
+      sort: { type: 'string', enum: ['path', 'modified'], description: 'Order by path (default) or modification time (oldest first).' },
     },
     timeoutMs: caps.timeoutMs,
     output: {
@@ -360,6 +362,7 @@ export function applyGlobTool(ctx: Context, caps: GlobToolCaps): void {
         const displayPath = toWorkdirRelative(line, run.workdir)
         all.push(displayPath)
       }
+      if (input.sort !== 'modified') all.sort()
       return { root, paths: all }
     },
     presentCall: presentGlobCall,

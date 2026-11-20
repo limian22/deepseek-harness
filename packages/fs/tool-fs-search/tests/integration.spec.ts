@@ -96,8 +96,8 @@ describe('search tools over the real subprocess service + the packaged rg', () =
       expect(result.isError).toBe(false)
       if (result.isError) throw new Error('expected glob success')
       expect(result.value).toEqual({ root: '.', paths: [
-        join('packages', 'core', 'src', 'old.ts'),
         join('packages', 'core', 'src', '.hidden.ts'),
+        join('packages', 'core', 'src', 'old.ts'),
       ] })
       expect(spawn.mock.calls[0]?.[0].argv.slice(3, 6)).toEqual([
         '--glob=!**', '--glob={packages,core,src}/', '--glob=packages/core/src/*.ts',
@@ -152,15 +152,24 @@ describe('search tools over the real subprocess service + the packaged rg', () =
       expect(spawn.mock.calls[0]?.[0].argv).not.toContain('--')
     })
 
-    it('discovers files by pattern, sorted by modification time, hidden included, .git excluded', async () => {
+    it('discovers files by pattern, sorted by path, hidden included, .git excluded', async () => {
       const result = await call('glob', { pattern: '**/*.ts' }, agent())
       expect(result.isError).toBe(false)
       const paths = text(result).split('\n')
-      expect(paths.indexOf(join('src', 'alpha.ts'))).toBeLessThan(paths.indexOf(join('src', 'beta.ts')))
+      expect(paths).toEqual([...paths].sort())
       expect(paths).toContain('.hidden.ts')
       expect(paths).toContain(join('spaced dir', "wei'rd name.ts"))
       expect(paths).not.toContain(join('.git', 'config.ts'))
       expect(paths).not.toContain('notes.md')
+    })
+
+    it('uses modification-time order only when requested', async () => {
+      await utimes(join(dir, 'src', 'beta.ts'), new Date(1990, 0, 1), new Date(1990, 0, 1))
+      const input = { pattern: '*.ts', path: 'src' }
+      const oldest = join('src', 'beta.ts')
+      const newest = join('src', 'alpha.ts')
+      expect(text(await call('glob', input, agent()))).toBe(`${newest}\n${oldest}`)
+      expect(text(await call('glob', { ...input, sort: 'modified' }, agent()))).toBe(`${oldest}\n${newest}`)
     })
 
     it('scopes to a directory search root (path arg)', async () => {
