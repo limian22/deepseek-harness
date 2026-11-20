@@ -216,6 +216,8 @@ Read these pages when the package-level contract is not enough. They move from t
 <a id="model-experience"></a>
 ## Model Experience
 
+A bare `WebSocket error` from pi-ai maps to `TRANSPORT` and is eligible for retry under the route's existing policy when `dsh-llm-retry` is mounted.
+
 ### Provider request through pi-ai
 
 #### What the model sees
