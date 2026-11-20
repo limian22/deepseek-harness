@@ -2502,6 +2502,33 @@ describe('SQLite background synchronization', () => {
     }
   })
 
+  it('keeps existing live FTS rows when a session appends an event', async () => {
+    const ctx = await liveContext(BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    try {
+      const live = ctx.sessions.create(SessionId('live-append-delta'), { seed: messageEvents('original needle') })
+      await service.searchEvents({ sessionId: live.id, query: 'original' })
+      const db = Reflect.get(service, '_db') as DatabaseSync
+      const prepare = vi.spyOn(db, 'prepare')
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'appended needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect((await service.searchEvents({ sessionId: live.id, query: 'appended' })).items).toHaveLength(1)
+      expect(prepare.mock.calls.map(([sql]) => sql)).not.toContain('DELETE FROM temp.live_docs WHERE session_id = ?')
+      expect((await service.searchEvents({ sessionId: live.id, query: 'original' })).items).toHaveLength(1)
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'replacement needle' }], source: { kind: 'test' },
+      }), {
+        surfaceOp: { op: 'replace', startSeq: SessionSeq(0), endSeq: SessionSeq(0) },
+        sourceEventSeqs: [SessionSeq(0)],
+      })
+      expect((await service.searchEvents({ sessionId: live.id, query: 'original' })).items)
+        .toMatchObject([{ seq: SessionSeq(0), surface: 'shadowed' }])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('counts searchable live-only sessions inside the requested coverage scope', async () => {
     const ctx = await liveContext(BACKGROUND_SYNC)
     const service = ctx.sessionQuery as SqliteSessionQueryEngine
