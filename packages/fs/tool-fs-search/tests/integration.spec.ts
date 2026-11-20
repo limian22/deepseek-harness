@@ -253,10 +253,29 @@ describe('search tools over the real subprocess service + the packaged rg', () =
       expect(result.error).toMatchObject({ info: { code: 'SEARCH_INVALID_PATTERN' } })
     })
 
-    it('classifies a missing target as SEARCH_FAILED', async () => {
-      const result = await call('grep', { pattern: 'x', path: 'no-such-dir' })
+    it('returns no matches for a valid explicit file without matching content', async () => {
+      const result = await call('grep', { pattern: 'no-such-content', path: 'notes.md' }, agent())
+      expect(result.isError).toBe(false)
+      expect(text(result)).toBe('No matches found')
+    })
+  })
+
+  describe('missing explicit search paths', () => {
+    it.each(['glob', 'grep'])('%s identifies a missing absolute search root without falling back', async (name) => {
+      const path = join(dir, 'retired plugin')
+      const result = await call(name, { pattern: name === 'glob' ? '**/*.ts' : 'alpha', path }, agent())
       expect(result.isError).toBe(true)
-      expect(result.error).toMatchObject({ info: { code: 'SEARCH_FAILED' } })
+      expect(result.error).toMatchObject({ info: { code: 'SEARCH_PATH_NOT_FOUND' } })
+      expect(text(result)).toContain(path)
+      expect(text(result)).not.toContain('alpha.ts')
+    })
+
+    it('reports a missing relative root against the session workspace', async () => {
+      const path = join('src', 'retired')
+      const result = await call('grep', { pattern: 'alpha', path }, agent())
+      expect(result.isError).toBe(true)
+      expect(result.error).toMatchObject({ info: { code: 'SEARCH_PATH_NOT_FOUND' } })
+      expect(text(result)).toContain(join(dir, path))
     })
   })
 

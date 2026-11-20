@@ -76,7 +76,9 @@ Node 部署在受支持的 macOS、Linux 与 Windows 目标上获得 `@vscode/ri
 
 ### 失败与恢复
 
-搜索失败携带本包定义的错误码：`SEARCH_INVALID_PATTERN`（ripgrep 拒绝正则或 glob）、`SEARCH_FAILED`（启动失败、目标不可访问、信号终止或 `--json` 输出格式错误）、`SEARCH_RAW_OUTPUT_OVERFLOW`（原始输出超过上限）与 `SEARCH_ABORTED`（协作式超时或调用方取消）。退出 0 表示成功且有结果，退出 1 表示成功的空搜索；模型参数错误仍是普通工具参数错误。
+如果 ripgrep 报告显式指定的 `path` 不存在，`SEARCH_PATH_NOT_FOUND` 会标明搜索目标。请对照当前工作区或配置核对目标，再用已确认的路径重试。工具不会自动扩大搜索范围。
+
+其他搜索失败携带本包定义的错误码：`SEARCH_INVALID_PATTERN`（ripgrep 拒绝正则或 glob）、`SEARCH_FAILED`（启动失败、目标不可访问、信号终止或 `--json` 输出格式错误）、`SEARCH_RAW_OUTPUT_OVERFLOW`（原始输出超过上限）与 `SEARCH_ABORTED`（协作式超时或调用方取消）。退出 0 表示成功且有结果，退出 1 表示成功的空搜索；模型参数错误仍是普通工具参数错误。
 
 -----
 
@@ -207,7 +209,7 @@ glob 描述声明了配置的超过上限排序方式。生成的 [`glob` 和 `g
 
 #### 模型看到的内容
 
-失败被规范化为 `Error: <message>`，并携带结构化 `SEARCH_INVALID_PATTERN`、`SEARCH_FAILED`、`SEARCH_RAW_OUTPUT_OVERFLOW` 或 `SEARCH_ABORTED` 元数据供调用方使用。
+失败被规范化为 `Error: <message>`，并携带结构化 `SEARCH_INVALID_PATTERN`、`SEARCH_PATH_NOT_FOUND`、`SEARCH_FAILED`、`SEARCH_RAW_OUTPUT_OVERFLOW` 或 `SEARCH_ABORTED` 元数据供调用方使用。
 
 #### Token 影响
 
