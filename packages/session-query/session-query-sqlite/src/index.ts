@@ -188,6 +188,17 @@ interface ObservedSession {
   fingerprint: string
 }
 
+interface LiveIndexedDocument {
+  readonly rowid: number | bigint
+  readonly surface: SessionEventSearchDocument['surface']
+}
+
+interface LivePublication {
+  readonly seq: SessionLogOffset
+  readonly fingerprint: string
+  readonly documents: ReadonlyMap<SessionSeq, LiveIndexedDocument>
+}
+
 interface ObservedPersistedSession {
   header: SessionHeader
   revision: SessionPersistenceRevision
@@ -365,7 +376,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _persistenceEpoch = 0
   private _globalGeneration = 0
   private _localGeneration = 0
-  private readonly _liveObservations = new WeakMap<Session, { seq: SessionLogOffset; fingerprint: string }>()
+  private readonly _liveObservations = new WeakMap<Session, LivePublication>()
   private _tail: Promise<void> = Promise.resolve()
   private _closed = false
   private _closePromise: Promise<void> | undefined
@@ -819,34 +830,36 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const indexed = liveIndexRows(db)
     const knownSources = this._knownSourceIds(binding)
     const activeIds = new Set<SessionId>()
-    const changes: ObservedSession[] = []
-    for (const session of this.ctx.sessions.list()) {
+    const changes = this.ctx.sessions.list().flatMap((session) => {
       activeIds.add(session.id)
       const row = indexed.get(session.id)
-      const persisted = knownSources.has(session.id) ? 1 : 0
+      const persisted = Number(knownSources.has(session.id))
+      const cached = this._liveObservations.get(session)
+      const previous = cached?.fingerprint === row?.fingerprint ? cached : undefined
       const seq = session.seq
-      const previous = this._liveObservations.get(session)
-      // Events are immutable and append-only on one Session instance. The
-      // index row must also match, including after a failed publication.
-      if (previous?.seq === seq && row?.fingerprint === previous.fingerprint && row.persisted === persisted) continue
-      const entry = observeLive(session)
-      this._liveObservations.set(session, { seq, fingerprint: entry.fingerprint })
-      if (row?.fingerprint !== entry.fingerprint || row.persisted !== persisted) changes.push(entry)
-    }
+      if (previous?.seq === seq && row?.persisted === persisted) return []
+      // oxlint-disable-next-line typescript/no-deprecated -- Full fold preserves the search surfaces of earlier events.
+      const documents = previous?.seq === seq ? undefined : buildSessionEventSearchDocuments(session.id, session.snapshotEvents())
+      return [{ session, previous, seq, persisted, documents, fingerprint: randomUUID() }]
+    })
     const deletes = [...indexed.values()].filter(row => !activeIds.has(row.id as SessionId))
     if (changes.length === 0 && deletes.length === 0) return
     const main = this._mainGeneration()
     let nextLocal = this._localGeneration
-    const replacements = changes.map((entry) => {
-      nextLocal = Math.max(nextLocal, main) + 1
-      return { entry, generation: nextLocal, persisted: knownSources.has(entry.header.id) }
-    })
+    const publications: Array<{ session: Session; publication: LivePublication }> = []
     this._transaction(() => {
       for (const row of deletes) this._deleteSession('live', row.id as SessionId)
-      for (const replacement of replacements) {
-        this._replaceLiveSession(replacement.entry, replacement.generation, replacement.persisted)
+      for (const { session, previous, seq, persisted, documents, fingerprint } of changes) {
+        nextLocal = Math.max(nextLocal, main) + 1
+        if (previous === undefined && indexed.has(session.id)) this._deleteSession('live', session.id)
+        this._upsertLiveHeader(session.header, session.inheritedEventCount, fingerprint, persisted, nextLocal)
+        const indexedDocuments = documents === undefined && previous !== undefined
+          ? previous.documents
+          : this._publishLiveDocuments(documents ?? [], previous?.documents)
+        publications.push({ session, publication: { seq, fingerprint, documents: indexedDocuments } })
       }
     })
+    for (const { session, publication } of publications) this._liveObservations.set(session, publication)
     this._localGeneration = nextLocal
     this._globalGeneration += 1
   }
@@ -1550,33 +1563,48 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
 
   private _replaceLiveSession(entry: ObservedSession, generation: number, persisted: boolean): void {
     this._deleteSession('live', entry.header.id)
-    const db = this._requireDb()
-    db.prepare(`
+    this._upsertLiveHeader(entry.header, entry.inheritedEventCount, entry.fingerprint, Number(persisted), generation)
+    this._publishLiveDocuments(entry.documents, undefined)
+  }
+
+  private _upsertLiveHeader(
+    header: SessionHeader, inherited: SessionLogOffset, fingerprint: string, persisted: number, generation: number,
+  ): void {
+    this._requireDb().prepare(`
       INSERT INTO temp.live_sessions
         (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, fingerprint, persisted, generation)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      ...headerBindings(entry.header, entry.inheritedEventCount),
-      entry.fingerprint,
-      persisted ? 1 : 0,
-      generation,
-    )
+      ON CONFLICT(id) DO UPDATE SET
+        fingerprint = excluded.fingerprint, persisted = excluded.persisted, generation = excluded.generation
+    `).run(...headerBindings(header, inherited), fingerprint, persisted, generation)
+  }
+
+  private _publishLiveDocuments(
+    documents: readonly SessionEventSearchDocument[],
+    previous: ReadonlyMap<SessionSeq, LiveIndexedDocument> | undefined,
+  ): Map<SessionSeq, LiveIndexedDocument> {
+    const db = this._requireDb()
     const insert = db.prepare(`
       INSERT INTO temp.live_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
-    for (const document of entry.documents) {
+    const next = new Map<SessionSeq, LiveIndexedDocument>()
+    // Within an append-only Session instance an existing event can change surface, but its text is immutable.
+    const update = previous === undefined ? undefined : db.prepare('UPDATE temp.live_docs SET surface = ? WHERE rowid = ?')
+    for (const document of documents) {
+      const row = previous?.get(document.seq)
+      if (row !== undefined) {
+        if (row.surface !== document.surface) update?.run(document.surface, row.rowid)
+        next.set(document.seq, { rowid: row.rowid, surface: document.surface })
+        continue
+      }
       const text = sanitizeFtsText(document.text)
-      insert.run(
-        text,
-        document.sessionId,
-        document.seq,
-        document.type,
-        document.time,
-        document.surface,
-        Array.from(text).length,
+      const { lastInsertRowid } = insert.run(
+        text, document.sessionId, document.seq, document.type, document.time, document.surface, Array.from(text).length,
       )
+      next.set(document.seq, { rowid: lastInsertRowid, surface: document.surface })
     }
+    return next
   }
 
   private _querySessions(
