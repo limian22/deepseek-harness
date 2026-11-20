@@ -12,6 +12,7 @@ import {
   type SessionLineageTrace,
   type SessionRecord,
   type SessionSearchHit,
+  type SessionSearchCoverage,
 } from '@deepseek-ai/dsh-session-query'
 import type {
   SessionEvent,
@@ -27,6 +28,7 @@ type AuthorizedDescendants = ReturnType<typeof workspaceAccess.authorizeDescenda
 interface SearchCollection<T> {
   readonly items: T[]
   readonly capped: boolean
+  readonly coverage?: SessionSearchCoverage
 }
 
 interface SessionSearchCallArgs {
@@ -50,8 +52,15 @@ function formatSessionSearch(
   titles: CompleteTitleMap,
   authorizedParents: ReadonlySet<SessionId>,
 ): string {
-  if (collected.items.length === 0) return formatEmptySessionSearch()
-  const lines = [`Session search results (${collected.items.length}):`]
+  if (collected.items.length === 0) {
+    return [
+      collected.coverage === undefined || collected.coverage.state === 'ready'
+        ? formatEmptySessionSearch()
+        : 'No matches in the indexed history available so far.',
+      ...coverageLines(collected.coverage),
+    ].join('\n')
+  }
+  const lines = [`Session search results (${collected.items.length}):`, ...coverageLines(collected.coverage)]
   for (const [index, hit] of collected.items.entries()) {
     const parent = hit.header.parentSession === undefined
       ? 'root'
@@ -78,6 +87,15 @@ function formatSessionSearch(
   return lines.join('\n')
 }
 
+function coverageLines(coverage: SessionSearchCoverage | undefined): string[] {
+  if (coverage === undefined) return []
+  const lines = [`Search coverage: ${coverage.state}.`]
+  if (coverage.state !== 'ready') {
+    lines.push('Results may be incomplete. Retry after history synchronization progresses.')
+  }
+  return lines
+}
+
 function formatEmptySessionSearch(): string {
   return 'No prior session matches found.'
 }
@@ -87,9 +105,14 @@ function formatEventSearch(
   title: TitleView,
   collected: SearchCollection<SessionEventSearchHit>,
 ): string {
-  const lines = [`Session ${sessionId} — ${workspaceAccess.titleText(title)}`]
+  const lines = [
+    `Session ${sessionId} — ${workspaceAccess.titleText(title)}`,
+    ...coverageLines(collected.coverage),
+  ]
   if (collected.items.length === 0) {
-    lines.push('', 'No prior event matches found.')
+    lines.push('', collected.coverage === undefined || collected.coverage.state === 'ready'
+      ? 'No prior event matches found.'
+      : 'No matches in the indexed history available so far.')
     return lines.join('\n')
   }
   lines.push('', `Event search results (${collected.items.length}):`)

@@ -14,6 +14,7 @@ import {
   type SessionEventSurface,
   type SessionRecord,
   type SessionSearchCursor,
+  type SessionSearchCoverage,
 } from '@deepseek-ai/dsh-session-query'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { toolInput } from './input.ts'
@@ -50,6 +51,7 @@ interface EventReadArgs extends EventTargetArgs {
 interface SearchCollection<T> {
   readonly items: T[]
   readonly capped: boolean
+  readonly coverage?: SessionSearchCoverage
 }
 
 async function executeSessionSearch(
@@ -96,6 +98,7 @@ async function executeSessionSearch(
         query,
         sessionFilters,
         eventFilters,
+        snapshot: true,
         ...cursor === undefined ? {} : { cursor },
       }, { signal: exec.signal })),
     hit => hit.header.id !== caller.id && workspaceAccess.recordAuthorized(hit, caller),
@@ -110,6 +113,7 @@ async function executeSessionSearch(
     caller,
     collected.items.map(hit => hit.header.id),
     exec.signal,
+    collected.coverage === undefined ? 'exact' : 'deferred',
   )
   return presentation.formatSessionSearch(collected, titles, authorizedParents)
 }
@@ -131,8 +135,8 @@ async function executeEventSearch(
     // filter validation rejects — the loop never runs tools outside a step.
     range.to = Math.min(range.to ?? Number.MAX_SAFE_INTEGER, (stepStartSeq ?? 0) - 1)
   }
-  const title = await workspaceAccess.readTitle(ctx, caller, sessionId, exec.signal)
   if (range.from !== undefined && range.to !== undefined && range.from > range.to) {
+    const title = await workspaceAccess.readTitle(ctx, caller, sessionId, exec.signal)
     return presentation.formatEventSearch(sessionId, title, { items: [], capped: false })
   }
   const filters = toolInput.buildEventFilters({
@@ -152,12 +156,20 @@ async function executeEventSearch(
           sessionId,
           query,
           filters,
+          snapshot: true,
           ...cursor === undefined ? {} : { cursor },
         }, { signal: exec.signal }))
       workspaceAccess.assertObservedTargetAuthorized(caller, sessionId, page.session)
       return page
     },
     () => true,
+  )
+  const title = await workspaceAccess.readTitle(
+    ctx,
+    caller,
+    sessionId,
+    exec.signal,
+    collected.coverage === undefined ? 'exact' : 'deferred',
   )
   return presentation.formatEventSearch(sessionId, title, collected)
 }
@@ -241,24 +253,29 @@ async function collectPages<T>(
   request: (cursor?: SessionSearchCursor) => Promise<{
     readonly items: readonly T[]
     readonly nextCursor?: SessionSearchCursor
+    readonly coverage?: SessionSearchCoverage
   }>,
   accept: (item: T) => boolean,
 ): Promise<SearchCollection<T>> {
   const items: T[] = []
   const seen = new Set<SessionSearchCursor>()
+  let coverage: SessionSearchCoverage | undefined
   let cursor: SessionSearchCursor | undefined
   while (true) {
     signal.throwIfAborted()
     const page = await request(cursor)
     signal.throwIfAborted()
+    coverage = mergeCoverage(coverage, page.coverage)
     for (const item of page.items) {
       if (!accept(item)) continue
       if (items.length === maxResults) {
-        return { items, capped: true }
+        return { items, capped: true, ...coverage === undefined ? {} : { coverage } }
       }
       items.push(item)
     }
-    if (page.nextCursor === undefined) return { items, capped: false }
+    if (page.nextCursor === undefined) {
+      return { items, capped: false, ...coverage === undefined ? {} : { coverage } }
+    }
     if (seen.has(page.nextCursor)) {
       throw new SessionQueryError(
         'session-search provider repeated a continuation cursor',
@@ -268,6 +285,17 @@ async function collectPages<T>(
     seen.add(page.nextCursor)
     cursor = page.nextCursor
   }
+}
+
+function mergeCoverage(
+  previous: SessionSearchCoverage | undefined,
+  next: SessionSearchCoverage | undefined,
+): SessionSearchCoverage | undefined {
+  if (previous === undefined) return next
+  if (next === undefined) return previous
+  const severity = { ready: 0, syncing: 1, initializing: 2, degraded: 3 } as const
+  // A later complete page cannot make earlier partial pages complete.
+  return severity[next.state] > severity[previous.state] ? next : previous
 }
 
 /** Five model-facing session-query operation implementations. */
