@@ -388,7 +388,6 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _syncCheckedAt: number | undefined
   private _syncListingFailed = false
   private _syncScanFailed = false
-  private _syncActive = false
   private _syncRequested = false
   private _syncDraining = false
   private _syncWork: Promise<void> = Promise.resolve()
@@ -975,8 +974,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     if (this._syncCancelled(signal)) return
     const binding = await this._serialized(signal, () => this._adoptBackgroundSource())
     if (this._syncCancelled(signal)) return
-    this._syncActive = true
-    try {
+    {
       const persistence = binding.service
       if (persistence === undefined) {
         await this._serialized(signal, () => {
@@ -1011,8 +1009,6 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       )
       if (this._syncCancelled(signal)) return
       await this._runSyncReads(persistence, work, signal)
-    } finally {
-      this._syncActive = false
     }
   }
 
@@ -1036,10 +1032,12 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       id: string
       revision: string
     }>
-    const ledgerRows = db.prepare('SELECT id, revision, state FROM sync_sessions').all() as Array<{
+    const ledgerRows = db.prepare('SELECT id, revision, state, attempts, observed_at FROM sync_sessions').all() as Array<{
       id: string
       revision: string
       state: SyncRowState
+      attempts: number
+      observed_at: number
     }>
     const committed = new Map(committedRows.map(row => [row.id as SessionId, row.revision]))
     const ledger = new Map(ledgerRows.map(row => [row.id as SessionId, row]))
@@ -1063,6 +1061,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       }
       if (row === undefined || row.revision !== entry.revision || row.state === 'live') {
         upserts.push({ id, entry, state: 'pending' })
+      }
+      if (row?.state === 'failed' && row.revision === entry.revision && row.attempts >= 2) {
+        const delay = Math.min(300_000, 5_000 * 2 ** Math.min(row.attempts - 2, 6))
+        const elapsed = Date.now() - row.observed_at
+        if (elapsed >= 0 && elapsed < delay) continue
       }
       work.push({ id, revision: entry.revision, header: entry.header })
     }
@@ -1097,6 +1100,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         seeded = excluded.seeded,
         delegation_depth = excluded.delegation_depth,
         agent_preset = excluded.agent_preset,
+        attempts = CASE WHEN revision <> excluded.revision THEN 0 ELSE attempts END,
+        error = CASE WHEN revision <> excluded.revision THEN NULL ELSE error END,
         revision = excluded.revision,
         state = excluded.state,
         observed_at = excluded.observed_at
@@ -1249,12 +1254,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
 
   private _eventSearchCoverage(sessionId: SessionId): SessionSearchCoverage {
     if (!this._syncVerified) return unverifiedCoverage()
-    const counts = this._scopeCounts([], sessionId)
-    const pendingRow = this._requireDb().prepare(
-      "SELECT 1 AS present FROM sync_sessions WHERE id = ? AND state = 'live'",
-    ).get(sessionId)
-    if (pendingRow !== undefined && this.ctx.sessions.get(sessionId) === undefined) counts.pending += 1
-    return this._coverageFrom(counts)
+    return this._coverageFrom(this._scopeCounts([], sessionId))
   }
 
   private _coverageFrom(counts: ScopedCoverageCounts): SessionSearchCoverage {
@@ -1271,7 +1271,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _coverageState(counts: ScopedCoverageCounts): SessionSearchCoverage['state'] {
     if (!this._syncVerified) return 'initializing'
     if (this._syncListingFailed || this._syncScanFailed || counts.failed > 0) return 'degraded'
-    if (this._syncActive || counts.pending > 0) return 'syncing'
+    if (counts.pending > 0) return 'syncing'
     return 'ready'
   }
 
@@ -1319,7 +1319,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         FROM temp.live_sessions AS ls
         UNION ALL
         SELECT
-          ss.state AS kind,
+          CASE WHEN ss.state = 'live' THEN 'pending' ELSE ss.state END AS kind,
           ss.id AS session_id,
           ss.created_at AS created_at,
           ss.cwd AS cwd,
@@ -1327,7 +1327,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           0 AS live,
           1 AS persisted
         FROM sync_sessions AS ss
-        WHERE ss.state IN ('pending', 'failed')
+        WHERE ss.state IN ('pending', 'failed', 'live')
           AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = ss.id)
       )
       SELECT kind, COUNT(*) AS sessions FROM scoped
