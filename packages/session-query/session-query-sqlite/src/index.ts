@@ -392,11 +392,13 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     this._optionalPersistenceFiber = ctx.inject(['sessionPersistence'], (childCtx: Context) => {
       const service = childCtx.sessionPersistence
       const binding = { identity: Symbol(), service }
+      this._invalidateSnapshots()
       this._persistenceBinding = binding
       this._requestSync()
       childCtx.effect(() => () => {
         /* v8 ignore next -- a stale optional-service disposer cannot clear a replacement */
         if (this._persistenceBinding !== binding) return
+        this._invalidateSnapshots()
         this._persistenceBinding = { identity: Symbol() }
         this._requestSync()
       }, 'sessionQuerySqlite.persistenceBinding')
@@ -446,7 +448,9 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
             captured.map(row => this._sessionHit(row)),
             undefined,
           )
-          return snapshotPage(snapshot, this._instance, 'sessions', 0, normalized.limit)
+          if (snapshot !== undefined) {
+            return snapshotPage(snapshot, this._instance, 'sessions', 0, normalized.limit)
+          }
         }
       }
       const generation = String(this._globalGeneration)
@@ -499,9 +503,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
             captured.map(row => this._eventHit(row)),
             { session: target.header },
           )
-          return {
-            session: target.header,
-            ...snapshotPage(snapshot, this._instance, 'events', 0, normalized.limit),
+          if (snapshot !== undefined) {
+            return {
+              session: target.header,
+              ...snapshotPage(snapshot, this._instance, 'events', 0, normalized.limit),
+            }
           }
         }
       }
@@ -675,9 +681,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
             captured.map(row => this._sessionHit(row)),
             coverage,
           )
-          return {
-            ...snapshotPage(snapshot, this._instance, 'sessions', 0, normalized.limit),
-            coverage,
+          if (snapshot !== undefined) {
+            return {
+              ...snapshotPage(snapshot, this._instance, 'sessions', 0, normalized.limit),
+              coverage,
+            }
           }
         }
       }
@@ -739,10 +747,12 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
             captured.map(row => this._eventHit(row)),
             { session: target.header, coverage },
           )
-          return {
-            session: target.header,
-            ...snapshotPage(snapshot, this._instance, 'events', 0, normalized.limit),
-            coverage,
+          if (snapshot !== undefined) {
+            return {
+              session: target.header,
+              ...snapshotPage(snapshot, this._instance, 'events', 0, normalized.limit),
+              coverage,
+            }
           }
         }
       }
@@ -788,6 +798,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
     this._requestSync()
     return binding
+  }
+
+  private _invalidateSnapshots(): void {
+    this._sessionSnapshots.clear()
+    this._eventSnapshots.clear()
   }
 
   private _clearIndexedContent(): void {
@@ -1084,6 +1099,8 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         seeded = excluded.seeded,
         delegation_depth = excluded.delegation_depth,
         agent_preset = excluded.agent_preset,
+        attempts = CASE WHEN revision <> excluded.revision THEN 0 ELSE attempts END,
+        error = CASE WHEN revision <> excluded.revision THEN NULL ELSE error END,
         revision = excluded.revision,
         state = excluded.state,
         observed_at = excluded.observed_at
