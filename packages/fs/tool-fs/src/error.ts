@@ -11,9 +11,10 @@ import { FsError } from '@deepseek-ai/dsh-fs'
  * Render the stable model-facing diagnostic for a guarded-mutation failure.
  * `FS_STALE_VERSION` keeps the provider's reason and appends its re-read
  * remedy. `FS_NOT_OBSERVED` replaces operation-specific policy/provider text
- * with one path-aware reason and read remedy. The original error remains the
- * cause, and both diagnostics preserve its code for machine routing. Anything
- * else passes through untouched.
+ * with one path-aware reason and read remedy. `FS_EDIT_NOT_FOUND` adds an
+ * idempotency hint because a prior edit may already have landed. The original
+ * error remains the cause, and diagnostics preserve its code for machine routing.
+ * Anything else passes through untouched.
  * @param error - the caught value from a write/edit execution.
  * @param displayPath - the resolved target path shown to the model.
  * @returns a remediated `FsError` for the two guarded-mutation codes, else the original value.
@@ -37,6 +38,9 @@ export function remediateFsError(error: unknown, displayPath: string): unknown {
   }
   if (error.code === 'FS_STALE_VERSION') {
     return new FsError(`${error.message} — re-read the file, then retry`, error.code, { cause: error })
+  }
+  if (error.code === 'FS_EDIT_NOT_FOUND') {
+    return new FsError(`${error.message} — the requested change may already be present; re-read the file before retrying and do not repeat the same edit`, error.code, { cause: error })
   }
   return error
 }
