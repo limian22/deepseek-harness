@@ -2855,6 +2855,29 @@ describe('SQLite background synchronization', () => {
     await persistence.dispose()
   })
 
+  it('resets source failure backoff when a new revision appears', async () => {
+    const durable = header('revision-backoff')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('revision needle') }])
+    TestPersistence.readFailures.add(durable.id)
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    const db = (service as unknown as { _db: DatabaseSync })._db
+    await awaitBackgroundSync(service)
+    db.prepare("UPDATE sync_sessions SET attempts = 2, error = 'old revision failure' WHERE id = ?").run(durable.id)
+
+    TestPersistence.set({ meta: durable, events: messageEvents('revision replacement') })
+    await service.searchSessions({ query: 'replacement' })
+    await awaitBackgroundSync(service)
+    expect(db.prepare('SELECT attempts FROM sync_sessions WHERE id = ?').get(durable.id)).toEqual({ attempts: 1 })
+
+    await search.dispose()
+    await persistence.dispose()
+  })
+
   it('deletes indexed rows only after a complete successful listing', async () => {
     const durable = header('complete-listing')
     TestPersistence.reset([{ meta: durable, events: messageEvents('complete needle') }])
@@ -3149,6 +3172,57 @@ describe('SQLite background synchronization', () => {
     expect((await service.searchSessions({ query: 'late' })).items).toMatchObject([{ header: late }])
     await search.dispose()
     await persistence.dispose()
+  })
+
+  it.each([false, true] as const)('invalidates captured pagination when persistence source changes (background=%s)', async (background) => {
+    const previous = header(`snapshot-previous-${background}`)
+    const previousOther = header(`snapshot-previous-other-${background}`, 2)
+    TestPersistence.reset([
+      { meta: previous, events: [
+        ...messageEvents('previous snapshot needle'),
+        { ...messageEvents('previous snapshot needle again', 2)[0]!, seq: SessionSeq(1) },
+      ] },
+      { meta: previousOther, events: messageEvents('previous snapshot needle other') },
+    ])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, background ? BACKGROUND_SYNC : { path: ':memory:' })
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const firstPersistence = await ctx.plugin(TestPersistence)
+    if (background) await awaitBackgroundSync(service)
+
+    const first = await service.searchSessions({ query: 'snapshot', limit: 1, snapshot: true })
+    expect(first.nextCursor).toBeDefined()
+    const firstEvents = await service.searchEvents({
+      sessionId: previous.id,
+      query: 'snapshot',
+      limit: 1,
+      snapshot: true,
+    })
+    expect(firstEvents.nextCursor).toBeDefined()
+
+    await firstPersistence.dispose()
+    const replacement = header(`snapshot-replacement-${background}`)
+    TestPersistence.reset([{ meta: replacement, events: messageEvents('replacement snapshot needle') }])
+    const secondPersistence = await ctx.plugin(TestPersistence)
+
+    await expect(service.searchSessions({
+      query: 'snapshot',
+      limit: 1,
+      snapshot: true,
+      ...(first.nextCursor === undefined ? {} : { cursor: first.nextCursor }),
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    await expect(service.searchEvents({
+      sessionId: previous.id,
+      query: 'snapshot',
+      limit: 1,
+      snapshot: true,
+      ...(firstEvents.nextCursor === undefined ? {} : { cursor: firstEvents.nextCursor }),
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+
+    await search.dispose()
+    await secondPersistence.dispose()
   })
 
   it('keeps live shadowing, generations, and captured pagination in background mode', async () => {

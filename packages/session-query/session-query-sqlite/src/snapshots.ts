@@ -82,13 +82,14 @@ export class SnapshotStore<Row, Meta> {
    * @param fingerprint - normalized request identity the capture belongs to.
    * @param rows - hits in ranking order; at most `maxRows` are kept.
    * @param meta - scope-owned payload returned with the capture.
-   * @returns the stored capture, including its continuation identifier.
+   * @returns the stored capture, including its continuation identifier, or undefined when the capture alone exceeds the byte budget.
    */
-  store(fingerprint: string, rows: readonly Row[], meta: Meta): SearchSnapshot<Row, Meta> {
+  store(fingerprint: string, rows: readonly Row[], meta: Meta): SearchSnapshot<Row, Meta> | undefined {
     const storedAt = Date.now()
     this.purge(storedAt)
     const kept = rows.slice(0, this.limits.maxRows)
     const bytes = Buffer.byteLength(JSON.stringify(kept), 'utf8')
+    if (bytes > this.limits.maxBytes) return undefined
     while (this.entries.size > 0
       && (this.entries.size >= this.limits.maxEntries || this.bytes + bytes > this.limits.maxBytes)) {
       const oldest = this.entries.entries().next()

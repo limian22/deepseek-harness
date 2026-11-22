@@ -81,11 +81,11 @@ describe('SnapshotStore', () => {
     expect(store.take(second.id)?.rows).toEqual(['bbbb'])
   })
 
-  it('stores one capture that alone exceeds the byte budget', () => {
+  it('does not store a capture that alone exceeds the byte budget', () => {
     const store = new SnapshotStore<string, undefined>({ ...unlimited, maxBytes: 1 })
     const snapshot = store.store('oversized', ['aaaa'], undefined)
 
-    expect(store.take(snapshot.id)).toBe(snapshot)
+    expect(snapshot).toBeUndefined()
   })
 
   it('forgets every capture when cleared', () => {
