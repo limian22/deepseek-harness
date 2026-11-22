@@ -13,7 +13,7 @@ import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { ClientSessionContext, TokenSpan } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { PopupSearchLabels, PopupSearchMode, PopupSelectSpec, SelectOption } from './contract.ts'
-import { rankByName } from '@deepseek-ai/dsh-client-ui-primitives'
+import { TextSearchIndex } from '@deepseek-ai/dsh-util-text-search'
 import { groupOptions } from './option-groups.ts'
 
 /**
@@ -107,9 +107,10 @@ export function filterOptions(
   const ordered = groups.some(group => group.group !== undefined) ? groups.flatMap(group => group.rows) : options
   if (query === '') return ordered
   if (mode === 'fuzzy-label') {
-    return groups.flatMap(group => rankByName(
-      group.rows.map(option => ({ name: option.label, option })), query,
-    ).map(row => row.option))
+    return groups.flatMap(group => new TextSearchIndex(
+      group.rows,
+      option => ({ fuzzy: [option.label] }),
+    ).search(query))
   }
   return ordered.filter(o => o.label.toLowerCase().includes(query) || (o.detail?.toLowerCase().includes(query) ?? false))
 }

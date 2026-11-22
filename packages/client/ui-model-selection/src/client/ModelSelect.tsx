@@ -38,12 +38,13 @@ import type { ModelReasoningEffort, ModelSelection } from '@deepseek-ai/dsh-api-
 import type { ModelCatalogModel } from '@deepseek-ai/dsh-api-session-controller/types'
 import {
   IconCheckOutlineRegular, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconCloseFillRegular,
-  IconDataOutlineRegular, IconWarningOutlineRegular, Input, isMobileDevice, rankByName, StateDot, Tag, Toast,
+  IconDataOutlineRegular, IconWarningOutlineRegular, Input, isMobileDevice, StateDot, Tag, Toast,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRenderSlots, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ModelLabelOwner, ModelSelectInjected } from './slots.ts'
 import { FAVORITES_GROUP_ID, favoriteKey, type ModelFavoritesState } from './favorites.ts'
 import css from './ModelSelect.module.css'
+import { TextSearchIndex } from '@deepseek-ai/dsh-util-text-search'
 import { orderModelProviders } from './provider-order.ts'
 
 /** Which pane the dropdown shows: the two-row root or one drilled-in list. */
@@ -178,13 +179,14 @@ export function ModelSelect(
       } satisfies ModelSelection,
     }))), [groups])
   const showSearch = choices.length > 4
-  const filteredGroups = useMemo(() => groups.map(group => ({
+  const groupIndexes = useMemo(() => groups.map(group => ({
+    group,
+    index: new TextSearchIndex(group.entries, entry => ({ fuzzy: [entry.model.name, entry.model.id] })),
+  })), [groups])
+  const filteredGroups = useMemo(() => groupIndexes.map(({ group, index }) => ({
     ...group,
-    entries: rankByName(
-      group.entries.map(entry => ({ name: entry.model.name, entry })),
-      showSearch ? query.trim() : '',
-    ).map(row => row.entry),
-  })).filter(group => group.entries.length > 0), [groups, query, showSearch])
+    entries: index.search(showSearch ? query : ''),
+  })).filter(group => group.entries.length > 0), [groupIndexes, query, showSearch])
   const visibleModels = useMemo(() => filteredGroups.flatMap(group => group.entries.map(entry => ({
     provider: entry.provider.id, model: entry.model.id,
   }))), [filteredGroups])
