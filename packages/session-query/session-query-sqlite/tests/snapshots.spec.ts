@@ -19,10 +19,15 @@ const unlimited: SnapshotLimits = {
   maxBytes: SESSION_QUERY_SNAPSHOT_MAX_BYTES,
 }
 
+function requireSnapshot<T extends object>(snapshot: T | undefined): T {
+  if (snapshot === undefined) throw new Error('expected snapshot to be stored')
+  return snapshot
+}
+
 describe('SnapshotStore', () => {
   it('captures hits and returns them with the owning payload', () => {
     const store = new SnapshotStore<string, { owner: string }>(unlimited)
-    const snapshot = store.store('fingerprint', ['first', 'second'], { owner: 'target' })
+    const snapshot = requireSnapshot(store.store('fingerprint', ['first', 'second'], { owner: 'target' }))
 
     expect(snapshot.fingerprint).toBe('fingerprint')
     expect(snapshot.rows).toEqual(['first', 'second'])
@@ -33,7 +38,7 @@ describe('SnapshotStore', () => {
 
   it('keeps at most the configured number of hits per capture', () => {
     const store = new SnapshotStore<string, undefined>({ ...unlimited, maxRows: 2 })
-    const snapshot = store.store('fingerprint', ['a', 'b', 'c'], undefined)
+    const snapshot = requireSnapshot(store.store('fingerprint', ['a', 'b', 'c'], undefined))
 
     expect(snapshot.rows).toEqual(['a', 'b'])
   })
@@ -42,7 +47,7 @@ describe('SnapshotStore', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
     const store = new SnapshotStore<string, undefined>({ ...unlimited, ttlMs: 1_000 })
-    const snapshot = store.store('fingerprint', ['a'], undefined)
+    const snapshot = requireSnapshot(store.store('fingerprint', ['a'], undefined))
 
     vi.setSystemTime(new Date('2026-01-01T00:00:01.001Z'))
 
@@ -51,9 +56,9 @@ describe('SnapshotStore', () => {
 
   it('evicts the oldest capture when the entry limit is reached', () => {
     const store = new SnapshotStore<string, undefined>({ ...unlimited, maxEntries: 2 })
-    const first = store.store('first', ['a'], undefined)
-    const second = store.store('second', ['b'], undefined)
-    const third = store.store('third', ['c'], undefined)
+    const first = requireSnapshot(store.store('first', ['a'], undefined))
+    const second = requireSnapshot(store.store('second', ['b'], undefined))
+    const third = requireSnapshot(store.store('third', ['c'], undefined))
 
     expect(store.take(first.id)).toBeUndefined()
     expect(store.take(second.id)?.rows).toEqual(['b'])
@@ -62,8 +67,8 @@ describe('SnapshotStore', () => {
 
   it('keeps a capture that is still being paged ahead of newly stored ones', () => {
     const store = new SnapshotStore<string, undefined>({ ...unlimited, maxEntries: 2 })
-    const older = store.store('older', ['a'], undefined)
-    const newer = store.store('newer', ['b'], undefined)
+    const older = requireSnapshot(store.store('older', ['a'], undefined))
+    const newer = requireSnapshot(store.store('newer', ['b'], undefined))
 
     expect(store.take(older.id)?.rows).toEqual(['a'])
     store.store('third', ['c'], undefined)
@@ -74,8 +79,8 @@ describe('SnapshotStore', () => {
 
   it('evicts captures that would exceed the byte budget', () => {
     const store = new SnapshotStore<string, undefined>({ ...unlimited, maxBytes: 12 })
-    const first = store.store('first', ['aaaa'], undefined)
-    const second = store.store('second', ['bbbb'], undefined)
+    const first = requireSnapshot(store.store('first', ['aaaa'], undefined))
+    const second = requireSnapshot(store.store('second', ['bbbb'], undefined))
 
     expect(store.take(first.id)).toBeUndefined()
     expect(store.take(second.id)?.rows).toEqual(['bbbb'])
@@ -90,7 +95,7 @@ describe('SnapshotStore', () => {
 
   it('forgets every capture when cleared', () => {
     const store = new SnapshotStore<string, undefined>(unlimited)
-    const snapshot = store.store('fingerprint', ['a'], undefined)
+    const snapshot = requireSnapshot(store.store('fingerprint', ['a'], undefined))
 
     store.clear()
 
