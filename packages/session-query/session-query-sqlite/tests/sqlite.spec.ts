@@ -1878,3 +1878,810 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
     await persistenceB.dispose()
   })
 })
+
+
+/**
+ * Await coalesced background synchronization through the engine's own
+ * quiescence barrier, bounded so a lost wakeup fails loudly.
+ * @param service - engine whose owned background job is observed.
+ * @returns nothing once the job is quiescent.
+ */
+async function awaitBackgroundSync(service: SqliteSessionQueryEngine): Promise<void> {
+  await service.whenSynchronized()
+}
+
+/** Background-mode configuration with a quiet periodic timer for deterministic scans. */
+const BACKGROUND_SYNC = {
+  path: ':memory:',
+  syncMode: 'background',
+  syncIntervalMs: 60_000,
+} as const
+
+describe('SQLite background synchronization', () => {
+  it('exposes background defaults and validates its sync configuration', async () => {
+    const defaults = new SqliteSessionQueryEngine.Config({ path: ':memory:' })
+    expect(defaults).toMatchObject({
+      syncMode: 'on-search',
+      syncIntervalMs: 5000,
+      syncReadConcurrency: 2,
+      syncBatchSessions: 24,
+    })
+    expect(new SqliteSessionQueryEngine.Config({
+      path: ':memory:',
+      syncMode: 'background',
+      syncIntervalMs: 1_000,
+      syncReadConcurrency: 3,
+    })).toMatchObject({ syncMode: 'background', syncIntervalMs: 1_000, syncReadConcurrency: 3 })
+
+    expect(() => new SqliteSessionQueryEngine.Config({
+      path: ':memory:',
+      syncMode: 'later' as never,
+    })).toThrow()
+    for (const syncIntervalMs of [0, -1, 1.5, 2 ** 31, Number.MAX_SAFE_INTEGER]) {
+      expect(() => new SqliteSessionQueryEngine.Config({ path: ':memory:', syncIntervalMs })).toThrow()
+    }
+    for (const syncReadConcurrency of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => new SqliteSessionQueryEngine.Config({ path: ':memory:', syncReadConcurrency })).toThrow()
+    }
+    for (const syncBatchSessions of [0, -1, 1.5, 10_001]) {
+      expect(() => new SqliteSessionQueryEngine.Config({ path: ':memory:', syncBatchSessions })).toThrow()
+    }
+
+    const ctx = await liveContext(BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    expect(service.config).toMatchObject({
+      syncMode: 'background',
+      syncIntervalMs: 60_000,
+      syncReadConcurrency: 2,
+    })
+    await service.close()
+  })
+
+  it('skips unchanged live histories and observes appends and replacement instances', async () => {
+    const ctx = await liveContext(BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    try {
+      const meta = header('live-revision', 1)
+      const live = ctx.sessions.prepare(meta.id, { meta, seed: messageEvents('original needle') })
+      const detach = ctx.sessions.enter(live)
+      ctx.sessions.announce(live)
+      const snapshot = vi.spyOn(live, 'snapshotEvents')
+      expect((await service.searchSessions({ query: 'original' })).items).toHaveLength(1)
+      expect(snapshot).toHaveBeenCalledTimes(1)
+      expect((await service.searchSessions({ query: 'original' })).items).toHaveLength(1)
+      expect(snapshot).toHaveBeenCalledTimes(1)
+
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'appended needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect((await service.searchSessions({ query: 'appended' })).items).toHaveLength(1)
+      expect(snapshot).toHaveBeenCalledTimes(2)
+      detach()
+
+      const replacement = ctx.sessions.prepare(meta.id, { meta, seed: messageEvents('replacement needle') })
+      const detachReplacement = ctx.sessions.enter(replacement)
+      ctx.sessions.announce(replacement)
+      replacement.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'second replacement' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect(replacement.seq).toBe(live.seq)
+      expect((await service.searchSessions({ query: 'replacement' })).items).toHaveLength(1)
+      expect((await service.searchSessions({ query: 'original' })).items).toEqual([])
+      detachReplacement()
+      expect((await service.searchSessions({ query: 'replacement' })).items).toEqual([])
+    } finally {
+      await service.close()
+    }
+  })
+
+  it('keeps existing live FTS rows when a session appends an event', async () => {
+    const ctx = await liveContext(BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    try {
+      const live = ctx.sessions.create(SessionId('live-append-delta'), { seed: messageEvents('original needle') })
+      await service.searchEvents({ sessionId: live.id, query: 'original' })
+      const db = Reflect.get(service, '_db') as DatabaseSync
+      const prepare = vi.spyOn(db, 'prepare')
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'appended needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect((await service.searchEvents({ sessionId: live.id, query: 'appended' })).items).toHaveLength(1)
+      expect(prepare.mock.calls.map(([sql]) => sql)).not.toContain('DELETE FROM temp.live_docs WHERE session_id = ?')
+      expect((await service.searchEvents({ sessionId: live.id, query: 'original' })).items).toHaveLength(1)
+      live.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'replacement needle' }], source: { kind: 'test' },
+      }), {
+        surfaceOp: { op: 'replace', startSeq: SessionSeq(0), endSeq: SessionSeq(0) },
+        sourceEventSeqs: [SessionSeq(0)],
+      })
+      expect((await service.searchEvents({ sessionId: live.id, query: 'original' })).items)
+        .toMatchObject([{ seq: SessionSeq(0), surface: 'shadowed' }])
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('counts searchable live-only sessions inside the requested coverage scope', async () => {
+    const ctx = await liveContext(BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    try {
+      const visible = ctx.sessions.create(SessionId('live-counted'), { meta: header('live-counted', 1, { cwd: '/visible' }) })
+      visible.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'counted needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      const hidden = ctx.sessions.create(SessionId('live-other-scope'), { meta: header('live-other-scope', 1, { cwd: '/other' }) })
+      hidden.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'hidden needle' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      await awaitBackgroundSync(service)
+      const result = await service.searchSessions({
+        query: 'needle',
+        sessionFilters: [{ kind: 'cwd', values: ['/visible'] }, { kind: 'availability', values: ['live'] }],
+      })
+      expect(result.items.map(item => item.header.id)).toEqual([visible.id])
+      expect(result.coverage).toMatchObject({ indexedSessions: 1, pendingSessions: 0, failedSessions: 0 })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('commits pending sessions in bounded batches and keeps every one searchable', async () => {
+    const entries = Array.from({ length: 12 }, (_, index) => ({
+      meta: header(`batched-${index}`, index + 1),
+      events: messageEvents(`batched needle ${index}`),
+    }))
+    TestPersistence.reset(entries)
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, { ...BACKGROUND_SYNC, syncBatchSessions: 5 })
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+
+    const page = await service.searchSessions({ query: 'needle', limit: 50 })
+    expect(page.items).toHaveLength(12)
+    expect(new Set(page.items.map(item => item.header.id)).size).toBe(12)
+    expect(page.coverage).toMatchObject({ state: 'ready', indexedSessions: 12, pendingSessions: 0 })
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('returns indexed history without awaiting a blocked persistence listing', async () => {
+    const durable = header('blocked-listing')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('blocked needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const gate = Promise.withResolvers<undefined>()
+    const listed = Promise.withResolvers<undefined>()
+    TestPersistence.listGate = gate.promise
+    TestPersistence.listStarted = () => { listed.resolve(undefined) }
+    const persistence = await ctx.plugin(TestPersistence)
+
+    const pending = await service.searchSessions({ query: 'blocked' })
+    expect(pending.items).toEqual([])
+    expect(pending.coverage).toMatchObject({
+      state: 'initializing',
+    })
+    expect(pending.coverage).not.toHaveProperty('pendingSessions')
+    expect(pending.coverage).not.toHaveProperty('failedSessions')
+    await listed.promise
+
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    const page = await service.searchSessions({ query: 'blocked' })
+    expect(page.items).toMatchObject([{ header: durable, live: false, persisted: true }])
+    expect(page.coverage).toMatchObject({
+      state: 'ready',
+      indexedSessions: 1,
+      pendingSessions: 0,
+      failedSessions: 0,
+    })
+    expect(typeof page.coverage?.checkedAt).toBe('number')
+    expect(TestPersistence.reads.get(durable.id)).toBe(1)
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('hides a known-changed generation until its replacement commits', async () => {
+    const durable = header('known-changed')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('original needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'original' })).items)
+      .toMatchObject([{ header: durable, persisted: true }])
+
+    TestPersistence.set({ meta: durable, events: messageEvents('replacement needle') })
+    const readGate = Promise.withResolvers<undefined>()
+    const readStarted = Promise.withResolvers<undefined>()
+    TestPersistence.readEffect = async () => {
+      readStarted.resolve(undefined)
+      await readGate.promise
+    }
+    await service.searchSessions({ query: 'original' })
+    await readStarted.promise
+
+    const hidden = await service.searchSessions({ query: 'original' })
+    expect(hidden.items).toEqual([])
+    expect(hidden.coverage).toMatchObject({
+      state: 'syncing',
+      indexedSessions: 0,
+      pendingSessions: 1,
+      failedSessions: 0,
+    })
+    expect((await service.searchSessions({ query: 'replacement' })).items).toEqual([])
+
+    readGate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'replacement' })).items)
+      .toMatchObject([{ header: durable, persisted: true }])
+    expect((await service.searchSessions({ query: 'original' })).items).toEqual([])
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('backs off repeated failures without hiding degraded coverage and retries a new revision immediately', async () => {
+    const durable = header('retry-backoff')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('retry needle') }])
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000)
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    TestPersistence.readFailures.add(durable.id)
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    await service.searchSessions({ query: 'retry' })
+    await awaitBackgroundSync(service)
+    const reads = TestPersistence.reads.get(durable.id)
+    await service.searchSessions({ query: 'retry' })
+    await awaitBackgroundSync(service)
+    expect(TestPersistence.reads.get(durable.id)).toBe(reads)
+    expect((await service.searchSessions({ query: 'retry' })).coverage).toMatchObject({ state: 'degraded', failedSessions: 1 })
+    TestPersistence.readFailures.delete(durable.id)
+    TestPersistence.set({ meta: durable, events: messageEvents('new revision needle') })
+    await service.searchSessions({ query: 'retry' })
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'revision' })).coverage).toMatchObject({ state: 'ready', failedSessions: 0 })
+    now.mockRestore()
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('retries transient failures after the bounded delay across reopening', async () => {
+    const durable = header('retry-reopen')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('eventual needle') }])
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000)
+    const path = await temporaryPath()
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    let search = await ctx.plugin(SqliteSessionQueryEngine, { ...BACKGROUND_SYNC, path })
+    let service = ctx.sessionQuery as SqliteSessionQueryEngine
+    TestPersistence.readFailures.add(durable.id)
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    await service.searchSessions({ query: 'eventual' })
+    await awaitBackgroundSync(service)
+    const reads = TestPersistence.reads.get(durable.id)
+    await search.dispose()
+    TestPersistence.readFailures.delete(durable.id)
+    search = await ctx.plugin(SqliteSessionQueryEngine, { ...BACKGROUND_SYNC, path })
+    service = ctx.sessionQuery as SqliteSessionQueryEngine
+    await awaitBackgroundSync(service)
+    expect(TestPersistence.reads.get(durable.id)).toBe(reads)
+    expect((await service.searchSessions({ query: 'eventual' })).coverage).toMatchObject({ state: 'degraded', failedSessions: 1 })
+    now.mockReturnValue(1_005_001)
+    await service.searchSessions({ query: 'eventual' })
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'eventual' })).coverage).toMatchObject({ state: 'ready', failedSessions: 0 })
+    now.mockRestore()
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('does not carry a failed retry delay to a replacement source with the same revision', async () => {
+    const durable = header('retry-source-switch')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('replacement needle') }])
+    const revision = TestPersistence.revisions.get(durable.id)!
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000)
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    TestPersistence.readFailures.add(durable.id)
+    const first = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    await service.searchSessions({ query: 'replacement' })
+    await awaitBackgroundSync(service)
+    await first.dispose()
+    await awaitBackgroundSync(service)
+    TestPersistence.readFailures.delete(durable.id)
+    TestPersistence.revisions.set(durable.id, revision)
+    const second = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    const result = await service.searchSessions({ query: 'replacement' })
+    expect(result.items).toMatchObject([{ header: durable }])
+    expect(result.coverage).toMatchObject({ state: 'ready', failedSessions: 0 })
+    now.mockRestore()
+    await search.dispose()
+    await second.dispose()
+  })
+
+  it('counts detached live sources as pending within session filters while listing is blocked', async () => {
+    const durable = header('detached-coverage', 10, { cwd: '/detached' })
+    TestPersistence.reset([{ meta: durable, events: messageEvents('durable needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const live = ctx.sessions.prepare(durable.id, {
+      seed: messageEvents('live needle'), meta: { createdAt: durable.createdAt, cwd: '/detached' },
+    })
+    const detach = ctx.sessions.enter(live)
+    ctx.sessions.announce(live)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'live' })).coverage)
+      .toMatchObject({ state: 'ready', indexedSessions: 1, pendingSessions: 0 })
+    await awaitBackgroundSync(service)
+    const gate = Promise.withResolvers<undefined>()
+    const listed = Promise.withResolvers<undefined>()
+    TestPersistence.listGate = gate.promise
+    TestPersistence.listStarted = () => { listed.resolve(undefined) }
+    detach()
+    const result = await service.searchSessions({ query: 'durable', sessionFilters: [{ kind: 'id', values: [durable.id] }] })
+    await listed.promise
+    expect(result.items).toEqual([])
+    expect(result.coverage).toMatchObject({ state: 'syncing', indexedSessions: 0, pendingSessions: 1 })
+    const other = await service.searchSessions({ query: 'durable', sessionFilters: [{ kind: 'id', values: [SessionId('other')] }] })
+    expect(other.coverage).toMatchObject({ state: 'ready', pendingSessions: 0 })
+    const event = await service.searchEvents({ sessionId: durable.id, query: 'durable' })
+    expect(event.coverage).toMatchObject({ state: 'syncing', pendingSessions: 1 })
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'durable' })).coverage)
+      .toMatchObject({ state: 'ready', indexedSessions: 1, pendingSessions: 0 })
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('reports ready while an unchanged background listing is blocked', async () => {
+    const durable = header('idle-listing')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('idle needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    const gate = Promise.withResolvers<undefined>()
+    const listed = Promise.withResolvers<undefined>()
+    TestPersistence.listGate = gate.promise
+    TestPersistence.listStarted = () => { listed.resolve(undefined) }
+    await service.searchSessions({ query: 'idle' })
+    await listed.promise
+    expect((await service.searchSessions({ query: 'idle' })).coverage).toMatchObject({ state: 'ready', pendingSessions: 0 })
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('isolates a failing source read and keeps other committed sessions searchable', async () => {
+    const healthy = header('healthy-source')
+    const broken = header('broken-source')
+    TestPersistence.reset([
+      { meta: healthy, events: messageEvents('healthy needle') },
+      { meta: broken, events: messageEvents('broken needle') },
+    ])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    TestPersistence.readFailures.add(broken.id)
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+
+    const page = await service.searchSessions({ query: 'healthy' })
+    expect(page.items).toMatchObject([{ header: healthy, persisted: true }])
+    expect(page.coverage).toMatchObject({
+      state: 'degraded',
+      indexedSessions: 1,
+      pendingSessions: 0,
+      failedSessions: 1,
+    })
+    const scoped = await service.searchSessions({
+      query: 'needle',
+      sessionFilters: [{ kind: 'id', values: [broken.id] }],
+    })
+    expect(scoped.items).toEqual([])
+    expect(scoped.coverage).toMatchObject({
+      indexedSessions: 0,
+      pendingSessions: 0,
+      failedSessions: 1,
+    })
+
+    TestPersistence.readFailures.delete(broken.id)
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 300_001)
+    await service.searchSessions({ query: 'broken' })
+    await awaitBackgroundSync(service)
+    const recovered = await service.searchSessions({ query: 'broken' })
+    expect(recovered.items).toMatchObject([{ header: broken, persisted: true }])
+    expect(recovered.coverage).toMatchObject({ state: 'ready', indexedSessions: 2, failedSessions: 0 })
+    now.mockRestore()
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('deletes indexed rows only after a complete successful listing', async () => {
+    const durable = header('complete-listing')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('complete needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    const indexed = await service.searchSessions({ query: 'complete' })
+    expect(indexed.items).toMatchObject([{ header: durable }])
+    const checkedAt = indexed.coverage?.checkedAt
+    expect(typeof checkedAt).toBe('number')
+
+    TestPersistence.failure = new Error('listing offline')
+    await service.searchSessions({ query: 'complete' })
+    await awaitBackgroundSync(service)
+    const offline = await service.searchSessions({ query: 'complete' })
+    expect(offline.items).toMatchObject([{ header: durable }])
+    expect(offline.coverage).toMatchObject({ state: 'degraded', indexedSessions: 1, checkedAt })
+
+    TestPersistence.failure = undefined
+    TestPersistence.entries.delete(durable.id)
+    await service.searchSessions({ query: 'complete' })
+    await awaitBackgroundSync(service)
+    const removed = await service.searchSessions({ query: 'complete' })
+    expect(removed.items).toEqual([])
+    expect(removed.coverage).toMatchObject({ state: 'ready', indexedSessions: 0 })
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('does not let a caller abort cancel the shared synchronization', async () => {
+    const durable = header('caller-abort')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('caller abort needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const gate = Promise.withResolvers<undefined>()
+    const listed = Promise.withResolvers<undefined>()
+    TestPersistence.listGate = gate.promise
+    TestPersistence.listStarted = () => { listed.resolve(undefined) }
+    const persistence = await ctx.plugin(TestPersistence)
+    await listed.promise
+
+    const controller = new AbortController()
+    controller.abort()
+    await expect(service.searchSessions({ query: 'caller' }, { signal: controller.signal }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_ABORTED'))
+    expect(TestPersistence.listSignals.length).toBeGreaterThan(0)
+    for (const signal of TestPersistence.listSignals) expect(signal?.aborted).toBe(false)
+
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'caller' })).items)
+      .toMatchObject([{ header: durable, persisted: true }])
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('cancels and awaits owned background work on disposal', async () => {
+    const durable = header('disposed-work')
+    TestPersistence.reset([{ meta: durable, events: messageEvents('disposed needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const readStarted = Promise.withResolvers<undefined>()
+    TestPersistence.readEffect = async (_entry, signal) => {
+      readStarted.resolve(undefined)
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => { reject(new Error('aborted')) }, { once: true })
+      })
+    }
+    const persistence = await ctx.plugin(TestPersistence)
+    await readStarted.promise
+
+    let settled = false
+    const disposing = search.dispose().then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    await disposing
+    expect(settled).toBe(true)
+    expect(TestPersistence.readSignals.at(-1)?.aborted).toBe(true)
+    await expect(service.searchSessions({ query: 'disposed' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_INDEX_FAILED'))
+    await persistence.dispose()
+  })
+
+  it('scopes coverage counts to the request session predicates', async () => {
+    const alpha = header('scoped-alpha', 10, { cwd: '/alpha' })
+    const beta = header('scoped-beta', 20, { cwd: '/beta' })
+    TestPersistence.reset([
+      { meta: alpha, events: messageEvents('scoped needle') },
+      { meta: beta, events: messageEvents('scoped needle') },
+    ])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const gate = Promise.withResolvers<undefined>()
+    const bothReads = Promise.withResolvers<undefined>()
+    let started = 0
+    TestPersistence.readEffect = async () => {
+      started += 1
+      if (started === 2) bothReads.resolve(undefined)
+      await gate.promise
+    }
+    const persistence = await ctx.plugin(TestPersistence)
+    await bothReads.promise
+
+    const all = await service.searchSessions({ query: 'scoped' })
+    expect(all.items).toEqual([])
+    expect(all.coverage).toMatchObject({ state: 'syncing', indexedSessions: 0, pendingSessions: 2 })
+    const alphaOnly = await service.searchSessions({
+      query: 'scoped',
+      sessionFilters: [{ kind: 'cwd', values: ['/alpha'] }],
+    })
+    expect(alphaOnly.coverage).toMatchObject({ indexedSessions: 0, pendingSessions: 1, failedSessions: 0 })
+    expect(Object.keys(alphaOnly.coverage ?? {}).sort())
+      .toEqual(['checkedAt', 'failedSessions', 'indexedSessions', 'pendingSessions', 'state'])
+    expect(JSON.stringify(alphaOnly.coverage)).not.toContain('/beta')
+    const betaOnly = await service.searchSessions({
+      query: 'scoped',
+      sessionFilters: [{ kind: 'id', values: [beta.id] }],
+    })
+    expect(betaOnly.coverage).toMatchObject({ pendingSessions: 1 })
+
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    const scopedAfter = await service.searchSessions({
+      query: 'scoped',
+      sessionFilters: [{ kind: 'cwd', values: ['/alpha'] }],
+    })
+    expect(scopedAfter.items).toMatchObject([{ header: alpha }])
+    expect(scopedAfter.coverage).toMatchObject({ state: 'ready', indexedSessions: 1, pendingSessions: 0 })
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('distinguishes a known pending event target from an unknown session', async () => {
+    const target = header('pending-target', 10)
+    TestPersistence.reset([{ meta: target, events: messageEvents('pending needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const gate = Promise.withResolvers<undefined>()
+    const readStarted = Promise.withResolvers<undefined>()
+    TestPersistence.readEffect = async () => {
+      readStarted.resolve(undefined)
+      await gate.promise
+    }
+    const persistence = await ctx.plugin(TestPersistence)
+    await readStarted.promise
+
+    const pending = await service.searchEvents({ sessionId: target.id, query: 'pending' })
+    expect(pending.items).toEqual([])
+    expect(pending.session).toEqual(target)
+    expect(pending.coverage).toMatchObject({
+      state: 'syncing',
+      indexedSessions: 0,
+      pendingSessions: 1,
+      failedSessions: 0,
+    })
+    await expect(service.searchEvents({ sessionId: SessionId('never-listed'), query: 'needle' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_SESSION_NOT_FOUND'))
+
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    const indexed = await service.searchEvents({ sessionId: target.id, query: 'pending' })
+    expect(indexed.items).toMatchObject([{ sessionId: target.id, seq: SessionSeq(0) }])
+    expect(indexed.coverage).toMatchObject({ state: 'ready', indexedSessions: 1, pendingSessions: 0 })
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('hides indexed content from a previous persistence source immediately', async () => {
+    const previous = header('previous-source', 10)
+    TestPersistence.reset([{ meta: previous, events: messageEvents('previous source needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const firstPersistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'previous' })).items).toMatchObject([{ header: previous }])
+
+    await firstPersistence.dispose()
+    await awaitBackgroundSync(service)
+    const replacement = header('replacement-source', 20)
+    TestPersistence.reset([{ meta: replacement, events: messageEvents('replacement source needle') }])
+    const gate = Promise.withResolvers<undefined>()
+    const listed = Promise.withResolvers<undefined>()
+    TestPersistence.listGate = gate.promise
+    TestPersistence.listStarted = () => { listed.resolve(undefined) }
+    const secondPersistence = await ctx.plugin(TestPersistence)
+
+    const hidden = await service.searchSessions({ query: 'previous' })
+    expect(hidden.items).toEqual([])
+    expect(hidden.coverage).toEqual({ state: 'initializing' })
+    await expect(service.searchEvents({ sessionId: previous.id, query: 'previous' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_SESSION_NOT_FOUND'))
+    await listed.promise
+
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'replacement' })).items)
+      .toMatchObject([{ header: replacement }])
+    await search.dispose()
+    await secondPersistence.dispose()
+  })
+
+  it('withholds a reopened index until the current source metadata verifies', async () => {
+    const path = await temporaryPath('reopened-verification.db')
+    const previous = header('previous-store', 10)
+    TestPersistence.reset([{ meta: previous, events: messageEvents('previous store needle') }])
+    const first = new Context()
+    await first.plugin(SessionStore)
+    await first.plugin(SessionProjectionRegistry)
+    const firstPersistence = await first.plugin(TestPersistence)
+    const firstSearch = await first.plugin(SqliteSessionQueryEngine, { ...BACKGROUND_SYNC, path })
+    await awaitBackgroundSync(first.sessionQuery as SqliteSessionQueryEngine)
+    expect((await first.sessionQuery.searchSessions({ query: 'previous' })).items)
+      .toMatchObject([{ header: previous }])
+    await firstSearch.dispose()
+    await firstPersistence.dispose()
+
+    const replacement = header('replacement-store', 20)
+    TestPersistence.reset([{ meta: replacement, events: messageEvents('replacement store needle') }])
+    const gate = Promise.withResolvers<undefined>()
+    const listed = Promise.withResolvers<undefined>()
+    TestPersistence.listGate = gate.promise
+    TestPersistence.listStarted = () => { listed.resolve(undefined) }
+    const second = new Context()
+    await second.plugin(SessionStore)
+    await second.plugin(SessionProjectionRegistry)
+    const secondPersistence = await second.plugin(TestPersistence)
+    const secondSearch = await second.plugin(SqliteSessionQueryEngine, { ...BACKGROUND_SYNC, path })
+    const service = second.sessionQuery as SqliteSessionQueryEngine
+
+    const withheld = await service.searchSessions({ query: 'needle' })
+    expect(withheld.items).toEqual([])
+    expect(withheld.coverage).toMatchObject({
+      state: 'initializing',
+    })
+    expect(withheld.coverage?.checkedAt).toBeUndefined()
+    await expect(service.searchEvents({ sessionId: previous.id, query: 'needle' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_SESSION_NOT_FOUND'))
+    await listed.promise
+
+    gate.resolve(undefined)
+    await awaitBackgroundSync(service)
+    const verified = await service.searchSessions({ query: 'needle' })
+    expect(verified.items).toMatchObject([{ header: replacement }])
+    expect(verified.coverage).toMatchObject({ state: 'ready', indexedSessions: 1 })
+    await expect(service.searchEvents({ sessionId: previous.id, query: 'needle' }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_SESSION_NOT_FOUND'))
+    await secondSearch.dispose()
+    await secondPersistence.dispose()
+  })
+
+  it('reconciles periodically while active without a caller query', async () => {
+    const early = header('periodic-early')
+    TestPersistence.reset([{ meta: early, events: messageEvents('periodic needle') }])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, {
+      path: ':memory:',
+      syncMode: 'background',
+      syncIntervalMs: 20,
+    })
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'periodic' })).items).toHaveLength(1)
+
+    const late = header('periodic-late')
+    const rescanned = Promise.withResolvers<undefined>()
+    TestPersistence.set({ meta: late, events: messageEvents('late needle') })
+    TestPersistence.listStarted = () => { rescanned.resolve(undefined) }
+    await rescanned.promise
+    await awaitBackgroundSync(service)
+    expect((await service.searchSessions({ query: 'late' })).items).toMatchObject([{ header: late }])
+    await search.dispose()
+    await persistence.dispose()
+  })
+
+  it('keeps live shadowing, generations, and captured pagination in background mode', async () => {
+    const shared = header('background-live', 10)
+    const other = header('background-other', 20)
+    TestPersistence.reset([
+      { meta: shared, events: messageEvents('persisted needle') },
+      { meta: other, events: messageEvents('other needle') },
+    ])
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    const search = await ctx.plugin(SqliteSessionQueryEngine, BACKGROUND_SYNC)
+    const service = ctx.sessionQuery as SqliteSessionQueryEngine
+    const persistence = await ctx.plugin(TestPersistence)
+    await awaitBackgroundSync(service)
+
+    const first = await service.searchSessions({ query: 'needle', limit: 1, snapshot: true })
+    expect(first.items).toHaveLength(1)
+    expect(first.nextCursor).toBeDefined()
+    expect(first.coverage?.state).toBe('ready')
+    // A capture keeps its original ranking and coverage while the corpus changes.
+    TestPersistence.set({ meta: header('background-new', 30), events: messageEvents('fresh needle') })
+    await service.searchSessions({ query: 'needle' })
+    await awaitBackgroundSync(service)
+    const continuation = await service.searchSessions({
+      query: 'needle',
+      limit: 1,
+      snapshot: true,
+      ...(first.nextCursor === undefined ? {} : { cursor: first.nextCursor }),
+    })
+    expect(continuation.items).toHaveLength(1)
+    expect(continuation.coverage).toEqual(first.coverage)
+
+    const generationPage = await service.searchSessions({ query: 'needle', limit: 1 })
+    const generationCursor = generationPage.nextCursor
+    expect(generationCursor).toBeDefined()
+    TestPersistence.set({ meta: header('background-newer', 40), events: messageEvents('newer needle') })
+    await service.searchSessions({ query: 'needle' })
+    await awaitBackgroundSync(service)
+    await expect(service.searchSessions({
+      query: 'needle',
+      limit: 1,
+      ...(generationCursor === undefined ? {} : { cursor: generationCursor }),
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    await awaitBackgroundSync(service)
+
+    const live = ctx.sessions.prepare(shared.id, {
+      seed: messageEvents('live needle'),
+      meta: { createdAt: shared.createdAt },
+    })
+    const detach = ctx.sessions.enter(live)
+    ctx.sessions.announce(live)
+    expect((await service.searchSessions({ query: 'live' })).items)
+      .toMatchObject([{ header: shared, live: true, persisted: true }])
+    expect((await service.searchSessions({ query: 'persisted' })).items).toEqual([])
+    detach()
+    expect((await service.searchSessions({ query: 'persisted' })).items)
+      .toMatchObject([{ header: shared, live: false, persisted: true }])
+    await search.dispose()
+    await persistence.dispose()
+  })
+})
+ (fix(session-query): back off failed revisions and report scoped lag)

@@ -239,6 +239,20 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _closePromise: Promise<void> | undefined
   private readonly _optionalPersistenceFiber: Fiber
 
+  private readonly _sessionSnapshots = new SnapshotStore<SessionSearchHit, SessionSearchCoverage | undefined>()
+  private readonly _eventSnapshots = new SnapshotStore<SessionEventSearchHit, EventSnapshotMeta>()
+  private _syncBinding: symbol | undefined
+  private _syncVerified = false
+  private _syncCheckedAt: number | undefined
+  private _syncListingFailed = false
+  private _syncScanFailed = false
+  private _syncRequested = false
+  private _syncDraining = false
+  private _syncWork: Promise<void> = Promise.resolve()
+  private _syncAbort: AbortController | undefined
+  private _syncTimer: ReturnType<typeof setInterval> | undefined
+ (fix(session-query): back off failed revisions and report scoped lag)
+
   constructor(ctx: Context, config: Config) {
     // The assignment expression resolves before the base constructor can
     // register `ctx.sessionQuery`; keep that same validated value afterward.
@@ -404,6 +418,709 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
   }
 
+
+  private async _backgroundSessions(
+    normalized: NormalizedSessionRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<SessionSearchPage<SessionSearchHit>> {
+    return this._serialized(signal, async () => {
+      await this._ensureReady(signal)
+      this._startBackgroundSync()
+      const persistenceBinding = this._adoptBackgroundSource()
+      this._publishLiveOverlay(persistenceBinding)
+      const fingerprint = requestFingerprint(normalized)
+      const payload = normalized.cursor === undefined ? undefined : parseCursor(normalized.cursor)
+      const continuation = payload === undefined
+        ? undefined
+        : snapshotContinuation(payload, this._instance, 'sessions', fingerprint)
+      if (continuation !== undefined) {
+        const snapshot = this._sessionSnapshots.take(continuation.snapshot)
+        if (snapshot === undefined) throw staleSnapshot()
+        const coverage = snapshot.meta
+        return {
+          ...snapshotPage(snapshot, this._instance, 'sessions', continuation.offset, normalized.limit),
+          ...coverage === undefined ? {} : { coverage },
+        }
+      }
+      if (normalized.snapshot && payload === undefined) {
+        const captured = this._querySessions(
+          normalized,
+          0,
+          persistenceBinding,
+          SESSION_QUERY_SNAPSHOT_MAX_ROWS,
+        )
+        if (captured.length <= SESSION_QUERY_SNAPSHOT_MAX_ROWS) {
+          const coverage = this._sessionSearchCoverage(normalized)
+          const snapshot = this._sessionSnapshots.store(
+            fingerprint,
+            captured.map(row => this._sessionHit(row)),
+            coverage,
+          )
+          return {
+            ...snapshotPage(snapshot, this._instance, 'sessions', 0, normalized.limit),
+            coverage,
+          }
+        }
+      }
+      const generation = String(this._globalGeneration)
+      const offset = payload === undefined
+        ? 0
+        : decodeCursor(payload, this._instance, 'sessions', fingerprint, generation)
+      const rows = this._querySessions(normalized, offset, persistenceBinding)
+      return {
+        ...page(rows, normalized.limit, row => this._sessionHit(row), cursorOffset => encodeCursor({
+          version: 1,
+          instance: this._instance,
+          scope: 'sessions',
+          fingerprint,
+          generation,
+          offset: cursorOffset,
+        }), offset),
+        coverage: this._sessionSearchCoverage(normalized),
+      }
+    })
+  }
+
+  private async _backgroundEvents(
+    normalized: NormalizedEventRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<SessionEventSearchPage> {
+    return this._serialized(signal, async () => {
+      await this._ensureReady(signal)
+      this._startBackgroundSync()
+      const persistenceBinding = this._adoptBackgroundSource()
+      this._publishLiveOverlay(persistenceBinding)
+      const fingerprint = requestFingerprint(normalized)
+      const payload = normalized.cursor === undefined ? undefined : parseCursor(normalized.cursor)
+      const continuation = payload === undefined
+        ? undefined
+        : snapshotContinuation(payload, this._instance, 'events', fingerprint)
+      if (continuation !== undefined) {
+        const snapshot = this._eventSnapshots.take(continuation.snapshot)
+        if (snapshot === undefined) throw staleSnapshot()
+        const { coverage } = snapshot.meta
+        return {
+          session: snapshot.meta.session,
+          ...snapshotPage(snapshot, this._instance, 'events', continuation.offset, normalized.limit),
+          ...(coverage === undefined ? {} : { coverage }),
+        }
+      }
+      const target = this._targetObservation(normalized.sessionId, persistenceBinding)
+      if (normalized.snapshot && payload === undefined) {
+        const captured = this._queryEvents(
+          normalized,
+          0,
+          persistenceBinding,
+          SESSION_QUERY_SNAPSHOT_MAX_ROWS,
+        )
+        if (captured.length <= SESSION_QUERY_SNAPSHOT_MAX_ROWS) {
+          const coverage = this._eventSearchCoverage(normalized.sessionId)
+          const snapshot = this._eventSnapshots.store(
+            fingerprint,
+            captured.map(row => this._eventHit(row)),
+            { session: target.header, coverage },
+          )
+          return {
+            session: target.header,
+            ...snapshotPage(snapshot, this._instance, 'events', 0, normalized.limit),
+            coverage,
+          }
+        }
+      }
+      const offset = payload === undefined
+        ? 0
+        : decodeCursor(payload, this._instance, 'events', fingerprint, target.generation)
+      const rows = this._queryEvents(normalized, offset, persistenceBinding)
+      return {
+        session: target.header,
+        ...page(rows, normalized.limit, row => this._eventHit(row), cursorOffset => encodeCursor({
+          version: 1,
+          instance: this._instance,
+          scope: 'events',
+          fingerprint,
+          generation: target.generation,
+          offset: cursorOffset,
+        }), offset),
+        coverage: this._eventSearchCoverage(normalized.sessionId),
+      }
+    })
+  }
+
+  /**
+   * Adopt the currently mounted persistence source for background
+   * synchronization. A changed source identity hides every generation indexed
+   * for the previous source and withholds the index until the first complete
+   * metadata check, so a reopened or replaced source never serves another
+   * store's rows.
+   * @returns the adopted persistence binding.
+   */
+  private _adoptBackgroundSource(): PersistenceBinding {
+    const binding = this._persistenceBinding
+    if (this._syncBinding === binding.identity) return binding
+    const previous = this._syncBinding
+    this._syncBinding = binding.identity
+    this._syncVerified = false
+    this._syncCheckedAt = undefined
+    this._syncListingFailed = false
+    this._syncScanFailed = false
+    if (previous !== undefined) {
+      this._persistenceEpoch += 1
+      this._clearIndexedContent()
+    }
+    this._requestSync()
+    return binding
+  }
+
+  private _clearIndexedContent(): void {
+    const db = this._requireDb()
+    const present = db.prepare(`
+      SELECT (SELECT COUNT(*) FROM persisted_sessions) + (SELECT COUNT(*) FROM sync_sessions) AS rows
+    `).get() as { rows: number }
+    if (present.rows === 0) return
+    let next = this._globalGeneration
+    this._transaction(() => {
+      db.exec('DELETE FROM persisted_docs')
+      db.exec('DELETE FROM persisted_sessions')
+      db.exec('DELETE FROM sync_sessions')
+      next = this._mainGeneration() + 1
+      db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(next)
+    })
+    this._globalGeneration += 1
+    this._localGeneration = Math.max(this._localGeneration, next)
+  }
+
+  /**
+   * Keep the connection-local live rows exactly as an on-search reconciliation
+   * would, without reading any durable source: live content stays preferred,
+   * shadows a persisted base of the same id, and reveals it again on detach.
+   * @param binding - adopted persistence binding whose listed ids define `persisted`.
+   */
+  private _publishLiveOverlay(binding: PersistenceBinding): void {
+    const db = this._requireDb()
+    const indexed = liveIndexRows(db)
+    const knownSources = this._knownSourceIds(binding)
+    const activeIds = new Set<SessionId>()
+    const changes = this.ctx.sessions.list().flatMap((session) => {
+      activeIds.add(session.id)
+      const row = indexed.get(session.id)
+      const persisted = Number(knownSources.has(session.id))
+      const cached = this._liveObservations.get(session)
+      const previous = cached?.fingerprint === row?.fingerprint ? cached : undefined
+      const seq = session.seq
+      if (previous?.seq === seq && row?.persisted === persisted) return []
+      // oxlint-disable-next-line typescript/no-deprecated -- Full fold preserves the search surfaces of earlier events.
+      const documents = previous?.seq === seq ? undefined : buildSessionEventSearchDocuments(session.id, session.snapshotEvents())
+      return [{ session, previous, seq, persisted, documents, fingerprint: randomUUID() }]
+    })
+    const deletes = [...indexed.values()].filter(row => !activeIds.has(row.id as SessionId))
+    if (changes.length === 0 && deletes.length === 0) return
+    const main = this._mainGeneration()
+    let nextLocal = this._localGeneration
+    const publications: Array<{ session: Session; publication: LivePublication }> = []
+    this._transaction(() => {
+      for (const row of deletes) this._deleteSession('live', row.id as SessionId)
+      for (const { session, previous, seq, persisted, documents, fingerprint } of changes) {
+        nextLocal = Math.max(nextLocal, main) + 1
+        if (previous === undefined && indexed.has(session.id)) this._deleteSession('live', session.id)
+        this._upsertLiveHeader(session.header, session.inheritedEventCount, fingerprint, persisted, nextLocal)
+        const indexedDocuments = documents === undefined && previous !== undefined
+          ? previous.documents
+          : this._publishLiveDocuments(documents ?? [], previous?.documents)
+        publications.push({ session, publication: { seq, fingerprint, documents: indexedDocuments } })
+      }
+    })
+    for (const { session, publication } of publications) this._liveObservations.set(session, publication)
+    this._localGeneration = nextLocal
+    this._globalGeneration += 1
+  }
+
+  private _knownSourceIds(binding: PersistenceBinding): Set<SessionId> {
+    const ids = new Set<SessionId>()
+    if (!this._persistedContentVisible(binding)) return ids
+    const db = this._requireDb()
+    for (const row of db.prepare('SELECT id FROM persisted_sessions').all() as Array<{ id: string }>) {
+      ids.add(row.id as SessionId)
+    }
+    for (const row of db.prepare('SELECT id FROM sync_sessions').all() as Array<{ id: string }>) {
+      ids.add(row.id as SessionId)
+    }
+    return ids
+  }
+
+  private _persistedContentVisible(binding: PersistenceBinding): boolean {
+    if (binding.service === undefined) return false
+    return this.config.syncMode === 'background' ? this._syncVerified : true
+  }
+
+  private _transaction(operation: () => void): void {
+    const db = this._requireDb()
+    let began = false
+    try {
+      db.exec('BEGIN IMMEDIATE')
+      began = true
+      operation()
+      db.exec('COMMIT')
+    } catch (error: unknown) {
+      /* v8 ignore next -- a BEGIN failure has no transaction to roll back; the wrapper still reports it. */
+      if (began) {
+        /* v8 ignore next 5 -- ROLLBACK failure requires a SQLite double fault; the original failure remains actionable. */
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          // The original SQLite failure remains the actionable cause.
+        }
+      }
+      throw new SessionQueryError(
+        `session-search index update failed: ${errorMessage(error)}`,
+        'SESSION_QUERY_INDEX_FAILED',
+        { cause: error },
+      )
+    }
+  }
+
+  private _startBackgroundSync(): void {
+    if (this.config.syncMode !== 'background' || this.config.openAt === 'never' || this._closed) return
+    if (this._syncAbort !== undefined) {
+      this._requestSync()
+      return
+    }
+    const controller = new AbortController()
+    this._syncAbort = controller
+    this._syncTimer = setInterval(() => { this._requestSync() }, this.config.syncIntervalMs)
+    this._syncTimer.unref()
+    this._requestSync()
+  }
+
+  private async _stopBackgroundSync(): Promise<void> {
+    const controller = this._syncAbort
+    if (controller === undefined) return
+    controller.abort()
+    if (this._syncTimer !== undefined) {
+      clearInterval(this._syncTimer)
+      this._syncTimer = undefined
+    }
+    this._syncRequested = false
+    await this._syncWork
+  }
+
+  /**
+   * Coalesce a background reconciliation request. Requests that arrive while
+   * a scan runs fold into one follow-up scan; requests before readiness defer
+   * to the readiness boundary that owns opening.
+   */
+  private _requestSync(): void {
+    if (this.config.syncMode !== 'background' || this._closed) return
+    const controller = this._syncAbort
+    if (controller === undefined || controller.signal.aborted) return
+    if (this._ready === undefined) return
+    this._syncRequested = true
+    if (this._syncDraining) return
+    this._syncDraining = true
+    this._syncWork = this._drainSync(controller).finally(() => {
+      this._syncDraining = false
+      if (this._syncRequested) this._requestSync()
+    })
+  }
+
+  private _syncCancelled(signal: AbortSignal): boolean {
+    return signal.aborted || this._isClosed()
+  }
+
+  private async _drainSync(controller: AbortController): Promise<void> {
+    while (this._syncRequested && !this._syncCancelled(controller.signal)) {
+      this._syncRequested = false
+      try {
+        await this._syncOnce(controller)
+      } catch (_error: unknown) {
+        // A failed scan leaves prior committed generations intact; coverage degrades.
+        if (this._syncCancelled(controller.signal)) return
+        this._syncScanFailed = true
+      }
+    }
+  }
+
+  private async _syncOnce(controller: AbortController): Promise<void> {
+    const signal = controller.signal
+    await this._ensureReady(undefined)
+    if (this._syncCancelled(signal)) return
+    const binding = await this._serialized(signal, () => this._adoptBackgroundSource())
+    if (this._syncCancelled(signal)) return
+    {
+      const persistence = binding.service
+      if (persistence === undefined) {
+        await this._serialized(signal, () => {
+          this._syncVerified = true
+          this._syncCheckedAt = Date.now()
+          this._syncListingFailed = false
+          this._syncScanFailed = false
+        })
+        return
+      }
+      let listed: readonly SessionPersistenceSnapshot[]
+      try {
+        listed = await persistence.list({ signal })
+      } catch (_error: unknown) {
+        if (this._syncCancelled(signal)) return
+        await this._serialized(signal, () => { this._syncListingFailed = true })
+        return
+      }
+      if (this._syncCancelled(signal)) return
+      let snapshots: Map<SessionId, ObservedPersistedSession>
+      try {
+        snapshots = materializePersistenceSnapshots(listed)
+      } catch (_error: unknown) {
+        if (this._syncCancelled(signal)) return
+        await this._serialized(signal, () => { this._syncListingFailed = true })
+        return
+      }
+      if (this._syncCancelled(signal)) return
+      const work = await this._serialized(
+        signal,
+        () => this._planBackgroundSync(binding, snapshots, signal),
+      )
+      if (this._syncCancelled(signal)) return
+      await this._runSyncReads(persistence, work, signal)
+    }
+  }
+
+  /**
+   * Publish the bounded result of one complete listing: hide generations whose
+   * source changed, drop rows a complete listing no longer contains, record
+   * listed-but-unindexed sources, and return the reads this scan must perform.
+   * @param binding - binding the listing belongs to.
+   * @param listed - complete listing snapshots keyed by session id.
+   * @param signal - the synchronization lifetime signal.
+   * @returns source generations that still need a read.
+   */
+  private _planBackgroundSync(
+    binding: PersistenceBinding,
+    listed: ReadonlyMap<SessionId, ObservedPersistedSession>,
+    signal: AbortSignal,
+  ): SyncWorkItem[] {
+    if (signal.aborted || this._persistenceBinding.identity !== binding.identity) return []
+    const db = this._requireDb()
+    const committedRows = db.prepare('SELECT id, revision FROM persisted_sessions').all() as Array<{
+      id: string
+      revision: string
+    }>
+    const ledgerRows = db.prepare('SELECT id, revision, state, attempts, observed_at FROM sync_sessions').all() as Array<{
+      id: string
+      revision: string
+      state: SyncRowState
+      attempts: number
+      observed_at: number
+    }>
+    const committed = new Map(committedRows.map(row => [row.id as SessionId, row.revision]))
+    const ledger = new Map(ledgerRows.map(row => [row.id as SessionId, row]))
+    const liveOwned = new Set(this.ctx.sessions.list().map(session => session.id))
+    const hidden: SessionId[] = []
+    const deleteLedger = new Set<SessionId>()
+    const upserts: Array<{ id: SessionId; entry: ObservedPersistedSession; state: SyncRowState }> = []
+    const work: SyncWorkItem[] = []
+    for (const [id, entry] of listed) {
+      const row = ledger.get(id)
+      if (committed.get(id) === entry.revision) {
+        if (row !== undefined) deleteLedger.add(id)
+        continue
+      }
+      if (committed.has(id)) hidden.push(id)
+      if (liveOwned.has(id)) {
+        if (row === undefined || row.revision !== entry.revision || row.state !== 'live') {
+          upserts.push({ id, entry, state: 'live' })
+        }
+        continue
+      }
+      if (row === undefined || row.revision !== entry.revision || row.state === 'live') {
+        upserts.push({ id, entry, state: 'pending' })
+      }
+      if (row?.state === 'failed' && row.revision === entry.revision && row.attempts >= 2) {
+        const delay = Math.min(300_000, 5_000 * 2 ** Math.min(row.attempts - 2, 6))
+        const elapsed = Date.now() - row.observed_at
+        if (elapsed >= 0 && elapsed < delay) continue
+      }
+      work.push({ id, revision: entry.revision, header: entry.header })
+    }
+    for (const id of committed.keys()) if (!listed.has(id)) hidden.push(id)
+    for (const id of ledger.keys()) if (!listed.has(id)) deleteLedger.add(id)
+    if (hidden.length > 0 || deleteLedger.size > 0 || upserts.length > 0) {
+      this._transaction(() => {
+        for (const id of hidden) this._deleteSession('persisted', id)
+        for (const id of deleteLedger) db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(id)
+        for (const upsert of upserts) this._upsertSyncRow(upsert.id, upsert.entry, upsert.state)
+      })
+    }
+    if (hidden.length > 0) this._globalGeneration += 1
+    this._syncVerified = true
+    this._syncCheckedAt = Date.now()
+    this._syncListingFailed = false
+    this._syncScanFailed = false
+    return work
+  }
+
+  private _upsertSyncRow(id: SessionId, entry: ObservedPersistedSession, state: SyncRowState): void {
+    this._requireDb().prepare(`
+      INSERT INTO sync_sessions
+        (id, version, created_at, cwd, parent_session, seeded, delegation_depth, agent_preset,
+         revision, state, attempts, error, observed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        version = excluded.version,
+        created_at = excluded.created_at,
+        cwd = excluded.cwd,
+        parent_session = excluded.parent_session,
+        seeded = excluded.seeded,
+        delegation_depth = excluded.delegation_depth,
+        agent_preset = excluded.agent_preset,
+        attempts = CASE WHEN revision <> excluded.revision THEN 0 ELSE attempts END,
+        error = CASE WHEN revision <> excluded.revision THEN NULL ELSE error END,
+        revision = excluded.revision,
+        state = excluded.state,
+        observed_at = excluded.observed_at
+    `).run(
+      id,
+      entry.header.version,
+      entry.header.createdAt,
+      entry.header.cwd ?? null,
+      entry.header.parentSession ?? null,
+      entry.header.isSeeded ? 1 : 0,
+      entry.header.delegationDepth ?? null,
+      entry.header.agentPreset ?? null,
+      entry.revision,
+      state,
+      Date.now(),
+    )
+  }
+
+  private async _runSyncReads(
+    persistence: SessionPersistence,
+    work: readonly SyncWorkItem[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (work.length === 0) return
+    const concurrency = Math.min(this.config.syncReadConcurrency, work.length)
+    const batchSize = this.config.syncBatchSessions
+    let next = 0
+    let pending: Array<{ readonly target: SyncWorkItem; readonly prepared: SessionPublication }> = []
+    let flushing: Promise<void> = Promise.resolve()
+    const flush = (): Promise<void> => {
+      if (pending.length === 0) return flushing
+      const batch = pending
+      pending = []
+      flushing = flushing.then(async () => {
+        await this._serialized(signal, () => {
+          this._publishPreparedBatch(batch)
+        })
+        // Bound each event-loop hold so a large first index never blocks searches.
+        await scheduler.yield()
+      })
+      return flushing
+    }
+    const readNext = async (): Promise<void> => {
+      while (!this._syncCancelled(signal)) {
+        const item = work[next]
+        next += 1
+        if (item === undefined) return
+        const prepared = await this._prepareSyncSource(persistence, item, signal)
+        if (prepared === undefined) continue
+        pending.push({ target: item, prepared })
+        if (pending.length >= batchSize) await flush()
+      }
+    }
+    await Promise.all(Array.from({ length: concurrency }, readNext))
+    await flush()
+    await flushing
+  }
+
+  private async _prepareSyncSource(
+    persistence: SessionPersistence,
+    target: SyncWorkItem,
+    signal: AbortSignal,
+  ): Promise<SessionPublication | undefined> {
+    try {
+      const options = { signal }
+      const before = await persistence.stat(target.id, options)
+      if (this._syncCancelled(signal)) return undefined
+      // Absent sources are resolved by the next complete listing, which owns deletion.
+      if (before === undefined) return undefined
+      if (before.revision !== target.revision) return undefined
+      const log = await readColdSessionLog(persistence, target.id, signal)
+      if (this._syncCancelled(signal)) return undefined
+      const after = await persistence.stat(target.id, options)
+      if (this._syncCancelled(signal)) return undefined
+      // A generation that moved during the read is retried by the next scan
+      // instead of publishing a mixed-cut prefix.
+      if (after === undefined || after.revision !== before.revision) return undefined
+      if (log.inheritedEventCount > log.storedEventCount) {
+        await this._recordSourceFailure(target, signal, 'inherited prefix exceeds the stored log')
+        return undefined
+      }
+      assertSessionHeadersCompatible(target.header, log.header)
+      return prepareSessionPublication(log)
+    } catch (error: unknown) {
+      if (this._syncCancelled(signal)) return undefined
+      if (error instanceof SessionQueryError && error.code === 'SESSION_QUERY_ABORTED') return undefined
+      await this._recordSourceFailure(target, signal, errorMessage(error))
+      return undefined
+    }
+  }
+
+  private async _recordSourceFailure(
+    target: SyncWorkItem,
+    signal: AbortSignal,
+    detail: string,
+  ): Promise<void> {
+    if (this._syncCancelled(signal)) return
+    await this._serialized(signal, () => {
+      const db = this._requireDb()
+      const row = db.prepare('SELECT revision FROM sync_sessions WHERE id = ?').get(target.id) as {
+        revision: string
+      } | undefined
+      if (row === undefined || row.revision !== target.revision) return
+      db.prepare(`
+        UPDATE sync_sessions
+        SET state = 'failed', attempts = attempts + 1, error = ?, observed_at = ?
+        WHERE id = ?
+      `).run(detail, Date.now(), target.id)
+    })
+  }
+
+  /**
+   * Commit one batch of validated source generations atomically. Every entry is
+   * rechecked against the pending generation it was read for; rows whose source
+   * moved are skipped and retried by the next pass. One transaction and one
+   * generation step cover the accepted entries, which keeps commit/fsync cost
+   * off the per-session path.
+   * @param batch - validated publications paired with the listed generation they came from.
+   */
+  private _publishPreparedBatch(
+    batch: readonly { readonly target: SyncWorkItem; readonly prepared: SessionPublication }[],
+  ): void {
+    if (this._closed) throw indexClosed()
+    if (this._persistenceBinding.identity !== this._syncBinding) return
+    const db = this._requireDb()
+    const lookup = db.prepare('SELECT revision FROM sync_sessions WHERE id = ?')
+    const accepted = batch.filter(({ target }) => {
+      const row = lookup.get(target.id) as { revision: string } | undefined
+      return row !== undefined && row.revision === target.revision
+    })
+    if (accepted.length === 0) return
+    let next = this._globalGeneration
+    this._transaction(() => {
+      next = this._mainGeneration() + 1
+      for (const { target, prepared } of accepted) {
+        this._deleteSession('persisted', target.id)
+        this._replacePersistedSession(prepared, target.revision, next)
+        db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(target.id)
+      }
+      db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(next)
+    })
+    this._globalGeneration = next
+    this._localGeneration = Math.max(this._localGeneration, next)
+  }
+
+  private _sessionSearchCoverage(request: NormalizedSessionRequest): SessionSearchCoverage {
+    if (!this._syncVerified) return unverifiedCoverage()
+    return this._coverageFrom(this._scopeCounts(request.sessionFilters, undefined))
+  }
+
+  private _eventSearchCoverage(sessionId: SessionId): SessionSearchCoverage {
+    if (!this._syncVerified) return unverifiedCoverage()
+    return this._coverageFrom(this._scopeCounts([], sessionId))
+  }
+
+  private _coverageFrom(counts: ScopedCoverageCounts): SessionSearchCoverage {
+    const coverage: SessionSearchCoverage = {
+      state: this._coverageState(counts),
+      indexedSessions: counts.indexed,
+      pendingSessions: counts.pending,
+      failedSessions: counts.failed,
+    }
+    if (this._syncCheckedAt !== undefined) coverage.checkedAt = this._syncCheckedAt
+    return coverage
+  }
+
+  private _coverageState(counts: ScopedCoverageCounts): SessionSearchCoverage['state'] {
+    if (!this._syncVerified) return 'initializing'
+    if (this._syncListingFailed || this._syncScanFailed || counts.failed > 0) return 'degraded'
+    if (counts.pending > 0) return 'syncing'
+    return 'ready'
+  }
+
+  /**
+   * Count indexed, pending, and failed sessions matching the request's session
+   * predicates. The same compiled predicates scope every count, so a caller
+   * never observes sessions outside its authorized filter.
+   * @param filters - validated ANDed logical-session clauses.
+   * @param sessionId - optional single target, used by event searches.
+   * @returns scoped counts for the three coverage dimensions.
+   */
+  private _scopeCounts(
+    filters: readonly SessionResultFilter[],
+    sessionId: SessionId | undefined,
+  ): ScopedCoverageCounts {
+    const sessionWhere = buildSessionWhere(filters)
+    const clauses = [sessionWhere.sql]
+    const params = [...sessionWhere.params]
+    if (sessionId !== undefined) {
+      clauses.push('session_id = ?')
+      params.push(sessionId)
+    }
+    const where = clauses.filter(Boolean).join(' AND ')
+    const rows = this._requireDb().prepare(`
+      WITH scoped AS (
+        SELECT
+          'indexed' AS kind,
+          ps.id AS session_id,
+          ps.created_at AS created_at,
+          ps.cwd AS cwd,
+          ps.parent_session AS parent_session,
+          0 AS live,
+          1 AS persisted
+        FROM persisted_sessions AS ps
+        WHERE NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = ps.id)
+        UNION ALL
+        SELECT
+          'indexed' AS kind,
+          ls.id AS session_id,
+          ls.created_at AS created_at,
+          ls.cwd AS cwd,
+          ls.parent_session AS parent_session,
+          1 AS live,
+          ls.persisted AS persisted
+        FROM temp.live_sessions AS ls
+        UNION ALL
+        SELECT
+          CASE WHEN ss.state = 'live' THEN 'pending' ELSE ss.state END AS kind,
+          ss.id AS session_id,
+          ss.created_at AS created_at,
+          ss.cwd AS cwd,
+          ss.parent_session AS parent_session,
+          0 AS live,
+          1 AS persisted
+        FROM sync_sessions AS ss
+        WHERE ss.state IN ('pending', 'failed', 'live')
+          AND NOT EXISTS (SELECT 1 FROM temp.live_sessions AS ls WHERE ls.id = ss.id)
+      )
+      SELECT kind, COUNT(*) AS sessions FROM scoped
+      ${where.length === 0 ? '' : `WHERE ${where}`}
+      GROUP BY kind
+    `).all(...params)
+    const counts: ScopedCoverageCounts = { indexed: 0, pending: 0, failed: 0 }
+    for (const row of rows) {
+      if (typeof row.kind !== 'string' || typeof row.sessions !== 'number') {
+        throw new SessionQueryError(
+          'session-search coverage query returned an unexpected row',
+          'SESSION_QUERY_INDEX_FAILED',
+        )
+      }
+      if (row.kind === 'indexed') counts.indexed = row.sessions
+      else if (row.kind === 'pending') counts.pending = row.sessions
+      else if (row.kind === 'failed') counts.failed = row.sessions
+    }
+    return counts
+  }
+
+ (fix(session-query): back off failed revisions and report scoped lag)
   private async _reconcile(signal: AbortSignal | undefined): Promise<PersistenceBinding> {
     assertNotAborted(signal)
     const db = this._requireDb()
