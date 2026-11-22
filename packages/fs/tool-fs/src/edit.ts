@@ -79,7 +79,7 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void 
     order: ctx.systemPrompt.getSectionOrder('TOOL_EDIT'),
     text: ({ scope }) => ctx.tools.get('edit', scope) === undefined
       ? ''
-      : 'Read a file before editing it unless you just created or edited it in this session.',
+      : 'Read a file before editing it unless you just created or edited it in this session. When `apply_patch` is available, prefer it for existing code, including single-file edits, because it carries surrounding context. Use `edit` for a short, unique literal replacement from the current read. Preserve `old_string` literally, including every operator, punctuation mark, whitespace character, and line ending. If the edit reports that `old_string` was not found, re-read the file and rebuild the exact string before retrying.',
   })
 
   ctx.tools.register(defineTool({

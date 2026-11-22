@@ -517,6 +517,7 @@ describe('edit tool', () => {
     expect(result.isError).toBe(true)
     expect(result.error).toMatchObject({ info: { code: 'FS_NOT_OBSERVED' } })
   })
+
 })
 
 describe('tool-owned presentation (pure presentCall)', () => {
@@ -1156,7 +1157,7 @@ async function guidanceScope(ctx: Context) {
 const originalGuidance = {
   read: 'Use the read tool — not shell commands like cat, sed, head, or tail — to inspect text files. Use offset and limit to read a line range or continue a large file.',
   write: 'Read an existing file before overwriting it with write and prefer edit for targeted changes.',
-  edit: 'Read a file before editing it unless you just created or edited it in this session.',
+  edit: 'Read a file before editing it unless you just created or edited it in this session. When `apply_patch` is available, prefer it for existing code, including single-file edits, because it carries surrounding context. Use `edit` for a short, unique literal replacement from the current read. Preserve `old_string` literally, including every operator, punctuation mark, whitespace character, and line ending. If the edit reports that `old_string` was not found, re-read the file and rebuild the exact string before retrying.',
 }
 
 describe('scope-aware filesystem guidance', () => {

@@ -389,6 +389,8 @@ describe('bare provider (no dsh-fs-observation-policy)', () => {
     const result = await call('edit', { file_path: 'a.txt', old_string: 'absent', new_string: 'x' })
     expect(result.isError).toBe(true)
     expect(result.error).toMatchObject({ info: { code: 'FS_EDIT_NOT_FOUND' } })
+    expect(text(result)).toContain('may already be present')
+    expect(text(result)).toContain('do not repeat the same edit')
   })
 
   it('neither write nor edit stats in the tool on the bare path', async () => {
