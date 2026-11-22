@@ -577,25 +577,29 @@ export function apply(ctx: Context, config: Config = Config({})): void {
     },
   }, InputBar)
 
-  slots.inject('main', function* () {
-    yield slots.register({
-      name: 'main',
-      key: 'conversation',
-      children: { 'main.conversation': { kind: 'single', scope: 'session-maybe' } },
-    }, ConversationPanel)
-    yield registerConversationRoot()
-    yield registerConversationContent()
-    yield registerConversationSession()
-    yield registerHeader()
-    yield registerSessionHeader()
-    yield registerComposerBar()
-  })
-
+  // A published composer can render immediately; install its service first.
   ctx.plugin(ConversationController, {
     input: inputHub,
     blocks: composerBlocks,
     maxConcurrentFileUploads,
   })
+
+  ctx.inject(['conversation'], (scope) => {
+    scope.slots.inject('main', function* () {
+      yield slots.register({
+        name: 'main',
+        key: 'conversation',
+        children: { 'main.conversation': { kind: 'single', scope: 'session-maybe' } },
+      }, ConversationPanel)
+      yield registerConversationRoot()
+      yield registerConversationContent()
+      yield registerConversationSession()
+      yield registerHeader()
+      yield registerSessionHeader()
+      yield registerComposerBar()
+    })
+  })
+
   ctx.plugin(todoDockEntry)
   ctx.plugin(queueDockEntry)
 }
