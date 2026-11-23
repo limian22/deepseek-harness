@@ -151,7 +151,7 @@ function copySessionTitleSource(source: SessionTitleSource): SessionTitleSource 
       provider: source.provider,
       ...(source.model === undefined ? {} : { model: { ...source.model } }),
     }
-    case 'user': return { kind: 'user' }
+    case 'user': return source.origin === undefined ? { kind: 'user' } : { kind: 'user', origin: source.origin }
     /* v8 ignore next -- closed-union exhaustiveness guard */
     default: return assertNever(source, 'SessionTitleSource')
   }
@@ -426,6 +426,28 @@ export class SessionTitleService extends Service {
     /* v8 ignore next -- unreachable: the append above just committed a session/title event. */
     if (snapshot === undefined) throw new Error('renamed title failed to fold')
     return snapshot
+  }
+
+  /**
+   * Synchronize a Telegram topic name unless an explicit user title is pinned.
+   * @param session - exact live session to update.
+   * @param title - raw topic name, normalized using the title limits.
+   * @returns current or accepted snapshot, or `undefined` when no title exists and input is empty.
+   * @throws {Error} when the session is not live or the service is disposed.
+   */
+  syncTelegramTopicTitle(session: Session, title: string): SessionTitleSnapshot | undefined {
+    this.assertServiceActive()
+    if (this.ctx.sessions.get(session.id) !== session) {
+      throw new Error(`session "${session.id}" is not live in this store`)
+    }
+    const current = this.get(session)
+    if (current?.source.kind === 'user' && current.source.origin !== 'telegram') return current
+    const normalized = normalizeSessionTitle(title, this.config.maxTitleBytes)
+    if (normalized.length === 0 || (current?.source.kind === 'user'
+      && current.source.origin === 'telegram' && current.title === normalized)) return current
+    this.supersede(this.stateFor(session), 'Telegram topic rename superseded title generation')
+    session.append('session/title', { title: normalized, messageSeqs: [], source: { kind: 'user', origin: 'telegram' } })
+    return this.get(session)
   }
 
   /**

@@ -63,6 +63,27 @@ async function expectPersistedTitle(ctx: Context, id: SessionId): Promise<void> 
 }
 
 describe('session title persistence round trips', () => {
+  it('reopens a Telegram title through the V4 JSONL reader', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-telegram-title-'))
+    roots.push(root)
+    const id = brandString<SessionId>('telegram-title-jsonl')
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const session = ctx.sessions.create(id)
+    const writer = await ctx.sessionPersistence.create(session.header)
+    ctx.sessionTitle.syncTelegramTopicTitle(session, 'Topic name')
+    await writer.close()
+    const reader = await ctx.sessionPersistence.open(id, 'read')
+    const { events } = await reader.read()
+    expect(foldSessionTitle(events)).toMatchObject({ title: 'Topic name', source: { kind: 'user', origin: 'telegram' } })
+    await reader.close()
+    await ctx.fiber.dispose()
+  })
+
   it('round-trips through a remounted JSONL backend', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-title-jsonl-'))
     roots.push(root)

@@ -35,6 +35,8 @@ export type SessionTitleSource =
   | {
     /** Explicit user rename: pins the title — automatic generation stops scheduling. */
     readonly kind: 'user'
+    /** Telegram topic rename, when the title came from that platform. */
+    readonly origin?: 'telegram'
   }
 
 /** Payload of the log-only `session/title` event. */
