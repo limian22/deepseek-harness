@@ -75,6 +75,40 @@ function loadNodePty(): typeof NodePty {
  * JavaScript-observable host exit also performs synchronous final termination.
  */
 export class LocalSubprocessRuntime extends SubprocessRuntime {
+  private readonly sessionEnvironments = new Set<{ resolve: (sessionId: string) => NodeJS.ProcessEnv | undefined }>()
+
+  override registerSessionEnvironment(resolve: (sessionId: string) => NodeJS.ProcessEnv | undefined): () => void {
+    if (this.sessionEnvironments.size !== 0) throw new Error('session environment already registered')
+    const registrations = this.sessionEnvironments
+    const registration = { resolve }
+    registrations.add(registration)
+    return () => { registrations.delete(registration) }
+  }
+
+  private withSessionEnvironment<T extends { env?: NodeJS.ProcessEnv | undefined }>(spec: T): T {
+    const id = spec.env?.DSH_SESSION_ID
+    if (typeof id !== 'string' || id.length === 0) return spec
+    const overlay = this.sessionEnvironments.values().next().value?.resolve(id)
+    if (overlay === undefined) return spec
+    const env = { ...spec.env }
+    if (process.platform === 'win32') {
+      for (const key of Object.keys(env)) {
+        const canonical = key.toUpperCase()
+        if (key !== canonical && canonical.startsWith('DSH_') && Object.hasOwn(env, canonical)) Reflect.deleteProperty(env, key)
+      }
+    }
+    for (const [key, value] of Object.entries(overlay)) {
+      if (key.toUpperCase().startsWith('DSH_')) continue
+      if (process.platform === 'win32') {
+        for (const existing of Object.keys(env)) {
+          if (existing.toUpperCase() === key.toUpperCase()) Reflect.deleteProperty(env, existing)
+        }
+      }
+      env[key] = value
+    }
+    return { ...spec, env }
+  }
+
   /** Live handles retained for normal disposal and synchronous host-exit finalization. */
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
@@ -208,6 +242,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   }
 
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    spec = this.withSessionEnvironment(spec)
     validateSubprocessSpec(spec)
     const env = targetEnvironment(spec)
     const containmentMode = this.selectContainmentMode('ordinary')
@@ -301,6 +336,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   // Local PTY allocation is synchronous, but the provider contract permits remote asynchronous allocation.
   // oxlint-disable-next-line typescript/require-await -- Preserve promise rejection semantics at the async provider contract.
   async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
+    spec = this.withSessionEnvironment(spec)
     const file = spec.argv[0]
     if (file === undefined || file.length === 0) {
       throw new SubprocessError('subprocess-local: terminal argv must contain a program', 'SUBPROCESS_INVALID_ARGV')
