@@ -66,12 +66,15 @@ async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, pre
   writeFileSync(join(dir, 'cordis.yml'), '[]\n')
   prepareFiles?.(dir)
   const overlays: PatchOptions[] = overlay ? [{ id: 'managed', disabled: true }] : []
+  const overlayPath = join(dir, 'test-overlay.yml')
+  const saveOverlays = () => { writeFileSync(overlayPath, JSON.stringify(overlays)) }
+  saveOverlays()
   const profile: ProfileContext = {
     name: 'test',
     ...(packageManager === undefined ? {} : { packageManager }),
     startedBundles: loadProfileDirectory('test', dir, anchor).layers.map(layer => layer.packageName),
     dir, patchPath: join(dir, 'cordis.patch.yml'), installAnchor: anchor, cwd: home, home,
-    overlays, telemetryDisabledEnv: undefined,
+    overlayPaths: [overlayPath], telemetryDisabledEnv: undefined,
   }
   const ctx = await boot('test', join(dir, 'cordis.yml'), readProfilePatches('test', profile), (ctx) => {
     owner = ctx
@@ -91,7 +94,7 @@ async function fixture(reload: 'live' | 'startup' = 'live', overlay = false, pre
     stopHmr = () => owner.dispose()
     await ctx.hmr.runExclusive(async () => {})
   }
-  return { ctx, dir, manager: ctx.pluginManager, bundle, profile, stopHmr, overlays, connection }
+  return { ctx, dir, manager: ctx.pluginManager, bundle, profile, stopHmr, overlays, saveOverlays, connection }
 }
 
 it('looks up dependencies in the current profile manifest even when a backup declares a retired package', async () => {
@@ -427,12 +430,12 @@ it('lists bundle versions and current-profile plugin targets', async () => {
   expect(plugins.find(row => row.entryId === 'include:manager')?.readOnlyReason).toBe('management-required')
   expect((await manager.listBundles()).filter(bundle => bundle.installTarget === undefined)).toEqual([
     {
-      name: 'core', version: '1.0.0', enabled: true, installed: false, official: false, availability: 'profile', optional: false, removable: false, updatable: false, readOnlyReason: 'management-required',
+      name: 'core', version: '1.0.0', enabled: true, installed: false, official: false, availability: 'profile', optional: false, removable: false, readOnlyReason: 'management-required',
       meta: { title: 'core' },
       rows: [{ rowId: 'manager', moduleName: 'cordis:manager', entryId: 'include:manager' }], overrides: [],
     },
     {
-      name: 'extra', version: '1.0.0', source: 'extra@1.0.0', enabled: true, installed: true, official: false, availability: 'profile', optional: false, removable: true, updatable: true,
+      name: 'extra', version: '1.0.0', source: 'extra@1.0.0', enabled: true, installed: true, official: false, availability: 'profile', optional: false, removable: true, update: 'registry',
       meta: { title: 'extra' },
       rows: [{ rowId: 'managed', moduleName: pathToFileURL(join(dir, 'node_modules', 'extra', 'plugin.mjs')).href, entryId: 'include:managed' }], overrides: [],
     },
@@ -465,7 +468,7 @@ it('describes a bundle by its manifest and patch: one-liner, rows without a live
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
   const moduleName = pathToFileURL(join(dir, 'node_modules', 'described', 'plugin.mjs')).href
   expect((await manager.listBundles()).find(row => row.name === 'described')).toEqual({
-    name: 'described', version: '2.0.0', description: 'Describes itself.', source: 'described@2.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, updatable: true,
+    name: 'described', version: '2.0.0', description: 'Describes itself.', source: 'described@2.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, update: 'registry',
     meta: { title: 'described', description: 'Describes itself.' },
     rows: [{ rowId: 'described-row', moduleName }], overrides: ['managed'],
   })
@@ -608,7 +611,7 @@ it.each([
   writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
 
   expect((await manager.listBundles()).find(row => row.name === 'unnamed')).toEqual({
-    name: 'unnamed', version: '1.0.0', source: 'unnamed@1.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, updatable: true,
+    name: 'unnamed', version: '1.0.0', source: 'unnamed@1.0.0', enabled: false, installed: true, official: false, availability: 'profile', optional: false, removable: true, update: 'registry',
     rows: [], overrides: [], ...expected,
   })
 })
@@ -1444,7 +1447,7 @@ it.each(OPTIONAL_BUNDLES)('offers %s switched off and never removable', async (o
   expect((await manager.listBundles()).find(row => row.name === offered)).toEqual({
     name: offered, version: '3.0.0', description: 'Package one-liner.',
     meta: { title: offered, description: 'Package one-liner.' },
-    enabled: false, installed: false, official: true, availability: 'installation', optional: true, removable: false, updatable: false,
+    enabled: false, installed: false, official: true, availability: 'installation', optional: true, removable: false,
     rows: [{ rowId: 'offered-row', moduleName: pathToFileURL(join(supplied, 'plugin.mjs')).href }], overrides: [],
   })
   expect(await manager.setBundleEnabled(offered, true)).toMatchObject({ application: 'applied' })
@@ -1478,9 +1481,10 @@ it('omits installation-owned plain packages from the bundle inventory', async ()
 })
 
 it('does not delete a bundle retained by a higher-priority overlay', async () => {
-  const { ctx, manager, overlays, dir } = await fixture()
+  const { ctx, manager, overlays, saveOverlays, dir } = await fixture()
   const entry = [...ctx.loader.entries()].find(row => row.id === 'include:managed')!
   overlays.push({ insert: [{ ...entry.options }] })
+  saveOverlays()
   const remove = vi.spyOn(operations, 'runProfilePnpm')
   onTestFinished(() => { remove.mockRestore() })
   expect(await manager.removeBundle('extra')).toMatchObject({ changed: true, application: 'failed', error: { code: 'bundle-in-use' } })
@@ -1834,7 +1838,7 @@ it('lists absent Official entries offline without resolving their packages or co
     expect(bundles.filter(bundle => bundle.name === entry.packageName)).toHaveLength(1)
     expect(bundles.filter(bundle => bundle.name === entry.packageName)).toMatchObject([{
       name: entry.packageName, official: true, availability: 'missing', enabled: false, installed: false, optional: false,
-      removable: false, updatable: false, rows: [], overrides: [], meta: entry.meta,
+      removable: false, rows: [], overrides: [], meta: entry.meta,
       ...entry.platforms !== undefined && !entry.platforms.includes(process.platform)
         ? { listedByDefault: false, error: { code: 'unsupported-platform' } } : {},
       installTarget: { spec: `${entry.packageName}@${getDshRuntimeVersion()}`, version: getDshRuntimeVersion() },
@@ -2193,7 +2197,7 @@ it('refuses to list versions of a package not installed from a registry', async 
   expect(await manager.listVersions('extra')).toEqual(refusal('extra declares no semver version'))
   // A bundle carrying plugin management cannot be removed, so it is not offered for an update.
   writeFileSync(join(dir, 'node_modules', 'extra', 'cordis.patch.yml'), JSON.stringify([{ insert: [{ id: 'pm', name: '@deepseek-ai/dsh-plugin-manager' }] }]))
-  expect((await manager.listBundles()).find(item => item.name === 'extra')).toMatchObject({ readOnlyReason: 'management-required', updatable: false })
+  expect((await manager.listBundles()).find(item => item.name === 'extra')).toMatchObject({ readOnlyReason: 'management-required' })
   expect(await manager.listVersions('extra')).toEqual(refusal('extra carries plugin management and cannot be removed'))
   expect(view).not.toHaveBeenCalled()
 })

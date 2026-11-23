@@ -421,7 +421,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   }
 
   /** Open eagerly only when activation owns the configured readiness boundary. */
-  protected async [Service.init](): Promise<void> {
+  protected override async [Service.init](): Promise<void> {
     if (this.config.openAt === 'startup') {
       await this._ensureReady(undefined)
       this._startBackgroundSync()
