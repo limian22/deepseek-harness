@@ -127,6 +127,20 @@ export abstract class SubprocessRuntime extends Service {
   }
 
   /**
+   * Register a trusted per-session child environment resolver. Unsupported providers throw.
+   * Local execution looks up only the explicit, internally supplied `env.DSH_SESSION_ID`;
+   * callers must protect that fact from untrusted input. Overlay entries override ordinary
+   * request entries, including tombstones; `DSH_*` entries are ignored. Ambient credentials
+   * remain scrubbed. At most one resolver may be registered; the returned disposer removes
+   * that registration and may be called repeatedly. This does not affect executable lookup.
+   * @param _resolve - return overrides for one session, or undefined when unscoped.
+   * @returns disposer for the registration.
+   */
+  registerSessionEnvironment(_resolve: (sessionId: string) => NodeJS.ProcessEnv | undefined): () => void {
+    throw new Error('subprocess provider does not support session environments')
+  }
+
+  /**
    * Resolve one configured executable in this provider's execution world.
    * Absolute paths are verified; bare names use the provider's scrubbed PATH
    * plus explicit environment overrides. Relative paths containing separators
