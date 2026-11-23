@@ -289,6 +289,11 @@ export abstract class SessionQueryEngine extends Service {
     filters: readonly SessionResultFilter[],
     signal?: AbortSignal,
   ): Promise<SessionRecord[]> {
+    const exactId = filters.find(filter => filter.kind === 'id' && filter.values.length === 1)
+    if (exactId?.kind === 'id') {
+      const record = await this._corpus.findSession(exactId.values[0] as SessionId, signal)
+      return filterSessionResults(record === undefined ? [] : [record], filters)
+    }
     return filterSessionResults(await this._corpus.listSessions(signal), filters)
   }
 
