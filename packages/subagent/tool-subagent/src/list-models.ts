@@ -7,8 +7,11 @@ import { defineTool, ToolArgsError, ToolContextUnavailableError } from '@deepsee
 import { parentAgentOptionsForDelegation, SubagentError } from '@deepseek-ai/dsh-subagent'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { ModelSelectionPolicy } from './model-selection.ts'
-import type {} from './model-selection-settings.ts'
-import { hasText } from './model-selection.ts'
+import { subagentModelSelectionPolicy } from './model-selection-state.ts'
+
+function hasText(value: string | undefined): value is string {
+  return value !== undefined && value !== ''
+}
 
 interface ListSubagentModelsRequest {
   readonly provider?: string
@@ -41,9 +44,10 @@ async function listSubagentModels(
   ctx: Context,
   request: ListSubagentModelsRequest,
   exec: ToolRunContext,
+  projection: Parameters<typeof subagentModelSelectionPolicy>[0],
 ): Promise<string> {
   if (exec.agent === undefined) throw new ToolContextUnavailableError('list_subagent_models requires a calling agent')
-  const routes = ctx.get('subagentModelSelection')?.allowedRoutes()
+  const routes = subagentModelSelectionPolicy(projection, exec.agent.session)
   let policy = routes === undefined ? undefined : { routes }
   const selectionEnabled = policy !== undefined
   if (policy === undefined) {
@@ -98,7 +102,10 @@ async function listSubagentModels(
  * Register discovery of the child models the Host setting authorizes.
  * @param ctx - Context carrying the tool registry, LLM service, and optional Host model-selection setting.
  */
-export function registerListSubagentModels(ctx: Context): void {
+export function registerListSubagentModels(
+  ctx: Context,
+  projection: Parameters<typeof subagentModelSelectionPolicy>[0],
+): void {
   ctx.tools.register(defineTool({
     name: 'list_subagent_models',
     description:
@@ -124,7 +131,7 @@ export function registerListSubagentModels(ctx: Context): void {
       return listSubagentModels(ctx, {
         ...hasText(args.provider) ? { provider: args.provider } : {},
         ...hasText(args.model) ? { model: args.model } : {},
-      }, exec)
+      }, exec, projection)
     },
   }))
 }

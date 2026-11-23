@@ -10,6 +10,7 @@ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { DEFAULT_MAX_INSTRUCTION_BYTES, RECONNECT_DEFAULTS } from './connection.ts'
 import type { ReconnectConfig } from './connection.ts'
 import { OAuthSchema } from './oauth-options.ts'
+import { DiscoverySchema } from './discovery.ts'
 import type { McpOAuthConfigInput } from './oauth-options.ts'
 import type { Config, StdioConfig, StreamableHttpConfig } from './index.ts'
 
@@ -65,6 +66,8 @@ export const StdioSchema = z.object({
   maxInstructionBytes: z.number().step(1).min(1).default(DEFAULT_MAX_INSTRUCTION_BYTES),
   reconnect: ReconnectSchema,
   toolLoading: z.union(['eager', 'on-demand']).default('eager'),
+  exposure: z.union(['direct', 'discovery']).default('direct'),
+  discovery: DiscoverySchema,
   catalogDescriptionMaxLength: z.natural().min(4).default(DEFAULT_CATALOG_DESCRIPTION_MAX_LENGTH),
 }) as z<StdioConfigInput, StdioConfig>
 
@@ -83,6 +86,8 @@ export const StreamableHttpSchema = z.object({
   maxInstructionBytes: z.number().step(1).min(1).default(DEFAULT_MAX_INSTRUCTION_BYTES),
   reconnect: ReconnectSchema,
   toolLoading: z.union(['eager', 'on-demand']).default('eager'),
+  exposure: z.union(['direct', 'discovery']).default('direct'),
+  discovery: DiscoverySchema,
   catalogDescriptionMaxLength: z.natural().min(4).default(DEFAULT_CATALOG_DESCRIPTION_MAX_LENGTH),
 }) as z<StreamableHttpConfigInput, StreamableHttpConfig>
 /* jscpd:ignore-end */
