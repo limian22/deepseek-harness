@@ -102,6 +102,24 @@ describe.skipIf(!hasPwsh)('pwsh tool over the real pwsh executor', () => {
     expect(lf(text(result))).toBe('[stderr]\nboom\n[exit code: 3]')
   })
 
+  it('keeps session environment overrides out of concurrent unrelated shell calls', async () => {
+    const dispose = ctx.subprocess.registerSessionEnvironment(id => id === 'session-int'
+      ? { DSH_TEST_SCOPE: 'ignored', SESSION_TEST_SCOPE: 'worker' }
+      : undefined)
+    try {
+      const args = { command: 'Write-Output "scope=$env:SESSION_TEST_SCOPE"', description: 'read session scope' }
+      const [worker, ordinary] = await Promise.all([
+        call('pwsh', args, agent()),
+        call('pwsh', args, { session: { header: { id: 'ordinary', cwd: dir } } }),
+      ])
+      expect(worker.isError || ordinary.isError).toBe(false)
+      expect(lf(text(worker))).toBe('scope=worker\n')
+      expect(lf(text(ordinary))).toBe('scope=\n')
+    } finally {
+      dispose()
+    }
+  })
+
   it('resolves relative paths in the session workspace', async () => {
     const result = await call('pwsh', {
       command: 'Get-Content greeting.txt',
