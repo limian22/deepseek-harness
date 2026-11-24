@@ -147,8 +147,29 @@ export class LlmError extends HarnessError {
   }
 }
 
+/** Classification of the initial dispatch URL's literal IP host, not the ultimate network peer. */
+export type EndpointHost = 'loopback-ip' | 'other'
+
+/** Trusted facts about one raw provider overflow and the exact request sent by an adapter. */
+export interface OverflowAssessment {
+  /** Locality of the actual endpoint, including any transport indirection; unknown must not assert local. */
+  readonly endpoint: 'local'
+  /** Estimated tokens for the exact dispatched request including system, tools, and message overhead. */
+  readonly inputTokens: number
+  /** Effective output reservation for that exact request. */
+  readonly reservedOutputTokens: number
+  /** Actual adapter-bound context capacity. */
+  readonly contextWindow: number
+  /** True if the original provider error text contained four or more consecutive digits. */
+  readonly providerErrorHadFourDigitSequence: boolean
+}
+
 /** One model call whose config and adapter registration were resolved together. */
 export interface PreparedLlmCall {
+  /** Adapter-provided fact bound to this exact dispatch; absent means unknown. Never persisted. */
+  readonly endpointHost?: EndpointHost
+  /** Return verified evidence only for this completed attempt's exact terminal failure object. */
+  readOverflowAssessment(failure: LlmFailure): OverflowAssessment | undefined
   /** Detached, deep-frozen config with any adapter-owned default materialized. */
   readonly config: LlmCallConfig
   /** Immutable retry policy captured with the adapter registration. */
@@ -171,12 +192,32 @@ export interface PreparedLlmCall {
    * @returns the chunk stream, including the `llm/stream` waterfall.
    */
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+  /** Optional opt-in freshness fence; the opaque object belongs to this exact prepared call. */
+  readonly freshness?: {
+    /** Opaque adapter-supplied proof; only an explicitly trusted supervisor can authenticate it. */
+    readonly managedProof?: object
+    /** Whether its captured registration and any participating adapter lease remain current. */
+    isCurrent(): boolean
+    /** Consume the same one-shot call only while its captured registration remains current. */
+    stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+  }
 }
 
 /** One adapter-owned model-resolution generation bound to its eventual stream call. */
 export interface PreparedAdapterCall {
+  /** Optional initial dispatch URL host classification captured with {@link stream}. */
+  readonly endpointHost?: EndpointHost
+  /**
+   * Optional per-prepared-call evidence. A result must name the very same terminal
+   * failure object emitted by this call; fabricated/synthetic errors, redirects,
+   * unknown reservations or unpriced request material must return undefined.
+   * The callback is read only after the corresponding stream finishes.
+   */
+  readOverflowAssessment?(): (OverflowAssessment & { readonly failure: LlmFailure }) | undefined
   /** Exact model metadata from the same adapter generation as {@link stream}. */
   readonly model: LlmResolvedModelInfo
+  /** Optional participating-adapter lease. Its proof is not authority without a trusted supervisor verifier. */
+  readonly managedLease?: { readonly proof: object, isActive(): boolean }
   /** Dispatch through that generation without re-reading dynamic connection facts. */
   stream(options: GenerateOptions): AsyncIterable<StreamChunk>
 }
@@ -380,7 +421,10 @@ export class LlmRuntime extends TypertRemoteService {
    * @param adapter - the adapter that streams calls for those providers.
    * @returns the disposer, carrying {@link AdapterRegistrationHandle.replace}.
    */
-  registerAdapter(providers: string[], adapter: LlmAdapter): AdapterRegistrationHandle {
+  registerAdapter(providers: string[], adapter: LlmAdapter, options?: { verifyManagedPair?: (proof: object, stream: PreparedAdapterCall['stream']) => boolean }): AdapterRegistrationHandle {
+    // The caller that registers the adapter is the trust boundary; capture once.
+    const verifyManagedPair = options?.verifyManagedPair
+    if (verifyManagedPair !== undefined && typeof verifyManagedPair !== 'function') throw new LlmError('invalid managed pair verifier', 'INVALID_ADAPTER')
     // The routes this registration currently holds; `replace` rewrites it, and
     // the disposer releases whatever it holds at disposal time.
     const owned = new Set<string>()
@@ -389,7 +433,7 @@ export class LlmRuntime extends TypertRemoteService {
     let released = false
     const dispose = this.ctx.effect(function* (this: LlmRuntime) {
       if (providers.length === 0) throw new LlmError('an adapter must register at least one provider', 'INVALID_ADAPTER')
-      this.commitRoutes(owned, this.prepareRoutes(providers, adapter, owned))
+      this.commitRoutes(owned, this.prepareRoutes(providers, adapter, owned, verifyManagedPair))
       yield () => {
         released = true
         for (const provider of owned) this.adapters.delete(provider)
@@ -406,7 +450,7 @@ export class LlmRuntime extends TypertRemoteService {
       if (released) {
         throw new LlmError('a disposed adapter registration cannot replace its routes', 'REGISTRATION_DISPOSED')
       }
-      this.commitRoutes(owned, this.prepareRoutes(next, adapter, owned))
+      this.commitRoutes(owned, this.prepareRoutes(next, adapter, owned, verifyManagedPair))
     }
     return handle
   }
@@ -416,7 +460,7 @@ export class LlmRuntime extends TypertRemoteService {
    * registration already holds as available. Nothing is mutated: a rejected
    * candidate leaves the registry exactly as it was.
    */
-  private prepareRoutes(providers: string[], adapter: LlmAdapter, owned: ReadonlySet<string>): AdapterRegistration[] {
+  private prepareRoutes(providers: string[], adapter: LlmAdapter, owned: ReadonlySet<string>, verifyManagedPair?: AdapterRegistration['verifyManagedPair']): AdapterRegistration[] {
     const unique = new Set<string>()
     const registrations: AdapterRegistration[] = []
     for (const provider of providers) {
@@ -435,6 +479,7 @@ export class LlmRuntime extends TypertRemoteService {
         adapter,
         provider: { id: info.id, name: info.name },
         retryPolicy,
+        ...(verifyManagedPair === undefined ? {} : { verifyManagedPair }),
       })
     }
     return registrations
@@ -968,34 +1013,83 @@ export class LlmRuntime extends TypertRemoteService {
         : {},
     })
     let dispatched = false
+    const lease = adapterCall.managedLease
+    const adapterStream = lease === undefined ? undefined : adapterCall.stream
+    const leaseProof = lease?.proof
+    const checkLease = lease?.isActive
+    const isCurrent = (): boolean => {
+      if (this.adapters.get(provider) !== registration) return false
+      if (lease === undefined) return true
+      try {
+        if (typeof adapterStream !== 'function' || typeof leaseProof !== 'object' || leaseProof === null || lease.proof !== leaseProof
+            || typeof checkLease !== 'function' || checkLease.call(lease) !== true
+            || typeof registration.verifyManagedPair !== 'function') return false
+        const verified: unknown = registration.verifyManagedPair(leaseProof, adapterStream)
+        if (verified !== true) {
+          if (verified && (typeof verified === 'object' || typeof verified === 'function')
+              && typeof (verified as PromiseLike<unknown>).then === 'function') {
+            void Promise.resolve(verified).catch(() => {})
+          }
+          return false
+        }
+        return checkLease.call(lease) === true && this.adapters.get(provider) === registration
+      } catch { return false }
+    }
+    const stream = (options: GenerateOptions, requireCurrent: boolean): AsyncIterable<StreamChunk> => {
+      if (dispatched) throw new LlmError('a prepared LLM call can only be dispatched once', 'INVALID_PREPARED_CALL')
+      if (!callConfigEquals(options, resolvedConfig)) {
+        throw new LlmError('prepared LLM call config changed before adapter dispatch', 'INVALID_PREPARED_CALL')
+      }
+      if (requireCurrent && !isCurrent()) throw new LlmError('prepared LLM registration changed', 'INVALID_PREPARED_CALL')
+      dispatched = true
+      return this.streamWithRegistration(options, {
+        registration,
+        config: resolvedConfig,
+        modelInfo,
+        requireCurrent,
+        checkCurrent: isCurrent,
+        dispatch: options => requireCurrent && lease !== undefined
+          ? adapterStream!.call(adapterCall, options)
+          : adapterCall.stream(options),
+      })
+    }
+    const freshness = Object.freeze({ ...(leaseProof === undefined ? {} : { managedProof: leaseProof }), isCurrent, stream: (options: GenerateOptions) => stream(options, true) })
     return Object.freeze({
       config: resolvedConfig,
       retryPolicy: registration.retryPolicy,
       adapterDefaults,
+      readOverflowAssessment: (failure: LlmFailure): OverflowAssessment | undefined => {
+        if (!dispatched || adapterCall.readOverflowAssessment === undefined) return undefined
+        try {
+          const value = adapterCall.readOverflowAssessment()
+          const output = resolvedConfig.maxTokens
+          // oxlint-disable-next-line typescript/no-unnecessary-condition -- adapter results cross a runtime trust boundary.
+          if (value === undefined || value.failure !== failure || value.endpoint !== 'local'
+            || typeof value.providerErrorHadFourDigitSequence !== 'boolean'
+            || !Number.isSafeInteger(value.inputTokens) || value.inputTokens < 0
+            || !Number.isSafeInteger(value.reservedOutputTokens) || value.reservedOutputTokens < 0
+            || !Number.isSafeInteger(value.contextWindow) || value.contextWindow <= 0
+            || !Number.isSafeInteger(value.inputTokens + value.reservedOutputTokens)
+            || value.contextWindow !== context?.contextWindow
+            || output === undefined || value.reservedOutputTokens !== output) return undefined
+          return Object.freeze({
+            endpoint: value.endpoint, inputTokens: value.inputTokens,
+            reservedOutputTokens: value.reservedOutputTokens, contextWindow: value.contextWindow,
+            providerErrorHadFourDigitSequence: value.providerErrorHadFourDigitSequence,
+          })
+        } catch { return undefined }
+      },
+      ...(adapterCall.endpointHost === 'loopback-ip' || adapterCall.endpointHost === 'other')
+        ? { endpointHost: adapterCall.endpointHost }
+        : {},
       ...context === undefined ? {} : { context },
       ...modelInfo.inputModalities === undefined
         ? {}
         : { inputModalities: Object.freeze([...modelInfo.inputModalities]) },
       ...modelInfo.systemPromptUpdate === undefined ? {} : { systemPromptUpdate: modelInfo.systemPromptUpdate },
       ...modelInfo.toolUpdate === undefined ? {} : { toolUpdate: modelInfo.toolUpdate },
-      stream: (options: GenerateOptions): AsyncIterable<StreamChunk> => {
-        if (dispatched) {
-          throw new LlmError('a prepared LLM call can only be dispatched once', 'INVALID_PREPARED_CALL')
-        }
-        if (!callConfigEquals(options, resolvedConfig)) {
-          throw new LlmError(
-            'prepared LLM call config changed before adapter dispatch',
-            'INVALID_PREPARED_CALL',
-          )
-        }
-        dispatched = true
-        return this.streamWithRegistration(options, {
-          registration,
-          config: resolvedConfig,
-          modelInfo,
-          dispatch: options => adapterCall.stream(options),
-        })
-      },
+      freshness,
+      stream: (options: GenerateOptions): AsyncIterable<StreamChunk> => stream(options, false),
     })
   }
 
@@ -1101,7 +1195,13 @@ export class LlmRuntime extends TypertRemoteService {
         }
         if (Object.isFrozen(resolvedOptions)) deepFreeze(projectedOptions)
       }
-      const stream = dispatch(this.forAdapter(projectedOptions, adapter))
+      const adapterOptions = this.forAdapter(projectedOptions, adapter)
+      // Waterfall middleware may have awaited since stream() was called. Fence again
+      // after synchronous projection at the final adapter boundary.
+      if (prepared?.requireCurrent && !prepared.checkCurrent?.()) {
+        throw new LlmError('prepared LLM registration changed', 'INVALID_PREPARED_CALL')
+      }
+      const stream = dispatch(adapterOptions)
       iterator = stream[Symbol.asyncIterator]()
     } catch (error: unknown) {
       yield adapterFailureChunk(error, options.signal)
@@ -1192,12 +1292,15 @@ interface AdapterRegistration {
   readonly adapter: LlmAdapter
   readonly provider: LlmProviderInfo
   readonly retryPolicy: ResolvedRetryPolicy
+  readonly verifyManagedPair?: (proof: object, stream: PreparedAdapterCall['stream']) => boolean
 }
 
 interface PreparedDispatch {
   readonly registration: AdapterRegistration
   readonly config: LlmCallConfig
   readonly modelInfo: LlmResolvedModelInfo
+  readonly requireCurrent?: boolean
+  readonly checkCurrent?: () => boolean
   readonly dispatch: (options: GenerateOptions) => AsyncIterable<StreamChunk>
 }
 
