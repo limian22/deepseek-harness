@@ -835,6 +835,32 @@ export async function readTextForDiff(
   }
 }
 
+function stripIndentation(text: string): string {
+  return text.replace(/(^|\n)[ \t]+/g, '$1')
+}
+
+function findIndentationHint(content: string, oldString: string): string {
+  // Bound diagnostic work independently of the literal edit, which supports larger files.
+  if (content.length > 500_000 || oldString.length > 20_000) return ''
+
+  const requiresFinalNewline = oldString.endsWith('\n')
+  const block = stripIndentation(requiresFinalNewline ? oldString.slice(0, -1) : oldString)
+  if (block.trim().length === 0) return ''
+
+  // Match whole lines, including at the start of the file and at an unterminated EOF.
+  // An explicitly requested newline must be present in the file.
+  const file = `\n${stripIndentation(content)}`
+  const haystack = requiresFinalNewline || file.endsWith('\n') ? file : `${file}\n`
+  const needle = `\n${block}\n`
+  const match = haystack.indexOf(needle)
+  if (match === -1 || haystack.indexOf(needle, match + 1) !== -1) return ''
+
+  const start = countOccurrences(haystack.slice(0, match), '\n') + 1
+  const lineCount = countOccurrences(block, '\n') + 1
+  const range = lineCount === 1 ? `line ${start}` : `lines ${start}–${start + lineCount - 1}`
+  return `. Ignoring leading spaces and tabs, old_string matches ${range}. Read with offset=${start}, limit=${lineCount} and copy the indentation exactly.`
+}
+
 /**
  * Apply a literal replacement to LF-normalized content. Empty or missing search text throws
  * `FS_EDIT_NOT_FOUND`; multiple matches throw `FS_AMBIGUOUS_EDIT` unless `replaceAll` is true.
@@ -860,7 +886,8 @@ export function applyLiteralEdit(
   const newNorm = normalizeLineEndings(newString)
   const replacements = countOccurrences(content, oldNorm)
   if (replacements === 0) {
-    throw new FsError(`old_string was not found in "${displayPath}"`, 'FS_EDIT_NOT_FOUND')
+    const hint = findIndentationHint(content, oldNorm)
+    throw new FsError(`old_string was not found in "${displayPath}"${hint}`, 'FS_EDIT_NOT_FOUND')
   }
   if (!replaceAll && replacements > 1) {
     throw new FsError(`old_string matched ${replacements} times in "${displayPath}"; provide a more specific old_string or set replace_all to true`, 'FS_AMBIGUOUS_EDIT')

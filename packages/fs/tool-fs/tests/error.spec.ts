@@ -31,8 +31,17 @@ describe('remediateFsError', () => {
     expect(remedied.map(error => error.cause)).toEqual(sources)
   })
 
+  it('preserves the provider diagnostic and adds the recovery hint to FS_EDIT_NOT_FOUND', () => {
+    const original = new FsError('no match anywhere. Read with offset=2, limit=1.', 'FS_EDIT_NOT_FOUND')
+    const remedied = remediateFsError(original, 'x')
+    expect(remedied.message).toContain(original.message)
+    expect(remedied.message).toContain('do not repeat the same edit')
+    expect(remedied.code).toBe('FS_EDIT_NOT_FOUND')
+    expect(remedied.cause).toBe(original)
+  })
+
   it('leaves other FsError codes untouched', () => {
-    const original = new FsError('no match anywhere', 'FS_EDIT_NOT_FOUND')
+    const original = new FsError('multiple matches', 'FS_AMBIGUOUS_EDIT')
     expect(remediateFsError(original, 'x')).toBe(original)
   })
 

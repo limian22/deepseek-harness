@@ -948,6 +948,28 @@ describe('applyLiteralEdit', () => {
     expect(() => applyLiteralEdit('a b c', 'z', 'X', false, 'f')).toThrow(expect.objectContaining({ code: 'FS_EDIT_NOT_FOUND' }))
   })
 
+  it('locates an indentation mismatch on the last line without a final newline', () => {
+    expect(() => applyLiteralEdit('before\n\tvalue', '  value', 'new', false, 'f')).toThrow(expect.objectContaining({
+      code: 'FS_EDIT_NOT_FOUND',
+      message: 'old_string was not found in "f". Ignoring leading spaces and tabs, old_string matches line 2. Read with offset=2, limit=1 and copy the indentation exactly.',
+    }))
+  })
+
+  it.each([
+    { name: 'repeated candidate', content: '  value\n  value', oldString: '\tvalue' },
+    { name: 'overlapping candidates', content: '  value\n  value\n  value', oldString: '\tvalue\n\tvalue' },
+    { name: 'missing requested newline', content: '  value', oldString: '\tvalue\n' },
+    { name: 'different token', content: '  value', oldString: '\tvalues' },
+    { name: 'blank search', content: '\t\n', oldString: '  ' },
+    { name: 'large file', content: `${'x'.repeat(500_000)}\n  value`, oldString: '\tvalue' },
+    { name: 'large search', content: ` ${'x'.repeat(20_000)}`, oldString: `\t${'x'.repeat(20_000)}` },
+  ])('leaves the generic error for $name', ({ content, oldString }) => {
+    expect(() => applyLiteralEdit(content, oldString, 'new', false, 'f')).toThrow(expect.objectContaining({
+      code: 'FS_EDIT_NOT_FOUND',
+      message: 'old_string was not found in "f"',
+    }))
+  })
+
   it('rejects an empty oldString without scanning forever', () => {
     expect(() => applyLiteralEdit('a b c', '', 'X', false, 'f')).toThrow(expect.objectContaining({ code: 'FS_EDIT_NOT_FOUND' }))
   })

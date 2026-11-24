@@ -414,6 +414,28 @@ describe('bare provider (no dsh-fs-observation-policy)', () => {
     const result = await call('edit', { file_path: 'a.txt', old_string: 'absent', new_string: 'x' })
     expect(result.isError).toBe(true)
     expect(result.error).toMatchObject({ info: { code: 'FS_EDIT_NOT_FOUND' } })
+    expect(text(result)).toContain('may already be present')
+    expect(text(result)).toContain('do not repeat the same edit')
+  })
+
+  it('locates a unique indentation mismatch for a targeted read and exact retry', async () => {
+    const file = join(dir, 'indent.txt')
+    const before = 'header\r\n  begin\r\n\tsetting = true\r\nfooter\r\n'
+    await writeFile(file, before)
+    const args = { file_path: 'indent.txt', new_string: '  begin\n\tsetting = false' }
+    const result = await call('edit', { ...args, old_string: '  begin\n    setting = true' })
+    expect(result.isError).toBe(true)
+    expect(result.error).toMatchObject({ info: { code: 'FS_EDIT_NOT_FOUND' } })
+    expect(await readFile(file, 'utf8')).toBe(before)
+    expect(text(result)).toContain('Ignoring leading spaces and tabs, old_string matches lines 2–3')
+    expect(text(result)).toContain('offset=2, limit=2')
+    expect(text(result)).toContain('do not repeat the same edit')
+
+    const observed = await call('read', { file_path: args.file_path, offset: 2, limit: 2 })
+    expect(text(observed)).toContain('2:   begin\n3: \tsetting = true')
+    const retry = await call('edit', { ...args, old_string: '  begin\n\tsetting = true' })
+    expect(retry.isError).toBe(false)
+    expect(await readFile(file, 'utf8')).toBe(before.replace('true', 'false'))
   })
 
   it('neither write nor edit stats in the tool on the bare path', async () => {
