@@ -2098,11 +2098,13 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
     }
     const started = Promise.withResolvers<AbortSignal>()
     const cleanup = Promise.withResolvers<undefined>()
+    const artifacts: Array<{ header: SessionHeader; path: string }> = []
+    const inspectArtifacts = vi.spyOn(artifacts, 'some')
     vi.spyOn(persistence, 'listArtifacts').mockImplementation(async (signal) => {
       if (signal === undefined) throw new Error('expected list signal')
       started.resolve(signal)
       await cleanup.promise
-      return []
+      return artifacts
     })
     const reason = new Error('JSONL list discovery cancelled')
     const controller = new AbortController()
@@ -2120,6 +2122,7 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
 
     cleanup.resolve(undefined)
     await expect(pending).rejects.toBe(reason)
+    expect(inspectArtifacts).not.toHaveBeenCalled()
   })
 
   it('checks cancellation after an uncancellable list stat settles', async () => {

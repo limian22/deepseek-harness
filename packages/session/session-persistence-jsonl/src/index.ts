@@ -528,6 +528,7 @@ class JsonlSessionPersistence extends SessionPersistence {
     // predate the scan), so create-to-list visibility never has a hole.
     const pending = [...this.tracker.pendingEntries()]
     const artifacts = await this.listArtifacts(signal)
+    signal?.throwIfAborted()
     const corpusRevision = artifacts.some(artifact => artifact.sourceVersion < SESSION_FORMAT_VERSION)
       ? await this.historicalCorpusRevision(signal) : undefined
     const statted = settledValues(await settleLimited(this.listLimit, artifacts, async (artifact) => {

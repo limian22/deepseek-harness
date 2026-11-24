@@ -86,6 +86,26 @@ export class SessionCorpus {
     return [...records.values()].sort(compareSessions)
   }
 
+  /** Observe one logical session without enumerating the complete corpus. */
+  async findSession(sessionId: SessionId, signal?: AbortSignal): Promise<SessionRecord | undefined> {
+    signal?.throwIfAborted()
+    const persistence = this._persistence
+    const stored = persistence === undefined ? undefined : await statPersisted(persistence, sessionId, signal)
+    signal?.throwIfAborted()
+    const live = this._ctx.sessions.get(sessionId)
+    if (live !== undefined) {
+      if (stored !== undefined) assertSessionHeadersCompatible(live.header, stored.header)
+      return { header: structuredClone(live.header), live: true, persisted: stored !== undefined, formatStatus: 'current' }
+    }
+    if (stored === undefined) return undefined
+    return {
+      header: structuredClone(stored.header),
+      live: false,
+      persisted: true,
+      ...(stored.formatStatus === undefined ? {} : { formatStatus: stored.formatStatus }),
+    }
+  }
+
   /**
    * Load one logical source, preferring a detached live snapshot.
    *
@@ -271,6 +291,27 @@ async function listPersisted(
     if (signal?.aborted) signal.throwIfAborted()
     throw new SessionQueryError(
       `session persistence listing failed: ${errorMessage(error)}`,
+      'SESSION_QUERY_PERSISTENCE_FAILED',
+      { cause: error },
+    )
+  }
+}
+
+async function statPersisted(
+  persistence: SessionPersistence,
+  sessionId: SessionId,
+  signal?: AbortSignal,
+): Promise<SessionPersistenceSnapshot | undefined> {
+  try {
+    const snapshot = await persistence.stat(sessionId, signal === undefined ? undefined : { signal })
+    if (snapshot !== undefined && snapshot.header.id !== sessionId) {
+      throw new Error('stored session id does not match the requested id')
+    }
+    return snapshot
+  } catch (error: unknown) {
+    if (signal?.aborted) signal.throwIfAborted()
+    throw new SessionQueryError(
+      `session persistence lookup failed: ${errorMessage(error)}`,
       'SESSION_QUERY_PERSISTENCE_FAILED',
       { cause: error },
     )
