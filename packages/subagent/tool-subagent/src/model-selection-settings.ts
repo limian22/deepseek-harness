@@ -12,13 +12,6 @@ import {
   type AllowedModelRoute,
 } from './model-selection.ts'
 
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    /** User preference read for explicit child route selection and route discovery. */
-    subagentModelSelection: SubagentModelSelectionConfig
-  }
-}
-
 /** Optional deployment base for the preference; the shipped composition defaults it off. */
 export interface Config {
   /** Whether Agents may select a child route from `allowedModels`; inherited when the user document does not override it. */
@@ -48,7 +41,11 @@ export class SubagentModelSelectionConfig extends Service {
   allowedRoutes(): AllowedModelRoute[] | undefined {
     if (!this.config.enabled.get()) return undefined
     const allowedModels = this.config.allowedModels.get()
-    assertAllowedModelRoutes(allowedModels)
+    try {
+      assertAllowedModelRoutes(allowedModels)
+    } catch (error) {
+      throw new SubagentError(error instanceof Error ? error.message : String(error), 'INVALID_MODEL_SELECTION_SETTINGS')
+    }
     if (allowedModels.length === 0) {
       throw new SubagentError('enabled subagent model selection requires at least one allowed model', 'INVALID_MODEL_SELECTION_SETTINGS')
     }

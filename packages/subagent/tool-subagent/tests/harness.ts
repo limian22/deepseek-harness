@@ -39,6 +39,8 @@ type SetupConfig = toolConfig & {
   withModelSelection?: boolean
   /** Host setting sampled by a `withModelSelection` setup; defaults to enabled. */
   hostSelectionEnabled?: boolean
+  /** Exercise a persisted policy on a host without live settings. */
+  historicalPolicyOnly?: boolean
   parentAgentOptions?: AgentOptions
 }
 
@@ -53,13 +55,15 @@ const TEST_ALLOWED_MODELS = [
 
 export async function setup(toolConfig: SetupConfig, mockConfig: Partial<mock.Config> = {}): Promise<Context> {
   const ctx = ownContext(new Context())
-  const { withModelSelection, hostSelectionEnabled = true, parentAgentOptions, ...config } = toolConfig
+  const { withModelSelection, hostSelectionEnabled = true, historicalPolicyOnly, parentAgentOptions, ...config } = toolConfig
   await mountAgentLoopTestDependencies(ctx)
   if (withModelSelection === true) {
-    await ctx.plugin(SubagentModelSelectionConfig, {
-      enabled: hostSelectionEnabled,
-      allowedModels: TEST_ALLOWED_MODELS,
-    })
+    if (historicalPolicyOnly !== true) {
+      await ctx.plugin(SubagentModelSelectionConfig, {
+        enabled: hostSelectionEnabled,
+        allowedModels: TEST_ALLOWED_MODELS,
+      })
+    }
     await ctx.plugin(AgentLoop, { agents: [] })
     await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
@@ -70,7 +74,7 @@ export async function setup(toolConfig: SetupConfig, mockConfig: Partial<mock.Co
       ...parentAgentOptions !== undefined ? { agentOptions: parentAgentOptions } : {},
       setup: async (agentCtx) => {
         const fiber = agentCtx.inject(tool.inject, (runtimeCtx) => {
-          tool.apply(runtimeCtx, { ...config, modelSelection: true, modelDiscovery: true })
+          return tool.apply(runtimeCtx, { ...config, modelSelection: true, modelDiscovery: true })
         })
         await fiber.await()
       },

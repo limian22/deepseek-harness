@@ -622,7 +622,7 @@ export class SubagentRuntime extends TypertRemoteService {
    */
   private admitModelSelection(provider: SubagentProvider, spec: SubagentActivationSpec): SubagentActivationSpec {
     const handle = this.modelSelectionPolicy
-    const routes = handle === undefined ? undefined : subagentModelSelectionPolicy(handle, spec.parent.session)
+    const routes = handle === undefined ? undefined : subagentModelSelectionPolicy(handle, spec.parent.session, this.ctx)
     if (routes === undefined) return spec
     if (!provider.capabilities.agentOptions) {
       throw new SubagentError(

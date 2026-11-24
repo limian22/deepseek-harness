@@ -47,7 +47,7 @@ async function listSubagentModels(
   projection: Parameters<typeof subagentModelSelectionPolicy>[0],
 ): Promise<string> {
   if (exec.agent === undefined) throw new ToolContextUnavailableError('list_subagent_models requires a calling agent')
-  const routes = subagentModelSelectionPolicy(projection, exec.agent.session)
+  const routes = subagentModelSelectionPolicy(projection, exec.agent.session, ctx)
   let policy = routes === undefined ? undefined : { routes }
   const selectionEnabled = policy !== undefined
   if (policy === undefined) {

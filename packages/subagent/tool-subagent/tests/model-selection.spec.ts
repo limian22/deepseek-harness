@@ -100,7 +100,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: {
         provider: 'alpha',
         model: 'parent-model',
@@ -130,7 +130,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: {
         provider: 'alpha',
         model: 'parent-model',
@@ -165,7 +165,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: {
         provider: 'alpha',
         model: 'parent-model',
@@ -203,7 +203,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: { provider: 'alpha', model: 'parent-model' },
       agentOptions: { provider: 'alpha', model: 'configured-model' },
     }, { onStart: (request) => { requests.push(request) } })
@@ -225,7 +225,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: {
         provider: 'alpha',
         model: 'parent-model',
@@ -262,7 +262,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: { provider: 'alpha', model: 'parent-model' },
       agentOptions: { provider: 'alpha', maxTokens: 321 },
     }, { onStart: (request) => { requests.push(request) } })
@@ -288,7 +288,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: { provider: 'alpha', model: 'parent-model' },
     }, {
       agentRouteDefaults: { provider: 'alpha', model: 'child-model' },
@@ -312,7 +312,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: {
         provider: 'alpha',
         model: 'parent-model',
@@ -348,7 +348,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({
       provider: 'mock',
       withModelSelection: true,
-      hostSelectionEnabled: false,
+      historicalPolicyOnly: true,
       parentAgentOptions: { provider: 'alpha', model: 'parent-model' },
     }, {
       agentRouteDefaults: { provider: 'alpha', model: 'child-model' },
@@ -468,7 +468,7 @@ describe('dsh-tool-subagent model selection', () => {
     const ctx = await setup({ provider: 'mock', modelSelection: true })
     const agent = modelSelectionSetupAgent(ctx)
     const descriptions = () => ctx.tools.schemas(agent).map(schema => schema.description).join('\n')
-    const guidance = 'Query when choosing an explicit child route or reasoning effort'
+    const guidance = 'Inspect the routes available for explicit subagent model selection.'
     expect(descriptions()).not.toContain(guidance)
     expect(descriptions()).not.toContain('list_subagent_models')
 

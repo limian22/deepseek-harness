@@ -279,7 +279,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           throw new Error('subagent tool requires a calling agent (exec.agent was undefined)')
         }
 
-        const routes = subagentModelSelectionPolicy(subagentModelSelectionProjectionHandle, parent.session)
+        const routes = subagentModelSelectionPolicy(subagentModelSelectionProjectionHandle, parent.session, ctx)
         const modelSelectionPolicy = routes === undefined ? undefined : { routes }
         const policyEnforced = modelSelectionPolicy !== undefined
         if (policyEnforced && !subagentProvider.capabilities.agentOptions) {

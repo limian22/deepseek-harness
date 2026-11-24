@@ -7,9 +7,18 @@
  */
 
 import { z as zod } from 'zod'
+import type { Context } from '@deepseek-ai/cordis'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { ProjectionDefinition, ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
+import { SubagentError } from './error.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Host preference; present when the model selection settings plugin is loaded. */
+    subagentModelSelection: { allowedRoutes(): AllowedModelRoute[] | undefined }
+  }
+}
 
 /** One exact child LLM route authorized by a user setting. */
 export interface AllowedModelRoute {
@@ -77,10 +86,10 @@ export function assertAllowedModelSelection(
     ? provider === parentOptions.provider && model === parentOptions.model
     : policy.routes.some(route => route.provider === provider && route.model === model)
   if (allowed) return
-  throw new Error(`child LLM route "${provider}/${model}" is not allowed for this Session`
-    + (policy === undefined
-      ? '; without a recorded model-selection policy, explicit selection is limited to the parent route'
-      : ''))
+  const reason = policy === undefined
+    ? 'without a recorded model-selection policy, explicit selection is limited to the parent route'
+    : 'the route is not allowed by the current subagent model selection setting'
+  throw new SubagentError(`child LLM route "${provider}/${model}" is not allowed for this Session; ${reason}`, 'MODEL_ROUTE_NOT_ALLOWED')
 }
 
 /**
@@ -153,14 +162,19 @@ export const subagentModelSelectionProjectionDefinition = {
 } satisfies ProjectionDefinition<'subagentModelSelectionPolicy', AllowedModelRoute[] | null>
 
 /**
- * Read the exact route list authorized for a Session.
+ * Read the current Host policy, falling back to a historical policy only on
+ * hosts without the settings service.
  * @param handle - registered policy state reader.
- * @param session - session whose durable decision is read.
- * @returns a detached route list, or undefined when the Session records no policy.
+ * @param session - session whose durable decision may be read.
+ * @param ctx - context that resolves the live Host settings service.
+ * @returns a detached route list, or undefined when no policy applies.
  */
 export function subagentModelSelectionPolicy(
   handle: Pick<ProjectionHandle<AllowedModelRoute[] | null>, 'stateOf'>,
   session: Session,
+  ctx?: Context,
 ): AllowedModelRoute[] | undefined {
+  const settings = ctx?.get('subagentModelSelection')
+  if (settings !== undefined) return settings.allowedRoutes()
   return handle.stateOf(session)?.map(route => ({ ...route }))
 }

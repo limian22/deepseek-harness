@@ -12,6 +12,7 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { MockAdapter, maxTokensResponse, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import * as spawn from '../src/index.ts'
+import * as delegationTool from '../../tool-subagent/src/index.ts'
 import { STRUCTURED_OUTPUT_TOOL } from '@deepseek-ai/dsh-subagent'
 import { brandString } from '@deepseek-ai/dsh-brand'
 
@@ -126,6 +127,35 @@ describe('dsh-subagent-spawn-in-process', () => {
     const child = run.localAgent
     expect(child.options.subagentDepth).toBe(1)
     await run.dispose()
+  })
+
+  it('exposes delegation to a real child and rejects a third level', async () => {
+    const { ctx, parent } = await setup([
+      toolCallResponse('nested', 'subagent', { description: 'second level', prompt: 'verify depth' }),
+      textResponse('nested delegation handled'),
+      textResponse('nested delegation handled'),
+    ])
+    await ctx.plugin(delegationTool, { provider: 'spawn', maxDepth: 2 })
+    const grandchild = Promise.withResolvers<Agent>()
+    const settled = Promise.withResolvers<undefined>()
+    let nestedId: SessionId | undefined
+    ctx.on('subagent/start', (info) => {
+      const agent = ctx.agents.get(info.id)
+      if (agent?.options.subagentDepth !== 2) return
+      nestedId = agent.id
+      grandchild.resolve(agent)
+    })
+    ctx.on('subagent/end', (info) => {
+      if (info.id === nestedId) settled.resolve(undefined)
+    })
+    const direct = await start(ctx, 'spawn', { prompt: [{ type: 'text', text: 'delegate once' }], parent, maxDepth: 2 })
+    const nested = await grandchild.promise
+    expect(nested.session.header.parentSession).toBe(direct.id)
+    await expect(start(ctx, 'spawn', { prompt: [{ type: 'text', text: 'too deep' }], parent: nested, maxDepth: 2 }))
+      .rejects.toMatchObject({ code: 'DEPTH_EXCEEDED', attemptedDepth: 3, maxDepth: 2 })
+    await direct.result
+    await settled.promise
+    await direct.dispose()
   })
 
   it('refuses to spawn past maxDepth (depthLimit capability)', async () => {
