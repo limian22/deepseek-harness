@@ -20,6 +20,7 @@ import {
 import { runLiveWritePathContract } from '../../session-persistence/tests/live-write-contract.ts'
 import { LIVE_WRITE_BATCH_MAX_DELAY_MS, type JsonlSessionHandle, type JsonlHandleStorage } from '../src/storage.ts'
 import { JsonlGenerationSourceChangedError } from '../src/generation.ts'
+import type { JsonlSessionPersistence as JsonlPersistenceBackend } from '../src/index.ts'
 import SessionStore from '@deepseek-ai/dsh-session'
 
 const statRace = vi.hoisted(() => ({
@@ -134,6 +135,9 @@ const dirs: string[] = []
 const liveContexts: Context[] = []
 
 type MutableSessionHeader = { -readonly [K in keyof SessionHeader]: SessionHeader[K] }
+type ArtifactDiscovery = {
+  listArtifacts(signal?: AbortSignal): ReturnType<JsonlPersistenceBackend['listArtifacts']>
+}
 
 /** Test-only mutable view used to verify that backends detach caller metadata. */
 function mutableHeader(header: SessionHeader): MutableSessionHeader {
@@ -2085,16 +2089,14 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
   })
 
   it('forwards list cancellation and awaits in-flight discovery cleanup', async () => {
-    const persistence = ctx.sessionPersistence as unknown as {
-      listArtifacts(signal?: AbortSignal): Promise<Array<{ header: SessionHeader; path: string }>>
-    }
+    const persistence = ctx.sessionPersistence as unknown as ArtifactDiscovery
     const started = Promise.withResolvers<AbortSignal>()
     const cleanup = Promise.withResolvers<undefined>()
     vi.spyOn(persistence, 'listArtifacts').mockImplementation(async (signal) => {
       if (signal === undefined) throw new Error('expected list signal')
       started.resolve(signal)
       await cleanup.promise
-      return []
+      return { artifacts: [], revisions: [] }
     })
     const reason = new Error('JSONL list discovery cancelled')
     const controller = new AbortController()
@@ -2117,29 +2119,16 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
   it('observes cancellation after discovery settles', async () => {
     const m = meta('snapshot-stat-cancellation')
     await writeLog(ctx.sessionPersistence, m, oneTurnLog())
-    const persistence = ctx.sessionPersistence as unknown as {
-      listArtifacts(signal?: AbortSignal): Promise<Array<{
-        header: SessionHeader
-        path: string
-        sourceVersion: number
-        identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint }
-      }>>
-    }
+    const persistence = ctx.sessionPersistence as unknown as ArtifactDiscovery
+    const listArtifacts = persistence['listArtifacts'].bind(persistence)
     const reason = new Error('JSONL list discovery cancelled')
     const controller = new AbortController()
     const discovery = vi.spyOn(persistence, 'listArtifacts').mockImplementation(async (signal) => {
       expect(signal).toBe(controller.signal)
+      const result = await listArtifacts(signal)
+      expect(result.artifacts).toHaveLength(1)
       controller.abort(reason)
-      const identity = await stat(rawLogPath(root, m.cwd, m.id), { bigint: true })
-      return [{
-        header: m,
-        path: rawLogPath(root, m.cwd, m.id),
-        sourceVersion: SESSION_FORMAT_VERSION,
-        identity: {
-          dev: identity.dev, ino: identity.ino, size: identity.size,
-          mtimeNs: identity.mtimeNs, ctimeNs: identity.ctimeNs,
-        },
-      }]
+      return result
     })
 
     await expect(ctx.sessionPersistence.list({ signal: controller.signal })).rejects.toBe(reason)

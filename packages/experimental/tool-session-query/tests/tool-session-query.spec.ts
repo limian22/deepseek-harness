@@ -384,7 +384,7 @@ describe('search coverage reporting', () => {
     createSession(mounted.ctx, 'second', '/work')
     FakeQuery.sessionSearch = async request => request.cursor === undefined ? {
       items: [sessionHit('first', '/work')],
-      nextCursor: SessionSearchCursor('coverage-page'),
+      nextCursor: brandString<SessionSearchCursor>('coverage-page'),
       coverage: { state: 'syncing', pendingSessions: 2 },
     } : {
       items: [sessionHit('second', '/work')],
@@ -412,7 +412,7 @@ describe('search coverage reporting', () => {
     const mounted = await mount()
     FakeQuery.sessionSearch = async request => request.cursor === undefined ? {
       items: [sessionHit('first', '/work')],
-      nextCursor: SessionSearchCursor('degraded-page'),
+      nextCursor: brandString<SessionSearchCursor>('degraded-page'),
       coverage: { state: 'ready' },
     } : {
       items: [],

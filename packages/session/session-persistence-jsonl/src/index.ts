@@ -776,7 +776,9 @@ export class JsonlSessionPersistence extends SessionPersistence {
     // append lands mid-scan is then still in this snapshot (its artifact may
     // predate the scan), so create-to-list visibility never has a hole.
     const pending = [...this.tracker.pendingEntries()]
-    const { artifacts, revisions } = await this.listArtifacts(signal)
+    const discovery = await this.listArtifacts(signal)
+    signal?.throwIfAborted()
+    const { artifacts, revisions } = discovery
     const corpusRevision = artifacts.some(artifact => artifact.sourceVersion < SESSION_FORMAT_VERSION)
       ? corpusDigest(revisions) : undefined
     for (const artifact of artifacts) {

@@ -66,6 +66,7 @@ function logFor(target: SessionRecord, storedEventCount = 1): StableColdLog {
     eventState: 'detached',
     header: target.header,
     inheritedEventCount: SessionLogOffset(0),
+    persistedEventCount: SessionLogOffset(storedEventCount),
     events,
     storedEventCount,
     revision: SessionPersistenceRevision(`revision:${target.header.id}`),

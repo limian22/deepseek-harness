@@ -17,6 +17,8 @@ import Include from '@deepseek-ai/cordis-plugin-include'
 import * as Connection from '@deepseek-ai/dsh-client-connection'
 import LocalCredentials from '@deepseek-ai/dsh-credentials-local'
 import HttpServer from '@deepseek-ai/dsh-host-webserver'
+import * as Token from '@deepseek-ai/dsh-host-authentication-token'
+import { BrowserAuth } from '@deepseek-ai/dsh-host-authentication-token/src/browser-auth.ts'
 import * as FrontendStatic from '../src/index.ts'
 
 let root: string | undefined
@@ -58,6 +60,7 @@ async function loadComposition(): Promise<Context> {
     "    host: '127.0.0.1'",
     '    port: 0',
     "- name: '@deepseek-ai/dsh-client-connection'",
+    "- name: '@deepseek-ai/dsh-host-authentication-token'",
     '- id: frontend',
     "  name: '@deepseek-ai/dsh-host-frontend-static'",
     '  config:',
@@ -73,6 +76,7 @@ async function loadComposition(): Promise<Context> {
     ['@deepseek-ai/dsh-credentials-local', LocalCredentials],
     ['@deepseek-ai/dsh-host-webserver', HttpServer],
     ['@deepseek-ai/dsh-client-connection', Connection],
+    ['@deepseek-ai/dsh-host-authentication-token', Token],
     ['@deepseek-ai/dsh-host-frontend-static', FrontendStatic],
   ])
   context.loader.internal = {
@@ -162,7 +166,8 @@ describe('real Loader composition', () => {
     expect(unloaded).toEqual([])
     const server = loaded.webServer
     const port = server.port
-    const launchUrl = loaded.connection.authenticatedUrl(`http://127.0.0.1:${String(port)}`)
+    const auth = await BrowserAuth.create(loaded[Context.root], loaded.credentials, 30)
+    const launchUrl = auth.authenticatedUrl(`http://127.0.0.1:${String(port)}`)
     const exchange = await fetch(launchUrl, { redirect: 'manual' })
     expect(exchange.status).toBe(303)
     expect(exchange.headers.get('location')).toBe('./')
@@ -177,8 +182,8 @@ describe('real Loader composition', () => {
 
     expect(await request(port, '/')).toMatchObject({
       status: 401,
-      type: 'text/plain; charset=utf-8',
-      body: 'dsh web authentication required; reopen the URL printed by dsh web.\n',
+      type: null,
+      body: 'unauthorized',
     })
 
     // Real assets with their MIME types; a live rebuild is served on the next read.
@@ -226,8 +231,9 @@ describe('real Loader composition', () => {
       expect(base).toBeLessThan(got.body.indexOf('<link rel="preload" as="script" href="plugins/boot.js">'))
       expect(base).toBeLessThan(got.body.indexOf('<script>window.__T__=1</script>'))
     }
-    // An authenticated browser renders for the owner's shared browser Peer.
-    expect(renderedFor).toEqual([loaded.connection.browserPeer, loaded.connection.browserPeer, loaded.connection.browserPeer])
+    // Token authentication reuses its owner peer for all index requests.
+    expect(renderedFor.map(peer => peer.principal.kind)).toEqual(['owner', 'owner', 'owner'])
+    expect(new Set(renderedFor).size).toBe(1)
     offRows()
     expect(await request(port, '/', authenticated({ method: 'HEAD' }))).toEqual({
       status: 200,
@@ -288,7 +294,7 @@ describe('real Loader composition', () => {
   it('answers in-process reads for the given Peer without browser authentication', { timeout: 60_000 }, async () => {
     const loaded = await loadComposition()
     const server = loaded.webServer
-    const reader = { principal: { kind: 'owner' } } as Connection.PeerScope
+    const reader = { principal: { kind: 'owner' }, signal: new AbortController().signal } as Connection.PeerScope
     const read = (path: string, init?: RequestInit) => server.readResource(new Request(`http://reader.invalid${path}`, init), reader)
     const renderedFor: Connection.PeerScope[] = []
     loaded.on('webserver/index-inject', (rows, peer) => {
@@ -338,7 +344,7 @@ describe('real Loader composition', () => {
     expect([revalidated.status, revalidated.headers.get('etag'), revalidated.headers.get('cache-control')]).toEqual([304, etag, 'no-cache'])
     expect(await revalidated.text()).toBe('')
     // An in-process read revalidates the same way.
-    const reader = { principal: { kind: 'owner' } } as Connection.PeerScope
+    const reader = { principal: { kind: 'owner' }, signal: new AbortController().signal } as Connection.PeerScope
     const read = await loaded.webServer.readResource(new Request(`${base}/app.js`, { headers: { 'if-none-match': etag } }), reader)
     expect(read.status).toBe(304)
 
