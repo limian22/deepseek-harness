@@ -1,6 +1,6 @@
 import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -112,6 +112,31 @@ describe('tool-session-query with the real SQLite provider', () => {
     expect(liveEvents.isError).toBe(false)
     expect(liveEvents.content.map(block => block.type === 'text' ? block.text : '').join('\n'))
       .toContain('seq 1')
+
+    const sameWorkspace = ctx.sessions.create(brandString<SessionId>('same-workspace'), {
+      meta: { createdAt: 11, cwd: '/work' },
+    })
+    sameWorkspace.append('turn/start', { turn: 1 })
+    const foreign = ctx.sessions.create(brandString<SessionId>('foreign'), {
+      meta: { createdAt: 12, cwd: '/other' },
+    })
+    const list = vi.spyOn(ctx.sessionPersistence, 'list')
+    try {
+      await expect(ctx.sessionQuery.filterSessions([
+        { kind: 'id', values: [persisted] },
+        { kind: 'cwd', values: ['/work'] },
+      ])).resolves.toMatchObject([{ header: { id: persisted }, live: false, persisted: true }])
+      const direct = await execute('session_event_read', { session_id: sameWorkspace.id, seq: 0 })
+      expect(direct.isError).toBe(false)
+      for (const id of [foreign.id, 'missing']) {
+        const denied = await execute('session_event_search', { session_id: id, query: 'needle' })
+        expect(denied.isError).toBe(true)
+        expect(denied.content).toEqual([{ type: 'text', text: 'Error: session target is outside the caller workspace' }])
+      }
+      expect(list).not.toHaveBeenCalled()
+    } finally {
+      list.mockRestore()
+    }
   })
 
   it('passes finite fractional epoch-millisecond bounds through SQLite comparisons', async () => {

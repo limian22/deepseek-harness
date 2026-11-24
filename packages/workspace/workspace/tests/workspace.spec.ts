@@ -914,7 +914,7 @@ describe('header-validated membership projection', () => {
 
   it('keeps an unlisted candidate accounted and lists it again once the store returns its header', async () => {
     const dir = await makeDir('unlisted-return')
-    const id = WorkspaceId('unlisted-return')
+    const id = brandString<WorkspaceId>('unlisted-return')
     const pool = storedPool([[id, record(dir, ['unlisted'])]], { initialized: true, workspaceIds: [id] })
     const result = await harness({ pool, sessions: [] })
     onTestFinished(() => result.ctx.fiber.dispose())
@@ -923,7 +923,7 @@ describe('header-validated membership projection', () => {
     await workspace.setTitle('Retained')
     expect(storedRecord(pool, id).sessionIds).toEqual(['unlisted'])
     result.setSessions([header('unlisted', dir)])
-    await result.registry.pinSession(SessionId('unlisted'))
+    await result.registry.pinSession(brandString<SessionId>('unlisted'))
     expect(workspace.sessionIds).toEqual(['unlisted'])
   })
 

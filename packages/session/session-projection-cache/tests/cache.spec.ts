@@ -957,7 +957,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('awaits durability and serves the checkpoint through the listing read', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('durable-cold'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-cold'), 9)
     const events = titledLog()
 
     const snapshot = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), events)
@@ -989,7 +989,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
       apply: expensiveApply,
       stateVersion: 1,
     })
-    const meta = headerOf(SessionId('durable-scope'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-scope'), 9)
 
     await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
 
@@ -1013,7 +1013,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
     })
     const { ctx, cache } = await harness({ root })
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('durable-merge'))
+    const meta = headerOf(brandString<SessionId>('durable-merge'))
 
     await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
 
@@ -1039,7 +1039,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
       },
       { type: 'turn/end', seq: SessionSeq(3), time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
     ]
-    const meta = headerOf(SessionId('durable-metadata'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-metadata'), 9)
 
     await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(3), events)
 
@@ -1071,7 +1071,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
     })
     const { ctx, cache } = await harness({ root })
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('durable-foreign'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-foreign'), 9)
 
     await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
 
@@ -1083,7 +1083,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('rejects events that are not contiguous from seq 0', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('durable-gap'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-gap'), 9)
     const gapped: SessionEvent[] = [
       { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
       { type: 'turn/end', seq: SessionSeq(2), time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
@@ -1103,7 +1103,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
     })
     const { ctx, cache } = await harness({ root })
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('durable-multi-row'))
+    const meta = headerOf(brandString<SessionId>('durable-multi-row'))
 
     expect(await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog()))
       .toBeUndefined()
@@ -1116,7 +1116,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('rejects a declared watermark that is not the last supplied event', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('durable-mismatch'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-mismatch'), 9)
 
     await expect(cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(1), titledLog()))
       .rejects.toThrow(/must end at seq/)
@@ -1126,7 +1126,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('abandons the write when the pre-put guard refuses it', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('guard-refused'), 9)
+    const meta = headerOf(brandString<SessionId>('guard-refused'), 9)
 
     const written = await cache.coldSnapshotDurable(
       meta,
@@ -1153,7 +1153,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
     })
     const { ctx, cache } = await harness({ root })
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('newer-cold'), 9)
+    const meta = headerOf(brandString<SessionId>('newer-cold'), 9)
 
     const written = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
 
@@ -1167,7 +1167,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('loses the write-chain race to another checkpoint that lands while the guard is pending', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('epoch-race'), 9)
+    const meta = headerOf(brandString<SessionId>('epoch-race'), 9)
     const gate = Promise.withResolvers<undefined>()
 
     const slow = cache.coldSnapshotDurable(
@@ -1188,7 +1188,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('refuses to write while the session is live', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('live-cold-write'), 9)
+    const meta = headerOf(brandString<SessionId>('live-cold-write'), 9)
     ctx.sessions.create(meta.id, { meta: { createdAt: meta.createdAt } })
 
     expect(await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog()))
@@ -1198,7 +1198,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
   it('writes a negative marker for an empty stored log', async () => {
     const { ctx, cache } = await harness()
     await ctx.sessionProjections.register(titleUnit)
-    const meta = headerOf(SessionId('empty-cold'), 9)
+    const meta = headerOf(brandString<SessionId>('empty-cold'), 9)
 
     const snapshot = await cache.coldSnapshotDurable(meta, SessionLogOffset(0), -1, [])
 
@@ -1208,7 +1208,7 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
 
   it('rejects when the durable write itself fails', async () => {
     const { cache, root } = await harness()
-    const meta = headerOf(SessionId('durable-failure'), 9)
+    const meta = headerOf(brandString<SessionId>('durable-failure'), 9)
     // A directory where the record document must land makes the put fail.
     await mkdir(recordPath(root, meta.id), { recursive: true })
     await expect(cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog()))

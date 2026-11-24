@@ -66,7 +66,7 @@ it.each(['set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'set_ver
   const { ctx, manager, call } = await fixture('workspace-write', 'ask')
   const prompted = vi.fn(async () => 'allowed-once' as const)
   ctx.on('approval/request', prompted)
-  const id = SessionId('dsh-im-session-self-reload')
+  const id = brandString<SessionId>('dsh-im-session-self-reload')
   const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })
   const agent = { session } as unknown as Agent
   const result = await call({ action, target: 'unrelated@1.0.0', enabled: true, runtimeVersion: 'test' }, agent)
@@ -78,16 +78,16 @@ it.each(['set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle', 'set_ver
 
 it.each(['list_plugins', 'list_bundles', 'list_version_exemptions'])('keeps IM %s available under existing permissions', async (action) => {
   const { call } = await fixture()
-  const id = SessionId('dsh-im-session-read-only-management')
+  const id = brandString<SessionId>('dsh-im-session-read-only-management')
   const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false })
   expect((await call({ action }, { session } as unknown as Agent)).isError).toBe(false)
 })
 
 it('refuses a child whose IM parent is not attached', async () => {
   const { call, manager } = await fixture()
-  const id = SessionId('self-reload-child')
+  const id = brandString<SessionId>('self-reload-child')
   const session = Session.create(id, undefined, { version: SESSION_FORMAT_VERSION, id, createdAt: 0, isSeeded: false,
-    parentSession: SessionId('dsh-im-session-unloaded-parent'), origin: 'subagent' })
+    parentSession: brandString<SessionId>('dsh-im-session-unloaded-parent'), origin: 'subagent' })
   const result = await call({ action: 'set_bundle', target: 'unrelated', enabled: true }, { session } as unknown as Agent)
   expect(result.isError).toBe(true)
   expect(manager.setBundleEnabled).not.toHaveBeenCalled()
