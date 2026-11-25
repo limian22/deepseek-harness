@@ -17,7 +17,7 @@ import type { GenericCallView, SearchResultView, ToolResult } from '@deepseek-ai
 import type { RetainedItems } from '@deepseek-ai/dsh-output-retention'
 import type { SpillRef } from '@deepseek-ai/dsh-spill'
 import type { GrepMatch } from './search-core.ts'
-import { SearchError, previewLine, retainGrepMatches, runRipgrep, toWorkdirRelative, trySaveFormattedResult } from './search-core.ts'
+import { SearchError, previewLine, retainGrepMatches, runRipgrep, scopeSearchGlob, toWorkdirRelative, trySaveFormattedResult } from './search-core.ts'
 import { grepSearchMeta, searchViewFromMeta } from './presentation.ts'
 import { acceptedDirectCallValue } from './direct-call.ts'
 
@@ -291,7 +291,7 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
     parameters: {
       pattern: { type: 'string', required: true, description: 'Regular expression to search for (ripgrep syntax).' },
       path: { type: 'string', description: 'File or directory to search. Defaults to the session workspace; a relative path resolves against it.' },
-      include: { type: 'string', description: 'One glob filter for which files to search (e.g. "*.ts", "*.{js,jsx}"). Not a list; negation is not supported.' },
+      include: { type: 'string', description: 'One positive glob filter (e.g. "*.ts", "src/*.ts"). Slash-bearing filters are anchored to an explicit path inside the session workspace, or to the session workspace when path is omitted; external paths retain ripgrep coordinates.' },
     },
     timeoutMs: caps.timeoutMs,
     // Matches record no file observation; over-cap spilling runs in model-ordered post-execute.
@@ -325,7 +325,7 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
     },
     async execute(args, exec) {
       const input = parseGrepArgs(args)
-      const run = await runRipgrep(ctx, exec, 'grep', buildGrepCommand(input), caps.rawOutputMaxBytes, caps.graceMs, caps.stderrMaxBytes, input.path)
+      const run = await runRipgrep(ctx, exec, 'grep', workdir => buildGrepCommand({ ...input, ...input.include !== undefined ? { include: scopeSearchGlob(input.include, input.path, workdir) } : {} }), caps.rawOutputMaxBytes, caps.graceMs, caps.stderrMaxBytes, input.path)
       if (run.noMatches) return { matches: [] }
 
       const all: GrepMatch[] = []

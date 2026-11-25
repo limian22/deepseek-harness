@@ -11,10 +11,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { sep } from 'node:path'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { ToolArgsError, defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, SearchResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type { SpillRef } from '@deepseek-ai/dsh-spill'
-import { runRipgrep, toWorkdirRelative, trySaveFormattedResult } from './search-core.ts'
+import { runRipgrep, scopeSearchGlob, toWorkdirRelative, trySaveFormattedResult } from './search-core.ts'
 import { globSearchMeta, searchViewFromMeta } from './presentation.ts'
 import { acceptedDirectCallValue } from './direct-call.ts'
 
@@ -63,15 +63,15 @@ export interface GlobInput {
 
 /**
  * Validate value constraints the schema DSL can't express: a non-blank
- * `pattern`, and a non-blank `path` when given. Throws a plain `Error` (an
- * ordinary tool argument error) otherwise.
+ * `pattern`, and a non-blank `path` when given. Throws `ToolArgsError`
+ * (`INVALID_ARGS`) otherwise.
  *
  * @param args - the schema-validated `glob` arguments.
  * @returns the accepted input, unchanged.
  */
 export function parseGlobArgs(args: GlobInput): GlobInput {
-  if (args.pattern.trim().length === 0) throw new Error('pattern must be a non-empty string')
-  if (args.path !== undefined && args.path.trim().length === 0) throw new Error('path must be a non-empty string when given')
+  if (args.pattern.trim().length === 0) throw new ToolArgsError(['pattern must be a non-empty string'])
+  if (args.path !== undefined && args.path.trim().length === 0) throw new ToolArgsError(['path must be a non-empty string when given'])
   return args
 }
 
@@ -329,12 +329,13 @@ export function applyGlobTool(ctx: Context, caps: GlobToolCaps): void {
         type: 'string',
         required: true,
         description: 'Glob pattern to match file paths against (e.g. "**/*.ts", "src/**/*.test.js"). '
-          + 'A pattern with no "/" matches the basename at any depth, so "*" and "*.ts" both search the whole tree; include a separator to anchor the depth.',
+          + 'A pattern with no "/" matches the basename at any depth. Slash-bearing patterns are anchored to an explicit path inside the session workspace, or to the session workspace when path is omitted; external paths retain ripgrep coordinates.',
       },
       path: { type: 'string', description: 'Directory to search in. Defaults to the session workspace; a relative path resolves against it.' },
       sort: { type: 'string', enum: ['path', 'modified'], description: 'Order by path (default) or modification time (oldest first).' },
     },
     timeoutMs: caps.timeoutMs,
+    isConcurrencySafe: () => true,
     output: {
       schema: {
         type: 'object',
@@ -352,7 +353,7 @@ export function applyGlobTool(ctx: Context, caps: GlobToolCaps): void {
     },
     async execute(args, exec) {
       const input = parseGlobArgs(args)
-      const run = await runRipgrep(ctx, exec, 'glob', buildGlobCommand(input), caps.rawOutputMaxBytes, caps.graceMs, caps.stderrMaxBytes, input.path)
+      const run = await runRipgrep(ctx, exec, 'glob', workdir => buildGlobCommand({ ...input, pattern: scopeSearchGlob(input.pattern, input.path, workdir) }), caps.rawOutputMaxBytes, caps.graceMs, caps.stderrMaxBytes, input.path)
       const root = input.path === undefined ? '.' : toWorkdirRelative(input.path, run.workdir)
       if (run.noMatches) return { root, paths: [] }
 

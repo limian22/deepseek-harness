@@ -82,6 +82,62 @@ describe('search tools over the real subprocess service + the packaged rg', () =
     await rm(dir, { recursive: true, force: true })
   })
 
+  it.each(['glob', 'grep'])('%s anchors directory filters to an explicit in-workspace root', async (name) => {
+    await mkdir(join(dir, '[project]', 'src'), { recursive: true })
+    await mkdir(join(dir, '[project]', 'nested', 'src'), { recursive: true })
+    await mkdir(join(dir, 'sibling', 'src'), { recursive: true })
+    await writeFile(join(dir, '[project]', 'src', 'one.ts'), 'marker\n')
+    await writeFile(join(dir, '[project]', 'nested', 'src', 'two.ts'), 'marker\n')
+    await writeFile(join(dir, 'sibling', 'src', 'three.ts'), 'marker\n')
+    for (const path of ['[project]', join(dir, '[project]')]) {
+      const args = name === 'glob' ? { path, pattern: 'src/*.ts' } : { path, pattern: 'marker', include: 'src/*.ts' }
+      const result = await call(name, args, agent())
+      expect(result.isError).toBe(false)
+      expect(text(result)).toContain(join('[project]', 'src', 'one.ts'))
+      expect(text(result)).not.toContain('two.ts')
+      expect(text(result)).not.toContain('three.ts')
+    }
+  })
+
+  it.each(['glob', 'grep'])('%s preserves depth, basename, ignore rules and output coordinates', async (name) => {
+    await mkdir(join(dir, 'project', 'src'), { recursive: true })
+    await mkdir(join(dir, 'project', 'nested', 'src'), { recursive: true })
+    await writeFile(join(dir, 'project', 'src', 'a.ts'), 'marker\n')
+    await writeFile(join(dir, 'project', 'nested', 'src', 'b.ts'), 'marker\n')
+    await writeFile(join(dir, 'project', 'src', 'ignored.ts'), 'marker\n')
+    await writeFile(join(dir, '.gitignore'), 'project/src/ignored.ts\n')
+    const run = async (filter: string) => call(name, name === 'glob'
+      ? { path: 'project', pattern: filter }
+      : { path: 'project', pattern: 'marker', include: filter }, agent())
+    const direct = text(await run('/src/*.ts'))
+    expect(direct).toContain(join('project', 'src', 'a.ts'))
+    expect(direct).not.toContain('b.ts')
+    // Positive ripgrep globs can override ignore rules; compare with the same
+    // filter relative to a session whose cwd is the explicit root.
+    const control = await call(name, name === 'glob'
+      ? { pattern: '/src/*.ts' }
+      : { pattern: 'marker', include: '/src/*.ts' },
+    { session: { header: { id: 'control', cwd: join(dir, 'project') } } })
+    expect(direct.includes('ignored.ts')).toBe(text(control).includes('ignored.ts'))
+    const recursive = text(await run('**/src/*.ts'))
+    expect(recursive).toContain(join('project', 'nested', 'src', 'b.ts'))
+    const basename = text(await run('*.ts'))
+    expect(basename).toContain(join('project', 'nested', 'src', 'b.ts'))
+    if (name === 'grep') expect(direct).toContain('Line 1: marker')
+  }, 15_000)
+
+  it('keeps scoped glob negation and rejects grep negation', async () => {
+    await mkdir(join(dir, 'project', 'src'), { recursive: true })
+    await mkdir(join(dir, 'project', 'other'), { recursive: true })
+    await writeFile(join(dir, 'project', 'src', 'a.ts'), 'marker\n')
+    await writeFile(join(dir, 'project', 'other', 'b.ts'), 'marker\n')
+    const result = await call('glob', { path: 'project', pattern: '!src/*.ts' }, agent())
+    expect(text(result)).not.toContain('a.ts')
+    expect(text(result)).toContain('b.ts')
+    const rejected = await call('grep', { path: 'project', pattern: 'marker', include: '!src/*.ts' }, agent())
+    expect(rejected.error).toMatchObject({ info: { code: 'INVALID_ARGS' } })
+  })
+
   describe('glob', () => {
     it('prunes unrelated directories and preserves workspace-relative results', async () => {
       await mkdir(join(dir, 'packages', 'core', 'src', 'nested'), { recursive: true })

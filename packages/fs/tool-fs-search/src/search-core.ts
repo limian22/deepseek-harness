@@ -216,7 +216,7 @@ export async function runRipgrep(
   ctx: Context,
   exec: ToolExecution,
   toolName: string,
-  argv: readonly string[],
+  argv: readonly string[] | ((workdir: string) => readonly string[]),
   rawOutputMaxBytes: number,
   graceMs: number,
   stderrMaxBytes: number,
@@ -231,7 +231,7 @@ export async function runRipgrep(
   let handle: SubprocessHandle
   try {
     handle = await spawnRipgrep(ctx.subprocess, {
-      argv,
+      argv: typeof argv === 'function' ? argv(workdir) : argv,
       cwd: workdir,
       stdio: {
         stdin: 'ignore',
@@ -278,6 +278,24 @@ export async function runRipgrep(
   }
   const text = completeStdout(toolName, stdout, rawOutputMaxBytes)
   return { stdout: text, noMatches: outcome.exitCode === 1, workdir }
+}
+
+/** Anchor a slash-bearing filter to an explicit root inside the session cwd.
+ * External roots retain the existing ripgrep semantics; changing cwd would also
+ * change ignore discovery and executor behavior. No filesystem probing is used.
+ */
+export function scopeSearchGlob(pattern: string, target: string | undefined, workdir: string): string {
+  if (target === undefined || !pattern.includes('/')) return pattern
+  const rel = relative(workdir, resolve(workdir, target))
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return pattern
+  const prefix = rel.split(sep).map(part => part.replace(/[\[\]*?{}\\]/g, (char) => {
+    if (char === '[') return '[[]'
+    if (char === ']') return '[]]'
+    return `\\${char}`
+  })).join('/')
+  const negative = pattern.startsWith('!')
+  const body = negative ? pattern.slice(1) : pattern
+  return `${negative ? '!' : ''}/${prefix}/${body.replace(/^\//, '')}`
 }
 
 /**
