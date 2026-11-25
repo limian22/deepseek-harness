@@ -27,6 +27,7 @@ import type { RetainedItems } from '@deepseek-ai/dsh-output-retention'
 import { spawnRipgrep } from '@deepseek-ai/dsh-util-ripgrep'
 import type { SubprocessHandle, SubprocessOutcome, SubprocessOutputRead } from '@deepseek-ai/dsh-subprocess'
 import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
+import { ToolArgsError } from '@deepseek-ai/dsh-tools'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 
 /**
@@ -228,10 +229,11 @@ export async function runRipgrep(
   const workdir = exec.agent === undefined
     ? process.cwd()
     : await ctx.workingDirectory.ensure(exec.agent, exec.signal)
+  const resolvedArgv = typeof argv === 'function' ? argv(workdir) : argv
   let handle: SubprocessHandle
   try {
     handle = await spawnRipgrep(ctx.subprocess, {
-      argv: typeof argv === 'function' ? argv(workdir) : argv,
+      argv: resolvedArgv,
       cwd: workdir,
       stdio: {
         stdin: 'ignore',
@@ -287,7 +289,12 @@ export async function runRipgrep(
 export function scopeSearchGlob(pattern: string, target: string | undefined, workdir: string): string {
   if (target === undefined || !pattern.includes('/')) return pattern
   const rel = relative(workdir, resolve(workdir, target))
-  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return pattern
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return pattern
+  const segments = target.split(sep === '\\' ? /[\\/]/ : /\//)
+  if (segments.includes('..')) {
+    throw new ToolArgsError(['path must not contain parent segments (..) when used with a slash-bearing glob; provide a verified path without them'])
+  }
+  if (!rel) return pattern
   const prefix = rel.split(sep).map(part => part.replace(/[\[\]*?{}\\]/g, (char) => {
     if (char === '[') return '[[]'
     if (char === ']') return '[]]'

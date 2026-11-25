@@ -331,7 +331,7 @@ export function applyGlobTool(ctx: Context, caps: GlobToolCaps): void {
         description: 'Glob pattern to match file paths against (e.g. "**/*.ts", "src/**/*.test.js"). '
           + 'A pattern with no "/" matches the basename at any depth. Slash-bearing patterns are anchored to an explicit path inside the session workspace, or to the session workspace when path is omitted; external paths retain ripgrep coordinates.',
       },
-      path: { type: 'string', description: 'Directory to search in. Defaults to the session workspace; a relative path resolves against it.' },
+      path: { type: 'string', description: 'Directory to search in. Defaults to the session workspace; a relative path resolves against it. For slash-bearing patterns, in-workspace paths cannot contain .. segments.' },
       sort: { type: 'string', enum: ['path', 'modified'], description: 'Order by path (default) or modification time (oldest first).' },
     },
     timeoutMs: caps.timeoutMs,

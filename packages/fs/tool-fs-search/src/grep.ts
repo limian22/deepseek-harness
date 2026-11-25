@@ -290,7 +290,7 @@ export function applyGrepTool(ctx: Context, caps: GrepToolCaps): void {
       + `Returns up to ${caps.maxMatches} matches; a larger result reports where the complete match list was saved.`,
     parameters: {
       pattern: { type: 'string', required: true, description: 'Regular expression to search for (ripgrep syntax).' },
-      path: { type: 'string', description: 'File or directory to search. Defaults to the session workspace; a relative path resolves against it.' },
+      path: { type: 'string', description: 'File or directory to search. Defaults to the session workspace; a relative path resolves against it. For slash-bearing includes, in-workspace paths cannot contain .. segments.' },
       include: { type: 'string', description: 'One positive glob filter (e.g. "*.ts", "src/*.ts"). Slash-bearing filters are anchored to an explicit path inside the session workspace, or to the session workspace when path is omitted; external paths retain ripgrep coordinates.' },
     },
     timeoutMs: caps.timeoutMs,

@@ -126,6 +126,32 @@ describe('search tools over the real subprocess service + the packaged rg', () =
     if (name === 'grep') expect(direct).toContain('Line 1: marker')
   }, 15_000)
 
+  it.each(['glob', 'grep'])('%s requires migrating the old cwd-anchored workaround', async (name) => {
+    await mkdir(join(dir, 'project', 'src'), { recursive: true })
+    await writeFile(join(dir, 'project', 'src', 'a.ts'), 'marker\n')
+    const oldArgs = name === 'glob'
+      ? { path: 'project', pattern: '/project/src/*.ts' }
+      : { path: 'project', pattern: 'marker', include: '/project/src/*.ts' }
+    const newArgs = name === 'glob'
+      ? { path: 'project', pattern: 'src/*.ts' }
+      : { path: 'project', pattern: 'marker', include: 'src/*.ts' }
+    expect(text(await call(name, oldArgs, agent()))).toMatch(/^No (files|matches) found/)
+    expect(text(await call(name, newArgs, agent()))).toContain(join('project', 'src', 'a.ts'))
+  })
+
+  it.each(['glob', 'grep'])('%s rejects parent segments in an in-workspace target with a slash filter', async (name) => {
+    await mkdir(join(dir, 'other'), { recursive: true })
+    await mkdir(join(dir, 'project', 'src'), { recursive: true })
+    await writeFile(join(dir, 'project', 'src', 'a.ts'), 'marker\n')
+    const path = `other${sep}..${sep}project`
+    const result = await call(name, name === 'glob'
+      ? { path, pattern: 'src/*.ts' }
+      : { path, pattern: 'marker', include: 'src/*.ts' }, agent())
+    expect(result.isError).toBe(true)
+    expect(result.error).toMatchObject({ info: { name: 'ToolArgsError', code: 'INVALID_ARGS' } })
+    expect(text(result)).toContain('parent segments')
+  })
+
   it('keeps scoped glob negation and rejects grep negation', async () => {
     await mkdir(join(dir, 'project', 'src'), { recursive: true })
     await mkdir(join(dir, 'project', 'other'), { recursive: true })
