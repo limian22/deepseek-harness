@@ -68,7 +68,7 @@ describe('tool-session-query with the real SQLite provider', () => {
       seq: SessionSeq(0),
       time: 2,
       data: createUserMessage({
-        content: [{ type: 'text', text: 'persisted integration needle' }],
+        content: [{ type: 'text', text: 'persisted integration needle 请分析这个刑事案件' }],
         source: { kind: 'user' },
       }),
       surfaceOp: 'append',
@@ -82,7 +82,7 @@ describe('tool-session-query with the real SQLite provider', () => {
     caller.append(
       'user/message',
       createUserMessage({
-        content: [{ type: 'text', text: 'live integration needle' }], source: { kind: 'user' },
+        content: [{ type: 'text', text: 'live integration needle 这里有一个刑事案件' }], source: { kind: 'user' },
       }),
       { surfaceOp: 'append' },
     )
@@ -112,6 +112,16 @@ describe('tool-session-query with the real SQLite provider', () => {
     expect(liveEvents.isError).toBe(false)
     expect(liveEvents.content.map(block => block.type === 'text' ? block.text : '').join('\n'))
       .toContain('seq 1')
+
+    const cjkSessions = await execute('session_search', { query: '刑事', event_types: ['user/message'] })
+    expect(cjkSessions.isError).toBe(false)
+    const cjkSessionsText = cjkSessions.content.map(block => block.type === 'text' ? block.text : '').join('\n')
+    expect(cjkSessionsText).toContain('Session persisted')
+    expect(cjkSessionsText).not.toContain('Session caller')
+    const cjkEvents = await execute('session_event_search', { query: '刑事', seq_from: 1, seq_to: 1 })
+    expect(cjkEvents.isError).toBe(false)
+    expect(cjkEvents.content.map(block => block.type === 'text' ? block.text : '').join('\n'))
+      .toContain('这里有一个刑事案件')
 
     const sameWorkspace = ctx.sessions.create(brandString<SessionId>('same-workspace'), {
       meta: { createdAt: 11, cwd: '/work' },
