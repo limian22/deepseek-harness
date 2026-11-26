@@ -65,6 +65,7 @@ import {
   quoteFtsData,
   requestFingerprint,
   sanitizeFtsText,
+  segmentHan,
   SQLITE_MAX_PAGE_LIMIT,
 } from './query.ts'
 
@@ -1565,7 +1566,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     for (const document of entry.documents) {
       const text = sanitizeFtsText(document.text)
       insert.run(
-        text,
+        segmentHan(text),
         document.sessionId,
         document.seq,
         document.type,
@@ -1615,7 +1616,13 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       }
       const text = sanitizeFtsText(document.text)
       const { lastInsertRowid } = insert.run(
-        text, document.sessionId, document.seq, document.type, document.time, document.surface, Array.from(text).length,
+        segmentHan(text),
+        document.sessionId,
+        document.seq,
+        document.type,
+        document.time,
+        document.surface,
+        Array.from(text).length,
       )
       next.set(document.seq, { rowid: lastInsertRowid, surface: document.surface })
     }

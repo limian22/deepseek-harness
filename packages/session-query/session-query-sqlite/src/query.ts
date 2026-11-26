@@ -19,6 +19,8 @@ import type {
 export const FTS_HIGHLIGHT_START = '\uFDD0'
 /** Collision-free marker inserted after an FTS5 match by `highlight()`. */
 export const FTS_HIGHLIGHT_END = '\uFDD1'
+/** Collision-free separator between Han tokens. */
+export const FTS_HAN_SEPARATOR = '\uFDD2'
 
 /** Largest page size whose internal lookahead remains an exact SQLite integer binding. */
 export const SQLITE_MAX_PAGE_LIMIT = Number.MAX_SAFE_INTEGER - 1
@@ -225,7 +227,18 @@ export function buildEventWhere(filters: readonly SessionEventMetadataFilter[]):
  * @returns FTS5 expression containing one escaped literal phrase.
  */
 export function quoteFtsData(query: string): string {
-  return `"${query.replaceAll('"', '""')}"`
+  return `"${segmentHan(query).replaceAll('"', '""')}"`
+}
+
+/**
+ * Make each Han code point a separate token while preserving adjacent non-Han text.
+ * @param text - sanitized document or query text.
+ * @returns text with reserved separators at Han token boundaries.
+ */
+export function segmentHan(text: string): string {
+  return text.replace(/\p{Script=Han}+/gu, run => (
+    FTS_HAN_SEPARATOR + Array.from(run).join(FTS_HAN_SEPARATOR) + FTS_HAN_SEPARATOR
+  ))
 }
 
 /**
@@ -238,6 +251,7 @@ export function sanitizeFtsText(text: string): string {
     .replaceAll('\0', '\uFFFD')
     .replaceAll(FTS_HIGHLIGHT_START, '\uFFFD')
     .replaceAll(FTS_HIGHLIGHT_END, '\uFFFD')
+    .replaceAll(FTS_HAN_SEPARATOR, '\uFFFD')
 }
 
 /**
@@ -307,7 +321,7 @@ function normalizeMarkedText(markedText: string): { text: string; matchStart: nu
       matchStart ??= characters.length
       continue
     }
-    if (character === FTS_HIGHLIGHT_END) continue
+    if (character === FTS_HIGHLIGHT_END || character === FTS_HAN_SEPARATOR) continue
     if (/\s/u.test(character)) {
       if (characters.length > 0 && characters.at(-1) !== ' ') characters.push(' ')
     } else {

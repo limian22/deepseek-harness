@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Add ranked SQLite FTS5 search across or within sessions with cursor pagination. Live and persisted history use a separate, single-owner derived index without changing source logs; exact reads, filters and traces remain available. Search is opt-in, with startup, first-search or disabled opening. Matches are tokens and phrases, not arbitrary substrings. The default `on-search` mode reconciles before answering; `syncMode: background` returns indexed history immediately, synchronizes in an owned background task and reports freshness through `coverage`.
+Add ranked SQLite FTS5 search across or within sessions with cursor pagination. Live and persisted history use a separate, single-owner derived index without changing source logs; exact reads, filters and traces remain available. Search is opt-in, with startup, first-search or disabled opening. Search matches phrases of adjacent tokens, including individual Han characters. The default `on-search` mode reconciles before answering; `syncMode: background` returns indexed history immediately, synchronizes in an owned background task and reports freshness through `coverage`.
 
 ## Table of Contents
 
@@ -66,7 +66,7 @@ Ranking is deterministic: more actual FTS5 highlighted-match spans first, then s
 
 A caller that reads several pages while other sessions keep writing can pass `snapshot: true`. The first page captures the complete ranking (at most 500 hits) and returns a snapshot cursor, so later pages read that capture and concurrent writes never invalidate the rest of the search. A capture stays continuable for two minutes, and each scope retains at most eight captures and 32 MiB of hits; expired or evicted captures fail with `SESSION_QUERY_STALE_CURSOR` exactly like a changed corpus. A result set larger than the cap falls back to generation-bound cursors instead of silently truncating.
 
-The `unicode61` tokenizer matches tokens and phrases, not arbitrary substrings: `AI` does not match the token `BRAID`. Use `ctx.sessionQuery.filterEvents()` with a `text` clause when a literal whitespace-flexible substring scan is required.
+The index separates each Han character into its own token, so `文检` finds `中文检索`. The `unicode61` tokenizer still matches other text by whole tokens and ignores token-separating punctuation in phrases. For example, `AI` requires its own token. Use `ctx.sessionQuery.filterEvents()` with a `text` clause for a literal, whitespace-flexible substring scan.
 
 ### Background synchronization
 
@@ -108,7 +108,7 @@ The backend is built on one separation and three commitments:
 - **Live-preferred observation.** One serialized state machine compares persistence snapshot revisions, reads only new or changed logs through short-lived read handles, and reconciles in one transaction, so a search reflects the newest stable state.
 - **Generation-bound cursors.** Every corpus change bumps a generation; cursors carry the generation they were created under and fail stale rather than returning a shifted page.
 - **Opt-in captured pagination.** A `snapshot: true` search captures its ranking once, so a caller reading several pages is not invalidated by writes elsewhere; captures are bounded by age, count, and bytes, and an oversized result set keeps the generation-bound behavior.
-- **Literal phrases as data.** Caller query text is quoted into one FTS5 phrase so query syntax stays inert, and reserved highlight markers are stripped from documents before indexing.
+- **Literal phrases as data.** Caller query text is quoted into one FTS5 phrase so query syntax stays inert. Documents and queries replace input occurrences of reserved characters before adding Han separators. Snippets discard the separators and highlight markers, and ranking uses the original document length.
 
 The design history lives in the [SQLite FTS5 session search note](../../../.agents/notes/archived/feature/2026-07-10-sqlite-session-query-provider.md) and the [unified service decision](../../../.agents/notes/archived/architecture/2026-07-23-unified-session-query-service.md).
 
@@ -130,7 +130,7 @@ Background mode keeps the same tables and live overlay but moves the observation
 
 ### Schema ownership
 
-The database carries an application id and schema version 9, which adds the `sync_sessions` ledger beside the persisted and live tables. Opening refuses a file owned by another application or a canonical database, rejects unknown user tables, and only a recognized incompatible derived schema resets in place — so an unrelated or session-persistence database is never touched. On POSIX filesystems, missing directories and database files are created owner-only (`0700` and `0600` before the process umask). Each path is claimed through a `<path>.owner.sqlite` sidecar opened in SQLite's exclusive locking mode: exactly one service in one process owns a derived-index path, the main database stays readable under WAL by other connections, a second claim fails with a diagnosable error, and the operating system releases the claim when the owning process exits. The sidecar is never deleted. Generations and TEMP shadow state are connection-owned.
+The database carries an application id and schema version 10. Opening a version 9 index resets its derived tables. The next synchronization rebuilds the searchable text from source logs with Han token boundaries. Opening refuses a file owned by another application or a canonical database, rejects unknown user tables, and only a recognized incompatible derived schema resets in place — so an unrelated or session-persistence database is never touched. On POSIX filesystems, missing directories and database files are created owner-only (`0700` and `0600` before the process umask). Each path is claimed through a `<path>.owner.sqlite` sidecar opened in SQLite's exclusive locking mode: exactly one service in one process owns a derived-index path, the main database stays readable under WAL by other connections, a second claim fails with a diagnosable error, and the operating system releases the claim when the owning process exits. The sidecar is never deleted. Generations and TEMP shadow state are connection-owned.
 
 </details>
 

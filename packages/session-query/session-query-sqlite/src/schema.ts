@@ -4,9 +4,12 @@ import type { DatabaseSync } from 'node:sqlite'
 import { open } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { claimIndexOwnership } from './ownership.ts'
+import { FTS_HAN_SEPARATOR } from './query.ts'
 
 /** Current derived-index schema version. Incompatible versions reset in place. */
-export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 9
+export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 10
+
+const FTS_TOKENIZER = `'unicode61 separators ''${FTS_HAN_SEPARATOR}'''`
 
 /** SQLite application id protecting unrelated databases from derived resets. */
 export const SESSION_QUERY_SQLITE_APPLICATION_ID = 0x44534851
@@ -163,7 +166,7 @@ function ensurePersistentSchema(db: DatabaseSync): void {
       time UNINDEXED,
       surface UNINDEXED,
       codepoint_length UNINDEXED,
-      tokenize = 'unicode61'
+      tokenize = ${FTS_TOKENIZER}
     )
   `)
   // Sources known from a completed listing that are not searchable yet: covered
@@ -215,7 +218,7 @@ function ensureTemporarySchema(db: DatabaseSync): void {
       time UNINDEXED,
       surface UNINDEXED,
       codepoint_length UNINDEXED,
-      tokenize = 'unicode61'
+      tokenize = ${FTS_TOKENIZER}
     )
   `)
 }

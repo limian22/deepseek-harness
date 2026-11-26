@@ -55,7 +55,7 @@ describe('dsh-session-query-sqlite real Loader path', () => {
       seq: SessionSeq(0),
       time: 10,
       data: createUserMessage({
-        content: [{ type: 'text', text: 'real Loader needle' }], source: { kind: 'user' },
+        content: [{ type: 'text', text: 'real Loader needle 中文检索示例' }], source: { kind: 'user' },
       }),
       surfaceOp: 'append',
     }])
@@ -63,6 +63,10 @@ describe('dsh-session-query-sqlite real Loader path', () => {
 
     await expect(ctx.sessionQuery.searchSessions({ query: 'Loader needle' }))
       .resolves.toMatchObject({ items: [{ header: { id }, persisted: true, live: false }] })
+    await expect(ctx.sessionQuery.searchSessions({ query: '文检' }))
+      .resolves.toMatchObject({ items: [{
+        header: { id }, persisted: true, live: false, bestMatch: { snippet: 'real Loader needle 中文检索示例' },
+      }] })
     await expect(ctx.sessionQuery.listSessions())
       .resolves.toMatchObject([{ header: { id }, persisted: true, live: false }])
     await query.dispose()

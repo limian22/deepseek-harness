@@ -469,6 +469,77 @@ describe('SQLite session search', () => {
       .resolves.toMatchObject({ items: [{ header: session.header, live: true, persisted: false }] })
   })
 
+  it.each([
+    ['文', '文'],
+    ['文检', '文检'],
+    ['文检𠀀索', '文检𠀀索'],
+    ['检𠀀索，报告', '检𠀀索，报告'],
+    ['检𠀀索报告', '检𠀀索，报告'],
+    ['CAFE前缀', 'café前缀'],
+  ])('matches the live phrase %s inside mixed text', async (query, matchedText) => {
+    const ctx = await liveContext({ path: ':memory:', snippetChars: 16 })
+    try {
+      const text = `${'filler '.repeat(10)}café前缀中文检𠀀索，报告后缀`
+      const session = ctx.sessions.create(SessionId('live-cjk'), { seed: messageEvents(text, 10) })
+      const events = await ctx.sessionQuery.searchEvents({ sessionId: session.id, query })
+      expect(events.items).toHaveLength(1)
+      expect(events.items[0]!.snippet).toContain(matchedText)
+      expect(events.items[0]!.snippet).not.toMatch(/[\uFDD0-\uFDD2]/u)
+      expect(Array.from(events.items[0]!.snippet).length).toBeLessThanOrEqual(16)
+      await expect(ctx.sessionQuery.searchSessions({ query })).resolves.toMatchObject({
+        items: [{ header: { id: session.id }, bestMatch: { snippet: events.items[0]!.snippet } }],
+      })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('applies session, event type, and time predicates to Han matches', async () => {
+    const ctx = await liveContext()
+    try {
+      const session = ctx.sessions.create(SessionId('target'), {
+        seed: [
+          ...messageEvents('中文检索案例', 10),
+          { type: 'turn/end', seq: SessionSeq(1), time: 10, data: {
+            turn: 1, reason: { kind: 'error', error: { message: '中文检索', code: 'UNKNOWN' } },
+          } },
+        ],
+      })
+      const peer = ctx.sessions.create(SessionId('peer'), { seed: messageEvents('中文检索', 10) })
+      const query = '文检'
+      const filters = [{ kind: 'type', values: ['user/message'] }, { kind: 'time', from: 10, to: 10 }] as const
+      await expect(ctx.sessionQuery.searchSessions({
+        query, sessionFilters: [{ kind: 'id', values: [session.id] }], eventFilters: filters,
+      })).resolves.toMatchObject({ items: [{ header: { id: session.id }, bestMatch: { seq: SessionSeq(0) } }] })
+      await expect(ctx.sessionQuery.searchEvents({ sessionId: session.id, query, filters }))
+        .resolves.toMatchObject({ items: [{ sessionId: session.id, seq: SessionSeq(0) }] })
+      await expect(ctx.sessionQuery.searchEvents({ sessionId: peer.id, query, filters: [{ kind: 'time', from: 11 }] }))
+        .resolves.toMatchObject({ items: [] })
+      await expect(ctx.sessionQuery.searchSessions({ query: '文索' })).resolves.toMatchObject({ items: [] })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('ranks Han hits by original document length and sanitizes reserved markers', async () => {
+    const ctx = await liveContext()
+    try {
+      const short = ctx.sessions.create(SessionId('han-short'), { seed: messageEvents('前缀中文检索后缀', 10) })
+      const long = ctx.sessions.create(SessionId('han-long'), { seed: messageEvents('abcdefghijkl中文检索', 10) })
+      const marked = ctx.sessions.create(SessionId('han-marked'), {
+        seed: messageEvents('中文检索\uFDD0\uFDD1\uFDD2结束', 10),
+      })
+      const result = await ctx.sessionQuery.searchSessions({ query: '文检' })
+      expect(result.items.map(item => item.header.id)).toEqual([short.id, marked.id, long.id])
+      await expect(ctx.sessionQuery.searchEvents({ sessionId: marked.id, query: '文检\uFDD2索' }))
+        .resolves.toMatchObject({ items: [{ snippet: '中文检索���结束' }] })
+      await expect(ctx.sessionQuery.searchEvents({ sessionId: marked.id, query: '\uFDD2' }))
+        .resolves.toMatchObject({ items: [] })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('excludes assistant reasoning while indexing visible answer text', async () => {
     const ctx = await liveContext()
     const session = ctx.sessions.create(SessionId('reasoning'))
@@ -1839,6 +1910,56 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
       cause: { code: 'ERR_INVALID_ARG_VALUE' },
     })
     expect(ctx.sessionQuery).toBeUndefined()
+  })
+
+  it('rebuilds version 9 stored text for Han search and reuses the index on reopen', async () => {
+    const path = await temporaryPath()
+    const meta = header('stored-cjk')
+    const text = '前缀中文检𠀀索后缀'
+    TestPersistence.reset([{ meta, events: messageEvents(text) }])
+    const owner = await liveContext({ path })
+    try {
+      await owner.plugin(TestPersistence)
+      await owner.sessionQuery.searchSessions({ query: text })
+    } finally {
+      await owner.fiber.dispose()
+    }
+
+    const old = new DatabaseSync(path)
+    try {
+      old.prepare('UPDATE persisted_docs SET text = ?').run(text)
+      old.exec('PRAGMA user_version = 9')
+    } finally {
+      old.close()
+    }
+
+    const query = '文检𠀀'
+    const rebuilt = await liveContext({ path })
+    try {
+      await rebuilt.plugin(TestPersistence)
+      await expect(rebuilt.sessionQuery.searchSessions({ query })).resolves.toMatchObject({
+        items: [{ header: meta, live: false, persisted: true, bestMatch: { snippet: text } }],
+      })
+      expect(TestPersistence.reads.get(meta.id)).toBe(2)
+    } finally {
+      await rebuilt.fiber.dispose()
+    }
+
+    const reopened = await liveContext({ path })
+    try {
+      await reopened.plugin(TestPersistence)
+      await expect(reopened.sessionQuery.searchEvents({ sessionId: meta.id, query }))
+        .resolves.toMatchObject({ items: [{ sessionId: meta.id, snippet: text }] })
+      expect(TestPersistence.reads.get(meta.id)).toBe(2)
+      const db = new DatabaseSync(path, { readOnly: true })
+      try {
+        expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 })
+      } finally {
+        db.close()
+      }
+    } finally {
+      await reopened.fiber.dispose()
+    }
   })
 
   it('resets a recognized incompatible schema but refuses unknown or foreign tables', { timeout: 20_000 }, async () => {
