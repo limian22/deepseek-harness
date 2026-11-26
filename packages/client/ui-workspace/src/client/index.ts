@@ -355,6 +355,7 @@ export function apply(ctx: Context, config: SyncedConfig<WorkspaceNavigationConf
     open: openSession,
     searchSessions,
     searchResultLimit: sessions.searchResultLimit,
+    refreshSessions: () => sessions.refresh(),
     requestSessionRename,
     notifyArchivedNotOpenable: () => { notify({ kind: 'archivedNotOpenable' }) },
     renameWorkspace: async (workspaceId, title) => { await workspaces.rename(workspaceId, title) },

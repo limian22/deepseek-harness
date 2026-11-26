@@ -80,6 +80,48 @@ async function feedList(b: Bench, rows: FeedRow[]): Promise<void> {
 }
 
 describe('list store projection', () => {
+  it('keeps display titles while a reconnect list is pending or failed without restoring old projections', async ({ bench }) => {
+    const b = bench()
+    await feedList(b, [{ id: 's1', projections: { title: 'Before reconnect' } }])
+    const pending = Promise.withResolvers<Awaited<ReturnType<typeof b.mock.remote.session.list>>>()
+    b.unblock.push(() => { pending.resolve(ok({ items: [] })) })
+    b.mock.remote.session.list.mockReturnValueOnce(pending.promise)
+
+    b.svc.handleConnected()
+    const refresh = b.svc.refresh()
+    await Promise.resolve()
+    expect(b.svc.list.getSnapshot().byId[sid('s1')]?.title).toBe('Before reconnect')
+    expect(b.svc.list.getSnapshot()).toMatchObject({ refresh: 'loading' })
+    expect(b.svc.list.getSnapshot().byId[sid('s1')]?.projectionValues?.title).toBeUndefined()
+
+    pending.resolve(err(new RemoteError('gateway/internal', 'listing unavailable', {})))
+    await refresh
+    await Promise.resolve()
+    expect(b.svc.list.getSnapshot().byId[sid('s1')]?.title).toBe('Before reconnect')
+    expect(b.svc.list.getSnapshot()).toMatchObject({ refresh: 'error' })
+
+    await feedList(b, [{ id: 's1' }])
+    expect(b.svc.list.getSnapshot().byId[sid('s1')]?.title).toBeUndefined()
+    expect(b.svc.list.getSnapshot()).not.toHaveProperty('refresh')
+  })
+
+  it('accepts an explicit empty title from the new generation before its list settles', async ({ bench }) => {
+    const b = bench()
+    await feedList(b, [{ id: 's1', projections: { title: 'Old label' } }])
+    const pending = Promise.withResolvers<Awaited<ReturnType<typeof b.mock.remote.session.list>>>()
+    b.unblock.push(() => { pending.resolve(ok({ items: [] })) })
+    b.mock.remote.session.list.mockReturnValueOnce(pending.promise)
+    b.svc.handleConnected()
+    b.svc.handleControlFrame({
+      type: 'baseline', value: { projections: { [sid('s1')]: { asOfSeq: 0, values: { title: null } } } },
+    })
+    await Promise.resolve()
+    expect(b.svc.list.getSnapshot().byId[sid('s1')]?.title).toBeUndefined()
+    expect(b.svc.list.getSnapshot().byId[sid('s1')]?.projectionValues?.title).toBeNull()
+    pending.resolve(ok({ items: [] }))
+    await b.svc.refresh()
+  })
+
   it('publishes format-status changes and preserves a newer update over an in-flight list', async ({ bench }) => {
     const b = bench()
     const historical = {

@@ -147,6 +147,7 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
     open: vi.fn(),
     searchSessions: vi.fn(async () => ({ items: [], hasMore: false })),
     searchResultLimit: 20,
+    refreshSessions: vi.fn(async () => {}),
     useSectionScroller: () => SECTION_SCROLLER,
     notifyArchivedNotOpenable: vi.fn(),
     renameWorkspace: vi.fn(async () => {}),
@@ -175,6 +176,24 @@ function rerender(b: ReturnType<typeof mount>, overrides: Partial<WorkspaceBrows
 }
 
 describe('WorkspaceBrowser', () => {
+  it('reports list refresh state without hiding titles and offers a retry after failure', () => {
+    const rows = [summary('retained-title', 10)]
+    const refreshSessions = vi.fn(async () => {})
+    const browser = mount({
+      useSessions: hook(sessionState(rows, { refresh: 'loading' })),
+      useWorkspaces: hook(workspaceState([workspace('alpha', ['retained-title'])])),
+      refreshSessions,
+    })
+    expect(screen.getByText('正在刷新会话')).toBeTruthy()
+    rerender(browser, { useSessions: hook(sessionState(rows, { refresh: 'error' })) })
+    expect(screen.getByText('会话刷新失败')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '重试刷新会话' }))
+    expect(refreshSessions).toHaveBeenCalledOnce()
+    rerender(browser, { useSessions: hook(sessionState(rows)) })
+    expect(screen.queryByText('会话刷新失败')).toBeNull()
+    expect(screen.queryByRole('button', { name: '重试刷新会话' })).toBeNull()
+  })
+
   it.each(['workspace', 'flat', 'ungrouped'] as const)('passes the standard menu factory through the %s list', (mode) => {
     const preferences = createWorkspaceViewStore().create()
     preferences.actions.setGroupBy(mode === 'flat' ? 'flat' : 'workspace')

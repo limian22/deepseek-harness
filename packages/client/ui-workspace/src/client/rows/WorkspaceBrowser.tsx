@@ -21,7 +21,7 @@ import {
   AnimatedRows, HoverCardGroup, IconArchiveCheckOutlineRegular, IconArchiveOffOutlineRegular, IconArchiveOutlineRegular,
   IconChevronsUpDownOutlineRegular, IconClockOutlineRegular, IconCloseFillRegular,
   IconFlatListOutlineRegular, IconFolderCloseRegular, IconProjectAddOutlineRegular,
-  IconQueueOutlineRegular, IconSearchOutlineRegular, IconSlidersTwoOutlineRegular,
+  IconQueueOutlineRegular, IconRefreshOutlineRegular, IconSearchOutlineRegular, IconSlidersTwoOutlineRegular,
   IconWorkspaceTreeOutlineRegular, Menu, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
@@ -926,6 +926,7 @@ export function WorkspaceBrowser({
   createWorkspace,
   searchSessions,
   searchResultLimit,
+  refreshSessions,
   useDirectoryFlow,
   useHostInfo,
   useShortcuts,
@@ -1232,8 +1233,13 @@ export function WorkspaceBrowser({
     <div className={clsx(css.root, !wide && css.rail)}>
       <div className={clsx(css.sectionHeader, wide && searchSpacingMotionEnabled && css.searchSpacingMotion)} data-sidebar-workspace-header="">
         {wide && (
-          <span className={clsx(css.sectionLabel, css.wide, searchExpanded && css.sectionLabelHidden)}>
-            {groupBy === 'flat' ? t('section.sessions') : t('section.workspaces')}
+          <span
+            className={clsx(css.sectionLabel, css.wide, searchExpanded && css.sectionLabelHidden)}
+            role={list.refresh === undefined ? undefined : 'status'}
+            title={list.refresh === 'loading' ? t('list.refreshing') : list.refresh === 'error' ? t('list.refreshFailed') : undefined}
+          >
+            {list.refresh === 'loading' ? t('list.refreshing') : list.refresh === 'error' ? t('list.refreshFailed')
+              : groupBy === 'flat' ? t('section.sessions') : t('section.workspaces')}
           </span>
         )}
         {wide && (
@@ -1293,7 +1299,21 @@ export function WorkspaceBrowser({
             </div>
           </div>
         )}
-        <div className={clsx(css.headerActions, wide && searchExpanded && css.headerActionsHidden)}>
+        <div className={clsx(css.headerActions, list.refresh === 'error' && css.headerActionsWithRetry, wide && searchExpanded && css.headerActionsHidden)}>
+          {list.refresh === 'error' && (
+            <Tooltip label={t('list.retry')} portal>
+              <button
+                type="button"
+                className={css.iconButton}
+                aria-label={t('list.retry')}
+                onClick={() => {
+                  void refreshSessions().catch((error: unknown) => { console.warn('session listing refresh rejected:', error) })
+                }}
+              >
+                <IconRefreshOutlineRegular size={wide ? 16 : 18} />
+              </button>
+            </Tooltip>
+          )}
           {wide && (
             <ViewOptionsMenu
               groupBy={groupBy}
