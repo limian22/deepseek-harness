@@ -41,6 +41,20 @@ export type RemoteStreamFailureMapper = (error: unknown) => RemoteStreamFailure
 
 const MAX_MISSED_HEARTBEATS = 2
 
+/** Wall-clock overrun beyond the configured interval that proves the Host stalled rather than drifted. */
+const HEARTBEAT_STALL_GRACE_MS = 1_000
+
+/**
+ * Whether one scheduled heartbeat interval arrived late enough that this Host was stalled, so an otherwise live peer
+ * had no opportunity to answer the previous Ping.
+ * @param elapsedMs - Wall-clock time since the previous heartbeat tick.
+ * @param intervalMs - Configured heartbeat interval.
+ * @returns True when the interval overran by more than the stall grace.
+ */
+export function heartbeatIntervalStalled(elapsedMs: number, intervalMs: number): boolean {
+  return elapsedMs > intervalMs + HEARTBEAT_STALL_GRACE_MS
+}
+
 /** Carrier options for {@link RemoteStreamMuxServer}. */
 export interface RemoteStreamMuxServerOptions {
   /** Interval between WebSocket Ping control frames. */
@@ -63,6 +77,8 @@ export class RemoteStreamMuxServer {
   private readonly connections = new Set<Promise<void>>()
   private readonly missedHeartbeats = new WeakMap<WebSocket, number>()
   private heartbeatTimer: NodeJS.Timeout | undefined
+  /** Scheduled time of the previous heartbeat tick, used to recognize a stalled Host. */
+  private heartbeatTickAt = 0
 
   /**
    * @param open - Gateway stream dispatcher.
@@ -134,9 +150,19 @@ export class RemoteStreamMuxServer {
   /** Start one `unref()` timer after the first upgrade; it spans empty-client periods until close(). */
   private startHeartbeat(): void {
     if (this.heartbeatTimer !== undefined) return
+    this.heartbeatTickAt = performance.now()
     this.heartbeatTimer = setInterval(() => {
+      const now = performance.now()
+      // A late tick means this Host could not run its own timer, so a silent peer proves nothing: counting that
+      // silence would terminate healthy connections whenever heavy work stalls the loop.
+      const stalled = heartbeatIntervalStalled(now - this.heartbeatTickAt, this.heartbeatIntervalMs)
+      this.heartbeatTickAt = now
       for (const socket of this.server.clients) {
         if (socket.readyState !== WebSocket.OPEN) continue
+        if (stalled) {
+          socket.ping()
+          continue
+        }
         const missed = this.missedHeartbeats.get(socket) as number
         if (missed >= MAX_MISSED_HEARTBEATS) {
           setImmediate(() => {

@@ -1863,6 +1863,42 @@ it('walks the composed rows once however many layers the profile stacks', async 
   expect(walk.mock.calls.length).toBe(1)
 })
 
+it('re-reads a listing the profile changed while it was reading', async () => {
+  const { manager, dir } = await fixture('startup', false, undefined, {}, undefined, (dir) => {
+    writeBundle(dir, 'late', [{ insert: [{ id: 'late-row', name: './plugin.mjs', disabled: true }] }])
+  })
+  const real = operations.bundleManifest
+  let mutated = false
+  const spy = vi.spyOn(operations, 'bundleManifest').mockImplementation((...args) => {
+    if (!mutated) {
+      mutated = true
+      // The selection changes mid-listing, exactly what the chunked loop lets a concurrent writer do.
+      const manifest = readProfileManifest('test', dir)
+      manifest.dsh = { profile: { bundles: ['core', 'extra', 'late'] } }
+      writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+    }
+    return real(...args)
+  })
+  onTestFinished(() => { spy.mockRestore() })
+  const listed = await manager.listBundles()
+  expect(listed.find(bundle => bundle.name === 'late')).toMatchObject({ enabled: true })
+  expect(listed.find(bundle => bundle.name === 'core')).toMatchObject({ enabled: true })
+  // The answer matches the profile as it stands after the write, not a mixture of both selections.
+  expect(listed.map(bundle => [bundle.name, bundle.enabled])).toEqual(
+    (await manager.listBundles()).map(bundle => [bundle.name, bundle.enabled]),
+  )
+})
+
+it('lists an unchanged profile once', async () => {
+  const { manager } = await fixture('startup')
+  const spy = vi.spyOn(operations, 'bundleManifest')
+  onTestFinished(() => { spy.mockRestore() })
+  await manager.listBundles()
+  const first = spy.mock.calls.length
+  await manager.listBundles()
+  expect(spy.mock.calls.length - first).toBe(first)
+})
+
 it.each([false, true])('applies offline platform admission to an uninstalled Official bundle (selected=%s)', async (selected) => {
   const entry = OFFICIAL_ON_DEMAND_CATALOG[0]!
   const previous = Object.getOwnPropertyDescriptor(entry, 'platforms')

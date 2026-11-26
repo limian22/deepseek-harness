@@ -67,6 +67,25 @@ describe('Remote stream mux server carrier lifecycle', () => {
     await closed
   })
 
+  it('does not count an interval the Host itself overran as a missed heartbeat', async () => {
+    const entry = await startMux(async (_endpoint, _payload, _uplink, _peer, control) => waitForAbort(control.signal), 20)
+    const client = await connect(entry.url)
+    const serverSocket = acceptedSocket(entry.mux)
+    serverSocket.removeAllListeners('pong')
+    const terminated = vi.spyOn(serverSocket, 'terminate')
+    let clock = 1_000
+    // Every read advances well past the interval plus the stall grace, so each tick reports the Host stalled between
+    // ticks while the peer never answers a Ping.
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => { clock += 1_500; return clock })
+
+    try {
+      await pings(client, 4)
+      expect(terminated).not.toHaveBeenCalled()
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('counts inbound frames as liveness while Pong is delayed', async () => {
     const entry = await startMux(async (_endpoint, _payload, _uplink, _peer, control) => waitForAbort(control.signal), 20)
     const client = await connect(entry.url, false)
