@@ -614,16 +614,20 @@ export class ChatViewport {
    * Give reserved room back after acknowledged scrolling or content growth without clamping the reader.
    * Holds still during folds and unsampled movement; following includes the room that remains.
    */
-  reclaimBelow(): void {
+  reclaimBelow(currentScroll?: ViewportScroll): ViewportMetrics | null {
     const elements = this.elements
-    if (elements === null || elements.spacer === null) return
+    if (elements === null || elements.spacer === null) return currentScroll?.metrics ?? null
     const current = this.spacerHeight()
-    if (current === 0 || this.motion.foldActive()) return
-    const scroll = this.readScroll()
+    if (current === 0 || this.motion.foldActive()) return currentScroll?.metrics ?? null
+    const scroll = currentScroll ?? this.readScroll()
     // Trimming the range before sampling could misclassify a reader's move as a layout clamp.
-    if (scroll === null || scroll.movedByReader) return
+    if (scroll === null || scroll.movedByReader) return scroll?.metrics ?? null
     const floorWithoutSpacer = scroll.metrics.floor - current
-    this.setSpacer(Math.min(current, Math.max(0, scroll.metrics.top - floorWithoutSpacer)))
+    const next = Math.min(current, Math.max(0, scroll.metrics.top - floorWithoutSpacer))
+    this.setSpacer(next)
+    return next === current
+      ? scroll.metrics
+      : { ...scroll.metrics, floor: scroll.metrics.floor - current + next }
   }
 
   /**
@@ -941,9 +945,9 @@ export class ChatViewport {
     const metrics = this.metrics()
     if (metrics === null || this.elements === null) return null
     this.observation = { top: metrics.top, landing: null }
-    this.reclaimBelow()
+    const reclaimed = this.reclaimBelow({ metrics, movedByReader: false })
     const landing: ViewportLanding = {
-      metrics: follow.toBottom(this.elements.scroller, scrollMetrics(this.elements.scroller), behavior),
+      metrics: follow.toBottom(this.elements.scroller, reclaimed ?? metrics, behavior),
       position: null,
       turn: this.latestTurn,
     }
