@@ -19,7 +19,7 @@ import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { scheduler } from 'node:timers/promises'
 import { createHash, randomBytes } from 'node:crypto'
-import pLimit, { type LimitFunction } from 'p-limit'
+import pLimit from 'p-limit'
 import {
   SessionPersistence, SessionFormatUnsupportedError,
   SessionPersistenceCorruptionError,
@@ -286,7 +286,7 @@ function isENOENT(error: unknown): boolean {
  * @returns one outcome per item, in input order.
  */
 function settleLimited<T, R>(
-  limit: LimitFunction,
+  limit: <V>(task: () => Promise<V>) => Promise<V>,
   items: readonly T[],
   task: (item: T) => Promise<R>,
 ): Promise<PromiseSettledResult<R>[]> {
@@ -359,9 +359,10 @@ export class JsonlSessionPersistence extends SessionPersistence {
    * this backend (`list()`, the root encoding check, historical fingerprints).
    * Queued tasks of a cancelled listing run and reject at their signal check.
    */
-  private readonly listLimit: LimitFunction
-  // Exact reads should not wait behind a full listing's queued project and Session probes.
-  private readonly lookupLimit: LimitFunction
+  private readonly listLimit: <T>(task: () => Promise<T>) => Promise<T>
+  private readonly lookupLimit: ReturnType<typeof pLimit>
+  private exactOperations = 0
+  private exactIdle: PromiseWithResolvers<void> | undefined
   private rootEncodingCheck: Promise<void> | undefined
   private readonly generationFormat: Omit<JsonlGenerationFormatAdapter, 'createRestore'>
   /**
@@ -410,8 +411,14 @@ export class JsonlSessionPersistence extends SessionPersistence {
     // Resolve once so later process.cwd() changes cannot split one backend across roots.
     this.root = resolve(config.root)
     this.compression = config.compression ?? DEFAULT_COMPRESSION
-    this.listLimit = pLimit(config.listConcurrency ?? DEFAULT_LIST_CONCURRENCY)
-    this.lookupLimit = pLimit(this.listLimit.concurrency)
+    const listLimit = pLimit(config.listConcurrency ?? DEFAULT_LIST_CONCURRENCY)
+    this.lookupLimit = pLimit(listLimit.concurrency)
+    this.listLimit = task => listLimit(async () => {
+      // Already-started probes can finish, but queued scans release filesystem
+      // capacity for exact lookup and cold-body reads.
+      while (this.exactIdle !== undefined) await this.exactIdle.promise
+      return task()
+    })
     this.generationFormat = {
       currentVersion: sessionFormatCatalog.currentVersion,
       encodeHeader: (header, inheritedEventCount) =>
@@ -797,7 +804,7 @@ export class JsonlSessionPersistence extends SessionPersistence {
     if (!this.supportsOpeningIndex() || snapshot.formatStatus !== 'current' || snapshot.header.isSeeded || snapshot.header.origin === 'subagent'
       || location?.kind !== 'jsonl' || this.tracker.hasPending(id) || this.tracker.closeCompletion(id) !== undefined) return undefined
     await this.assertStoredIdentity(location.path, SESSION_FORMAT_VERSION, snapshot.header, id, signal)
-    const captured = await readStableJsonlFile(location.path, signal)
+    const captured = await this.withExactPriority(() => readStableJsonlFile(location.path, signal))
     const after = await stat(location.path, { bigint: true })
     signal?.throwIfAborted()
     return fileRevision(captured.identity) === snapshot.revision && samePhysicalIdentity(captured.identity, after)
@@ -1070,8 +1077,10 @@ export class JsonlSessionPersistence extends SessionPersistence {
       return memoized
     }
     return this.shareLogRead(this.currentReads, expectedId, path, probe, async (innerSignal) => {
-      const { bytes, identity } = await readStableJsonlFile(path, innerSignal)
-      return this.decodeStoredLog(path, expectedId, bytes, fileRevision(identity), innerSignal)
+      return this.withExactPriority(async () => {
+        const { bytes, identity } = await readStableJsonlFile(path, innerSignal)
+        return this.decodeStoredLog(path, expectedId, bytes, fileRevision(identity), innerSignal)
+      })
     }, signal)
   }
 
@@ -1919,19 +1928,35 @@ export class JsonlSessionPersistence extends SessionPersistence {
 
   /** Find the unique authoritative generation for an id across project directories. */
   private async findLog(id: SessionId, signal?: AbortSignal): Promise<ResolvedJsonlGeneration | undefined> {
-    const projects = await this.listProjectDirs(signal)
-    const outcomes = await settleLimited(this.lookupLimit, projects, async (project) => {
+    return this.withExactPriority(async () => {
+      const projects = await this.listProjectDirs(signal)
+      const outcomes = await settleLimited(this.lookupLimit, projects, async (project) => {
+        signal?.throwIfAborted()
+        await this.rejectLegacyFlatArtifact(project, id, signal)
+        signal?.throwIfAborted()
+        return this.resolveGenerationInDirectory(join(project, encodeSegment(id)), signal)
+      })
+      const matches = settledValues(outcomes).filter(selected => selected !== undefined)
+      if (matches.length > 1) {
+        throw new Error(`duplicate JSONL session id "${id}" appears in multiple project directories`)
+      }
       signal?.throwIfAborted()
-      await this.rejectLegacyFlatArtifact(project, id, signal)
-      signal?.throwIfAborted()
-      return this.resolveGenerationInDirectory(join(project, encodeSegment(id)), signal)
+      return matches[0]
     })
-    const matches = settledValues(outcomes).filter(selected => selected !== undefined)
-    if (matches.length > 1) {
-      throw new Error(`duplicate JSONL session id "${id}" appears in multiple project directories`)
+  }
+
+  // An operation holding this gate must never use the listing limiter.
+  private async withExactPriority<T>(operation: () => Promise<T>): Promise<T> {
+    const idle = this.exactIdle ??= Promise.withResolvers<void>()
+    this.exactOperations++
+    try {
+      return await operation()
+    } finally {
+      if (--this.exactOperations === 0) {
+        this.exactIdle = undefined
+        idle.resolve()
+      }
     }
-    signal?.throwIfAborted()
-    return matches[0]
   }
 
   /** Require an existing configured root to be a readable directory. */

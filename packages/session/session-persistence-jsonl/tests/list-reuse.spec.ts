@@ -21,6 +21,7 @@ const io = vi.hoisted(() => ({
   readdir: new Map<string, number>(),
   onStat: undefined as undefined | ((path: string, count: number) => void | Promise<void>),
   onReaddir: undefined as undefined | ((path: string) => Promise<void>),
+  onReadFile: undefined as undefined | ((path: string) => Promise<void>),
   onHandleRead: undefined as undefined | ((path: string) => void | Promise<void>),
 }))
 
@@ -48,6 +49,10 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       }
       return handle
     }),
+    readFile: (async (...args: Parameters<typeof actual.readFile>) => {
+      if (typeof args[0] === 'string') await io.onReadFile?.(args[0])
+      return actual.readFile(...args)
+    }) as typeof actual.readFile,
     stat: (async (...args: Parameters<typeof actual.stat>) => {
       const path = String(args[0])
       const identity = await actual.stat(...args)
@@ -129,6 +134,7 @@ function resetIo(): void {
   io.onStat = undefined
   io.onReaddir = undefined
   io.onHandleRead = undefined
+  io.onReadFile = undefined
   io.enabled = true
 }
 
@@ -161,11 +167,44 @@ afterEach(async () => {
   io.onStat = undefined
   io.onReaddir = undefined
   io.onHandleRead = undefined
+  io.onReadFile = undefined
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
 describe('JsonlSessionPersistence exact project lookup', () => {
+
+  it('pauses queued listing probes while an exact cold read is pending', async () => {
+    const root = await freshRoot()
+    const target = header('foreground', '/project')
+    await seed(root, target)
+    await seed(root, header('background', '/project'))
+    const ctx = await backend(root)
+    await ctx.sessionPersistence.stat(target.id)
+
+    const readPath = currentPath(root, target)
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    resetIo()
+    io.onReadFile = async (path) => {
+      if (path !== readPath) return
+      entered.resolve(undefined)
+      await release.promise
+    }
+    const foreground = ctx.sessionPersistence.open(target.id, 'read')
+    let listing: ReturnType<typeof ctx.sessionPersistence.list> | undefined
+    try {
+      await entered.promise
+      listing = ctx.sessionPersistence.list()
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(count(io.readdir, root)).toBe(1)
+    } finally {
+      release.resolve(undefined)
+      await (await foreground).close()
+      await listing
+    }
+    expect(ids(await listing ?? [])).toEqual(['background', 'foreground'])
+  })
   it.each([false, true])('bounds simultaneous project reads and skips queued probes on abort (%s)', async (cancel) => {
     const root = await freshRoot()
     const target = header('target', '/a')
