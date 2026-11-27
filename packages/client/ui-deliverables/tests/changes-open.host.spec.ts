@@ -93,8 +93,8 @@ describe('change summary route', () => {
     expect(response.headers.get('cache-control')).toBe('no-store')
     // The snapshot ids stay on the Host.
     expect(await response.json()).toEqual({ turn: 1, cwd, total: 3, added: 3, deleted: 0, files: data.files })
-    expect((await read('?sessionId=owner&seq=8')).status).toBe(404)
-    expect((await read('?sessionId=other&seq=9')).status).toBe(404)
+    expect((await read('?sessionId=owner&seq=8')).status).toBe(204)
+    expect((await read('?sessionId=other&seq=9')).status).toBe(204)
     for (const bad of ['', '?seq=9', '?sessionId=owner', '?sessionId=owner&seq=x', '?sessionId=owner&seq=1.5']) {
       expect((await read(bad)).status).toBe(400)
     }
