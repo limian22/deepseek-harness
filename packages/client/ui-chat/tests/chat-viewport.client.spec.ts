@@ -66,7 +66,10 @@ it('updates history distance only from scrollport size observations before layou
   h.viewport.setHistoryEdge(edge)
   expect(height).not.toHaveBeenCalled()
   let afterWrite = false
-  vi.spyOn(h.viewport, 'reclaimBelow').mockImplementation(() => { afterWrite = true })
+  vi.spyOn(h.viewport, 'reclaimBelow').mockImplementation(() => {
+    afterWrite = true
+    return null
+  })
   height.mockImplementation(() => {
     if (afterWrite) throw new Error('height read after a layout writer')
     return 300

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { createMessage } from '@deepseek-ai/dsh-llm'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
-import SessionStore, { SESSION_FORMAT_VERSION, type SessionEvent, type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import SessionStore, { SESSION_FORMAT_VERSION, type SessionEvent, type SessionHeader, type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import * as Jsonl from '@deepseek-ai/dsh-session-persistence-jsonl'
 import ProjectionCache from '@deepseek-ai/dsh-session-projection-cache'
 import Storage from '@deepseek-ai/dsh-storage'
@@ -54,7 +54,7 @@ describe('HistoryController passive reads', () => {
       await ctx.plugin(Jsonl, { root: join(root, 'logs') })
       await ctx.plugin(ProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 60_000 })
       const id = brandString<SessionId>('indexed-history')
-      const header = { id, version: SESSION_FORMAT_VERSION, cwd: root, createdAt: 1, isSeeded: false }
+      const header: SessionHeader = { id, version: SESSION_FORMAT_VERSION, cwd: root, createdAt: 1, isSeeded: false }
       {
         await using writer = await ctx.sessionPersistence.create(header)
         for (let turn = 1; turn <= 55; turn += 1) {
@@ -84,7 +84,7 @@ describe('HistoryController passive reads', () => {
       const full = web.follow({ ...request, maxMessages: 501 }, signal)[Symbol.asyncIterator]()
       expect((await full.next()).value).toEqual({ type: 'snapshot', ...indexed })
       await full.return?.()
-      const writer = await ctx.sessionPersistence.open(id, { access: 'write' })
+      const writer = await ctx.sessionPersistence.open(id, 'write')
       await writer.append([
         { type: 'turn/start', seq: SessionSeq(165), time: 166, data: { turn: 56 } },
         { type: 'turn/end', seq: SessionSeq(166), time: 167, data: { turn: 56, reason: { kind: 'completed' } } },
