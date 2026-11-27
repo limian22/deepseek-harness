@@ -123,7 +123,7 @@ describe('Host Schedule timer', () => {
     expect(test.resolve).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1)
     expect(test.resolve).toHaveBeenCalledWith(ORIGINAL)
-    expect(test.followup).toHaveBeenCalledWith(expect.objectContaining({ source: { kind: 'schedule' } }))
+    expect(test.followup.mock.calls[0]?.[0].source.kind).toBe('schedule')
     expect(test.flush).toHaveBeenCalled()
     expect(test.commit).toHaveBeenCalledTimes(1)
     expect(test.changed).toHaveBeenCalledTimes(1)
@@ -347,15 +347,18 @@ describe('Schedule dispatch failures and concurrent changes', () => {
       task(createAfterScheduleRecord(brandString<ScheduleId>('future-b'), 'Later B', 20, Date.now(), 'Later B')),
     ]
     const test = await setup(records)
+    const other = agentFor(test.ctx, 'other')
+    test.resolve.mockImplementation(async id => ({ agent: id === other.session.id ? other : test.agent }))
     test.runtime.requestDrive()
     await vi.advanceTimersByTimeAsync(0)
-    expect(test.followup).toHaveBeenCalledTimes(2)
+    expect(test.followup).toHaveBeenCalledTimes(1)
+    expect(other.followup).toHaveBeenCalledTimes(1)
     expect(test.commit).toHaveBeenCalledTimes(3)
     expect(test.resolve.mock.calls.map(([id]) => id)).toEqual(['original', 'other'])
     const firstMessage = test.followup.mock.calls[0]?.[0]
     expect(JSON.stringify(firstMessage?.content)).toContain('First')
     expect(JSON.stringify(firstMessage?.content)).toContain('Second')
-    const otherMessage = test.followup.mock.calls[1]![0]
+    const otherMessage = other.followup.mock.calls[0]![0]
     expect(records.slice(0, 3).map(item => item.lastDelivery)).toEqual([
       {
         scheduledAt: '2026-09-16T00:00:00.000Z', deliveredAt: '2026-09-16T00:00:00.000Z',
@@ -389,7 +392,7 @@ describe('Schedule dispatch failures and concurrent changes', () => {
     expect(test.followup).toHaveBeenCalledTimes(1)
     expect(test.flush).toHaveBeenCalledTimes(1)
     const message = test.followup.mock.calls[0]![0]
-    expect(message.source).toEqual({ kind: 'schedule' })
+    expect(message.source).toMatchObject({ kind: 'schedule', occurrences: [{ id: 'daily-batch' }, { id: 'every-batch' }] })
     expect(JSON.stringify(message.content)).toContain('Daily check')
     expect(JSON.stringify(message.content)).toContain('Interval check')
     expect(records).toEqual([

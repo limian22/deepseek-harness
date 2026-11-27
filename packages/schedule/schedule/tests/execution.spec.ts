@@ -18,6 +18,22 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 
 const LIMITS = { retention: { days: 30, records: 200 }, newSessionIntervalMs: 3_600_000 }
 
+function mountReadFixture(ctx: Context): void {
+  ctx.provide('sessionPersistence', {
+    flush: async () => {},
+    open: async (id: SessionId) => {
+      const session = ctx.sessions.get(id)!
+      return {
+        id, inheritedEventCount: session.inheritedEventCount,
+        read: async (offset = 0, length?: number) => ({
+          events: session.snapshotEvents().slice(offset, length === undefined ? undefined : offset + length),
+        }),
+        close: async () => {},
+      }
+    },
+  } as never)
+}
+
 class HangingAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
   readonly complete = Promise.withResolvers<undefined>()
@@ -42,6 +58,7 @@ it('requeues a still-queued delivery after restart instead of enqueuing another 
     await mountAgentLoopTestDependencies(ctx)
     const loop = await mountAgentLoopTestHarness(ctx)
     const agent = await loop.create(brandString<SessionId>('delivery-owner'))
+    mountReadFixture(ctx)
     // Maintenance holds model execution while the production followup still records inbox input.
     const releaseMaintenance = Promise.withResolvers<undefined>()
     const maintenance = agent.runMaintenance(() => releaseMaintenance.promise)
@@ -98,7 +115,8 @@ it('requeues a still-queued delivery after restart instead of enqueuing another 
         }
 
         // A failed recovery flush releases the slot, so the next request requeues the same message again.
-        const failedRecovery = new ScheduleRuntime(ctx, () => tasks, work => work(), commit, () => {}, LIMITS, async () => agent)
+        const admission = { followup: vi.fn(() => { throw new Error('Recovered reminder must not mint a live proof') }) }
+        const failedRecovery = new ScheduleRuntime(ctx, () => tasks, work => work(), commit, () => {}, LIMITS, async () => agent, admission)
         const flush = vi.spyOn(ctx.sessions, 'flush').mockResolvedValueOnce(false)
         try {
           await expect(failedRecovery.runNow(record.id)).rejects.toThrow('did not acknowledge the recovered reminder')
@@ -106,6 +124,7 @@ it('requeues a still-queued delivery after restart instead of enqueuing another 
           expect(await failedRecovery.runNow(record.id)).toMatchObject({ admitted: false })
           expect(failedRecovery.isExecutionActive(record.id)).toBe(true)
           expect(agent.inbox.nextTurn).toEqual(inserted)
+          expect(admission.followup).not.toHaveBeenCalled()
           expect(commit).toHaveBeenCalledTimes(1)
         } finally {
           flush.mockRestore()
@@ -136,6 +155,7 @@ it('holds every recovered batch member before the real driver claims their share
     const adapter = new HangingAdapter()
     ctx.llm.registerAdapter(['mock'], adapter)
     const agent = await loop.create(brandString<SessionId>('batch-owner'), { provider: 'mock', model: 'mock' })
+    mountReadFixture(ctx)
     const message = createUserMessage({ content: [{ type: 'text', text: 'Stored reminder batch' }], source: { kind: 'schedule' } })
     agent.inject(message)
     const receipt = { scheduledAt: '2026-09-15T00:00:01.000Z', deliveredAt: '2026-09-15T00:00:01.000Z',

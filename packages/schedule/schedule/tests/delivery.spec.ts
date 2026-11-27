@@ -18,6 +18,12 @@ it('acknowledges the real synchronous inbox splice after flush without claiming 
     await mountAgentLoopTestDependencies(ctx)
     const loop = await mountAgentLoopTestHarness(ctx)
     const agent = await loop.create(brandString<SessionId>('delivery-owner'))
+    ctx.provide('sessionPersistence', {
+      open: async () => ({
+        id: agent.session.id, inheritedEventCount: 0,
+        read: async () => ({ events: [] }), close: async () => {},
+      }),
+    } as never)
     // Maintenance holds model execution while the production followup still records inbox input.
     const releaseMaintenance = Promise.withResolvers<undefined>()
     const maintenance = agent.runMaintenance(() => releaseMaintenance.promise)
@@ -45,7 +51,7 @@ it('acknowledges the real synchronous inbox splice after flush without claiming 
         expect(resolve).toHaveBeenCalledWith(agent.session.id)
         const inserted = eventsAtFlush.flatMap(event => event.type === 'agent/inbox/spliced' ? event.data.inserted : [])
         expect(inserted).toHaveLength(1)
-        expect(inserted[0]?.source).toEqual({ kind: 'schedule' })
+        expect(inserted[0]?.source).toMatchObject({ kind: 'schedule', occurrences: [{ id: 'receipt' }] })
         expect(agent.inbox.nextTurn).toEqual(inserted)
         expect(commit).not.toHaveBeenCalled()
         expect(tasks).toEqual([seeded])

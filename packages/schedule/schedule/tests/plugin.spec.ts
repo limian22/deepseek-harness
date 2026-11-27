@@ -46,6 +46,27 @@ describe('shared Schedule management', () => {
     expect(created.target).toEqual({ kind: 'session', sessionId: brandString<SessionId>('existing') })
   })
 
+  it('does not persist caller-provided IM identity through either creation path', async () => {
+    const test = await setup()
+    const sessionId = brandString<SessionId>('target')
+    const request = {
+      title: 'Reminder', prompt: 'Check later', timing: { kind: 'after', after_seconds: 60 },
+      target: { kind: 'session', sessionId, principalRef: 'caller-principal' },
+      principalRef: 'caller-principal', routeRef: 'caller-route',
+    } as const
+    const direct = await test.service.create(request, brandString<SessionId>('actor'))
+    const remote = await test.service.remoteCreate(request)
+    expect(direct.involvedSessionIds).toEqual(expect.arrayContaining(['actor', sessionId]))
+    expect(remote.involvedSessionIds).toEqual([sessionId])
+    for (const entry of [direct, remote]) {
+      const stored = storedValue(test.pool, entry.id)
+      expect(stored).toBeDefined()
+      expect(stored).not.toHaveProperty('principalRef')
+      expect(stored).not.toHaveProperty('routeRef')
+      expect(stored).toHaveProperty('target', { kind: 'session', sessionId })
+    }
+  })
+
   it('delivers overdue tasks when the Web controller mounts and remounts', async () => {
     const test = await harness({ sessionController: false })
     tests.push(test)

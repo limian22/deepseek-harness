@@ -377,12 +377,14 @@ export class ScheduleService extends TypertRemoteService {
    * @param request - Title, prompt, recurrence, and delivery destination.
    * @param actorSessionId - Session of the acting Agent, or undefined for a human caller.
    * @param signal - Cancellation checked before the durable write begins, including after FIFO waits.
+   * @param beforeWrite - In-process hook for recording separate delivery evidence, keyed by the new task identity and revision.
    * @returns The stored task. Cancellation does not roll back an in-flight write.
    */
   async create(
     request: ScheduleCreateRequest,
     actorSessionId?: SessionId,
     signal?: AbortSignal,
+    beforeWrite?: (identity: { id: ScheduleId; revision: string }) => void,
   ): Promise<ScheduleCatalogEntry> {
     const id = brandString<ScheduleId>(`schedule-${randomUUID()}`)
     const now = Date.now()
@@ -399,6 +401,8 @@ export class ScheduleService extends TypertRemoteService {
         createdAt, updatedAt: createdAt,
         deliveryHistory: { records: [], earlierRecordsUnavailable: false, earlierRecordsPruned: false },
       })
+      if (target.kind === 'session' && target.sessionId === actorSessionId) beforeWrite?.({ id, revision: createdAt })
+      signal?.throwIfAborted()
       await domain.table('tasks').put(id, task)
       this.emitChanged()
       this.runtime?.requestDrive()

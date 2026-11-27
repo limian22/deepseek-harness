@@ -11,6 +11,7 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { SessionPersistenceRevision, SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
 import Storage, { type KvUnit, type KvUnitDescriptor, type StorageBackend } from '@deepseek-ai/dsh-storage'
 import { DomainFacility, type KvTable } from '@deepseek-ai/dsh-storage-domain'
+import { JsonStorageBackend } from '@deepseek-ai/dsh-storage-json'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { vi } from 'vitest'
@@ -115,7 +116,19 @@ export async function harness(options: {
   }
   const flush = vi.fn(async () => {})
   ctx.on('session/flush', flush)
-  ctx.provide('sessionPersistence', { stat } as never)
+  const open = vi.fn(async (sessionId: SessionId) => {
+    const session = ctx.sessions.get(sessionId)
+    if (session === undefined) throw new Error('missing Session')
+    return {
+      id: sessionId,
+      inheritedEventCount: session.inheritedEventCount,
+      read: async (offset = 0, length?: number) => ({
+        events: session.snapshotEvents().slice(offset, length === undefined ? undefined : offset + length),
+      }),
+      close: async () => {},
+    }
+  })
+  ctx.provide('sessionPersistence', { stat, open, flush: async () => {} } as never)
   await options.beforeService?.(ctx, facility)
   let fiber: Context['fiber']
   if (options.direct) {
@@ -232,6 +245,17 @@ export function taskTable(ctx: Context): KvTable<ScheduleId, ScheduleTask> {
   if (domain === undefined) throw new Error('Schedule domain not initialized')
   // The service opens this name with scheduleDomain; registry lookup erases that type.
   return domain.table('tasks') as KvTable<ScheduleId, ScheduleTask>
+}
+
+export async function openDiskTasks(root: string) {
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  const backend = new JsonStorageBackend(root)
+  ctx.storage.backend.register('json', backend)
+  const facility = new DomainFacility(ctx, { backend: 'json' })
+  const domain = await facility.open(scheduleDomain)
+  ctx.effect(() => async () => { await domain.close(); await backend.close() })
+  return { ctx, domain }
 }
 
 /** Extract the authoritative rule from a management response for storage assertions. */

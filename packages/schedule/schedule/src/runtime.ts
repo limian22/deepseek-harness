@@ -1,10 +1,10 @@
 /** Host timer over standalone tasks; target Session activation is a delivery operation. */
 import { randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, UserMessage } from '@deepseek-ai/dsh-llm'
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'schedule': { kind: 'schedule' } & ContextFormed
+    'schedule': { kind: 'schedule'; occurrences?: readonly { id: string; scheduledAt: string; revision: string; occurrenceAt: string; nextScheduledAt?: string }[] } & ContextFormed
   }
 }
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -17,7 +17,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-workspace'
 import {
-  isRecurringScheduleRecord, MIN_EVERY_INTERVAL_SECONDS, renderRecurringReminderBatchFraming, renderReminderFraming,
+  isRecord, isRecurringScheduleRecord, MIN_EVERY_INTERVAL_SECONDS, renderRecurringReminderBatchFraming, renderReminderFraming,
   resolveRecurringOccurrence, type RecurringOccurrence,
 } from './domain.ts'
 import { formatScheduleLocalTime } from './domain.ts'
@@ -89,6 +89,7 @@ export class ScheduleRuntime {
     private readonly changed: () => void,
     private readonly limits: ScheduleRuntimeLimits,
     private readonly resolveAgent: (sessionId: SessionIdType) => Promise<Agent>,
+    private readonly admission?: { followup(agent: Agent, message: UserMessage): void },
   ) {}
 
   /**
@@ -247,8 +248,78 @@ export class ScheduleRuntime {
       if (first === undefined) return []
       const target = await this.resolveTarget(first)
       if (this.stopping) return []
+      // Never infer absence from a truncated scan or from a fork's inherited events.
+      const session = target.agent.session
+      if (session.id !== target.sessionId) throw new Error('Schedule target Session identity does not match the resolved Agent')
+      const through = session.seq
+      if (through > session.inheritedEventCount && !await this.ctx.sessions.flush(session)) {
+        throw new Error('Session persistence did not acknowledge the recovery scan')
+      }
+      const persistence = this.ctx.get('sessionPersistence')
+      if (persistence === undefined) throw new Error('Session persistence is unavailable for schedule recovery')
+      const recovered = new Map<ScheduleId, { occurrence: RecurringOccurrence; messageId: ScheduleDeliveryReceipt['messageId'] }>()
+      const reader = await persistence.open(target.sessionId, 'read')
+      try {
+        if (reader.id !== session.id || reader.inheritedEventCount !== session.inheritedEventCount) {
+          throw new Error('Session recovery identity or inherited boundary differs')
+        }
+        if (through === session.inheritedEventCount && (await reader.read(through, 1)).events.length !== 0) {
+          throw new Error('Session recovery history extends beyond the live Session')
+        }
+        for (let offset = Number(reader.inheritedEventCount); offset < through;) {
+          const length = Math.min(8192, through - offset)
+          const page = (await reader.read(offset, length)).events
+          if (page.length !== length) throw new Error('Session recovery history is incomplete')
+          for (const event of page) {
+            if (event.seq !== offset++) throw new Error('Session recovery history is not contiguous')
+            if (event.type !== 'agent/inbox/spliced' || !session.isOwnSeq(event.seq)) continue
+            for (const message of event.data.inserted) {
+              if (message.source.kind !== 'schedule' || message.source.occurrences === undefined) continue
+              const claims: unknown = message.source.occurrences
+              if (!Array.isArray(claims)) throw new Error('Invalid schedule occurrence evidence')
+              for (const value of claims as unknown[]) {
+                if (!isRecord(value) || typeof value['id'] !== 'string' || typeof value['scheduledAt'] !== 'string'
+                  || typeof value['revision'] !== 'string' || typeof value['occurrenceAt'] !== 'string'
+                  || !Number.isFinite(Date.parse(value['occurrenceAt']))
+                  || (value['nextScheduledAt'] !== undefined && (typeof value['nextScheduledAt'] !== 'string'
+                    || !Number.isFinite(Date.parse(value['nextScheduledAt']))))) {
+                  throw new Error('Invalid schedule occurrence evidence')
+                }
+                const member = admitted.find(candidate => candidate.record.id === value['id']
+                  && candidate.record.scheduledAt === value['scheduledAt'] && (candidate.updatedAt ?? '') === value['revision'])
+                if (member === undefined) continue
+                if (recovered.has(member.record.id)) throw new Error('Ambiguous schedule occurrence in Session history')
+                recovered.set(member.record.id, {
+                  occurrence: {
+                    occurrenceAt: value['occurrenceAt'],
+                    ...(value['nextScheduledAt'] === undefined ? {} : { nextScheduledAt: value['nextScheduledAt'] }),
+                  },
+                  messageId: message.id,
+                })
+              }
+            }
+          }
+        }
+      } finally { await reader.close() }
+      if (recovered.size > 0) {
+        for (const task of admitted) {
+          const prior = recovered.get(task.record.id)
+          if (prior === undefined) continue
+          const reconciled = this.advanced(task, prior.occurrence, {
+            scheduledAt: prior.occurrence.occurrenceAt, deliveredAt: new Date().toISOString(),
+            messageId: prior.messageId, targetSessionId: target.sessionId,
+          })
+          await this.commit(reconciled)
+          committed.add(task.record.id)
+          if (task.target.kind !== 'new' && target.agent.status !== 'idle') {
+            this.executing.add(task.record.id)
+            this.watchExecution([task.record.id], target.agent.whenIdle())
+          }
+        }
+        admitted = admitted.filter(task => !committed.has(task.record.id))
+      }
+      // Session restoration and the durability scan can span a wall-clock change.
       const now = Date.now()
-      // Session restoration can span a wall-clock rollback; future members keep their timer obligation.
       admitted = admitted.filter(member => Date.parse(member.record.scheduledAt) <= now)
       const deliveries = admitted.map(task => ({
         task, occurrence: isRecurringScheduleRecord(task.record)
@@ -262,7 +333,9 @@ export class ScheduleRuntime {
         })))
         : renderReminderFraming({ ...single.task.record, scheduledAt: single.occurrence.occurrenceAt })
       const held = deliveries.filter(({ task }) => task.target.kind !== 'new').map(({ task }) => task.record.id)
-      const sent = await this.send(target.agent, text, held)
+      const sent = await this.send(target.agent, text, held, deliveries.map(({ task, occurrence }) => ({
+        id: task.record.id, scheduledAt: task.record.scheduledAt, revision: task.updatedAt ?? '', ...occurrence,
+      })))
       try {
         for (const { task, occurrence } of deliveries) {
           await this.commit(this.advanced(task, occurrence, {
@@ -350,11 +423,18 @@ export class ScheduleRuntime {
    * Enqueue one reminder and wait for Session persistence to acknowledge it.
    * The held tasks hold their slots from the enqueue; a failure releases them.
    */
-  private async send(agent: Agent, text: string, held: readonly ScheduleId[]): Promise<SentReminder> {
-    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'schedule' } })
+  private async send(agent: Agent, text: string, held: readonly ScheduleId[], occurrences?: readonly {
+    id: string
+    scheduledAt: string
+    revision: string
+    occurrenceAt: string
+    nextScheduledAt?: string
+  }[]): Promise<SentReminder> {
+    const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'schedule', ...(occurrences === undefined ? {} : { occurrences }) } })
     for (const id of held) this.executing.add(id)
     try {
-      agent.followup(message)
+      if (this.admission) this.admission.followup(agent, message)
+      else agent.followup(message)
       // Capture the activity immediately after wakeup. Waiting for durable flush
       // can miss the whole lifecycle of a fast target Agent.
       const execution = held.length > 0 ? agent.whenIdle() : undefined
