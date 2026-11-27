@@ -200,15 +200,15 @@ describe('startActivation model-selection admission', () => {
     expect(outOfPolicy.provider.runs).toHaveLength(0)
   })
 
-  it('rejects a fixed-runtime backend that cannot honor the allowed models', async () => {
+  it('keeps a fixed-runtime backend on its own route despite the allowed models', async () => {
     const { ctx, parent, provider } = await setup({
       capabilities: FIXED_RUNTIME,
       parentOptions: { provider: GPT.provider, model: GPT.model },
     })
     recordPolicy(parent, [FLASH])
-    await expect(start(ctx, parent))
-      .rejects.toThrow("cannot honor this Session's allowed child models")
-    expect(provider.runs).toHaveLength(0)
+    await start(ctx, parent)
+    expect(provider.runs).toHaveLength(1)
+    expect(provider.runs[0]?.agentOptions).toBeUndefined()
   })
 
   it('keeps existing behavior without a recorded policy', async () => {

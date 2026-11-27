@@ -279,17 +279,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           throw new Error('subagent tool requires a calling agent (exec.agent was undefined)')
         }
 
-        const routes = subagentModelSelectionPolicy(subagentModelSelectionProjectionHandle, parent.session, ctx)
+        const modelRequest = args as DelegationModelRequest
+        const routes = subagentProvider.capabilities.agentOptions
+          ? subagentModelSelectionPolicy(subagentModelSelectionProjectionHandle, parent.session, ctx)
+          : undefined
         const modelSelectionPolicy = routes === undefined ? undefined : { routes }
         const policyEnforced = modelSelectionPolicy !== undefined
-        if (policyEnforced && !subagentProvider.capabilities.agentOptions) {
-          throw new Error(
-            `subagent provider "${config.provider}" cannot honor this Session's allowed child models: `
-            + 'it does not support child LLM route selection',
-          )
-        }
         const agentPreset = presets.resolve(args as PresetSelectionRequest)
-        const modelRequest = args as DelegationModelRequest
         const parentOptions = parentAgentOptionsForDelegation(parent)
         const requiresRoutePreflight = hasDelegationModelRequest(modelRequest)
           || hasConfiguredLlmSelection(config.agentOptions)

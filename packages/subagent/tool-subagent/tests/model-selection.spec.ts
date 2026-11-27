@@ -379,7 +379,7 @@ describe('dsh-tool-subagent model selection', () => {
     expect(requestedAgentOptions(configured, {}, true, undefined, parent)).toBe(configured)
   })
 
-  it('rejects a fixed-route backend that cannot honor a recorded policy', async () => {
+  it('allows a fixed-route backend to use its own route despite a recorded policy', async () => {
     const started = vi.fn()
     const ctx = await setup({ provider: 'mock' }, {
       capabilities: { agentOptions: false },
@@ -390,9 +390,8 @@ describe('dsh-tool-subagent model selection', () => {
 
     const result = await callSubagent(ctx, { description: 'fixed route', prompt: 'do it' })
 
-    expect(result.isError).toBe(true)
-    expect(text(result)).toContain('cannot honor this Session\'s allowed child models')
-    expect(started).not.toHaveBeenCalled()
+    expect(result.isError, text(result)).toBe(false)
+    expect(started).toHaveBeenCalledOnce()
   })
 
   it('keeps existing omitted fallback behavior without a recorded policy', async () => {

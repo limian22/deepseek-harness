@@ -625,10 +625,7 @@ export class SubagentRuntime extends TypertRemoteService {
     const routes = handle === undefined ? undefined : subagentModelSelectionPolicy(handle, spec.parent.session, this.ctx)
     if (routes === undefined) return spec
     if (!provider.capabilities.agentOptions) {
-      throw new SubagentError(
-        `subagent provider "${provider.name}" cannot honor this Session's allowed child models because it cannot select a child LLM route; choose a backend that supports agentOptions or start the Session without model selection`,
-        'UNSUPPORTED_CAPABILITY',
-      )
+      return spec
     }
     const policy = { routes }
     const parentOptions = parentAgentOptionsForDelegation(spec.parent)
