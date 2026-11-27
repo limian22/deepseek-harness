@@ -825,6 +825,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     let next = this._globalGeneration
     this._transaction(() => {
       db.exec('DELETE FROM persisted_docs')
+      db.exec('DELETE FROM persisted_doc_rows')
       db.exec('DELETE FROM persisted_sessions')
       db.exec('DELETE FROM sync_sessions')
       next = this._mainGeneration() + 1
@@ -1253,7 +1254,6 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     this._transaction(() => {
       next = this._mainGeneration() + 1
       for (const { target, prepared } of accepted) {
-        this._deleteSession('persisted', target.id)
         this._replacePersistedSession(prepared, target.revision, next)
         db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(target.id)
       }
@@ -1535,10 +1535,12 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _deleteSession(source: 'persisted' | 'live', id: SessionId): void {
     const db = this._requireDb()
     if (source === 'persisted') {
-      db.prepare('DELETE FROM persisted_docs WHERE session_id = ?').run(id)
+      db.prepare('DELETE FROM persisted_docs WHERE rowid IN (SELECT doc_rowid FROM persisted_doc_rows WHERE session_id = ?)').run(id)
+      db.prepare('DELETE FROM persisted_doc_rows WHERE session_id = ?').run(id)
       db.prepare('DELETE FROM persisted_sessions WHERE id = ?').run(id)
     } else {
-      db.prepare('DELETE FROM temp.live_docs WHERE session_id = ?').run(id)
+      db.prepare('DELETE FROM temp.live_docs WHERE rowid IN (SELECT doc_rowid FROM temp.live_doc_rows WHERE session_id = ?)').run(id)
+      db.prepare('DELETE FROM temp.live_doc_rows WHERE session_id = ?').run(id)
       db.prepare('DELETE FROM temp.live_sessions WHERE id = ?').run(id)
     }
   }
@@ -1563,9 +1565,10 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       INSERT INTO persisted_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
+    const mapRow = db.prepare('INSERT INTO persisted_doc_rows (session_id, doc_rowid) VALUES (?, ?)')
     for (const document of entry.documents) {
       const text = sanitizeFtsText(document.text)
-      insert.run(
+      const { lastInsertRowid } = insert.run(
         segmentHan(text),
         document.sessionId,
         document.seq,
@@ -1574,6 +1577,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         document.surface,
         Array.from(text).length,
       )
+      mapRow.run(document.sessionId, lastInsertRowid)
     }
   }
 
@@ -1604,6 +1608,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       INSERT INTO temp.live_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
+    const mapRow = db.prepare('INSERT INTO temp.live_doc_rows (session_id, doc_rowid) VALUES (?, ?)')
     const next = new Map<SessionSeq, LiveIndexedDocument>()
     // Within an append-only Session instance an existing event can change surface, but its text is immutable.
     const update = previous === undefined ? undefined : db.prepare('UPDATE temp.live_docs SET surface = ? WHERE rowid = ?')
@@ -1624,6 +1629,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         document.surface,
         Array.from(text).length,
       )
+      mapRow.run(document.sessionId, lastInsertRowid)
       next.set(document.seq, { rowid: lastInsertRowid, surface: document.surface })
     }
     return next

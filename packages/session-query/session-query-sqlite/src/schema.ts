@@ -7,7 +7,7 @@ import { claimIndexOwnership } from './ownership.ts'
 import { FTS_HAN_SEPARATOR } from './query.ts'
 
 /** Current derived-index schema version. Incompatible versions reset in place. */
-export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 10
+export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 11
 
 const FTS_TOKENIZER = `'unicode61 separators ''${FTS_HAN_SEPARATOR}'''`
 
@@ -21,6 +21,7 @@ const DERIVED_USER_TABLES = new Set([
   'search_state',
   'persisted_sessions',
   'persisted_docs',
+  'persisted_doc_rows',
   'persisted_docs_data',
   'persisted_docs_idx',
   'persisted_docs_content',
@@ -75,14 +76,14 @@ export async function openSearchDatabase(
     const { DatabaseSync } = await import('node:sqlite')
     const db = new DatabaseSync(actual)
     try {
-      assertRecognizedDatabase(db, actual)
+      const version = assertRecognizedDatabase(db, actual)
       // Apply mutating pragmas only after refusing foreign or canonical files.
       // journalMode is a validated closed union, not caller-controlled SQL.
       db.exec(`PRAGMA journal_mode = ${journalMode.toUpperCase()}`)
       // This derived index is disposable and rebuildable, so NORMAL durability is
       // safe: it drops one fsync per commit on the large first-index path.
       db.exec('PRAGMA synchronous = NORMAL')
-      ensurePersistentSchema(db)
+      ensurePersistentSchema(db, version)
       ensureTemporarySchema(db)
       return { db, release: () => ownership.release() }
     } catch (error: unknown) {
@@ -95,7 +96,7 @@ export async function openSearchDatabase(
   }
 }
 
-function assertRecognizedDatabase(db: DatabaseSync, actual: string): void {
+function assertRecognizedDatabase(db: DatabaseSync, actual: string): number {
   const { application_id: applicationId } = db.prepare('PRAGMA application_id').get() as { application_id: number }
   const { user_version: version } = db.prepare('PRAGMA user_version').get() as { user_version: number }
   const userTables = listUserTables(db)
@@ -107,8 +108,11 @@ function assertRecognizedDatabase(db: DatabaseSync, actual: string): void {
   }
   if (applicationId === SESSION_QUERY_SQLITE_APPLICATION_ID) {
     assertDerivedUserTables(actual, userTables)
-    if (version !== SESSION_QUERY_SQLITE_SCHEMA_VERSION) resetDerivedSchema(db, userTables)
+    if (version === 10 && userTables.includes('persisted_docs')) return version
+    if (version === SESSION_QUERY_SQLITE_SCHEMA_VERSION) return version
+    resetDerivedSchema(db, userTables)
   }
+  return 0
 }
 
 function listUserTables(db: DatabaseSync): string[] {
@@ -134,7 +138,18 @@ function resetDerivedSchema(db: DatabaseSync, userTables: readonly string[]): vo
   db.exec('PRAGMA user_version = 0')
 }
 
-function ensurePersistentSchema(db: DatabaseSync): void {
+function ensurePersistentSchema(db: DatabaseSync, version: number): void {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    initializePersistentSchema(db, version)
+    db.exec('COMMIT')
+  } catch (error: unknown) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function initializePersistentSchema(db: DatabaseSync, version: number): void {
   db.exec(`PRAGMA application_id = ${SESSION_QUERY_SQLITE_APPLICATION_ID}`)
   db.exec(`
     CREATE TABLE IF NOT EXISTS search_state (
@@ -169,6 +184,16 @@ function ensurePersistentSchema(db: DatabaseSync): void {
       tokenize = ${FTS_TOKENIZER}
     )
   `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS persisted_doc_rows (
+      session_id TEXT NOT NULL,
+      doc_rowid INTEGER NOT NULL,
+      PRIMARY KEY (session_id, doc_rowid)
+    ) WITHOUT ROWID, STRICT
+  `)
+  if (version === 10) {
+    db.exec('INSERT INTO persisted_doc_rows SELECT session_id, rowid FROM persisted_docs')
+  }
   // Sources known from a completed listing that are not searchable yet: covered
   // by a live owner, awaiting a read, or failed. Rows remain invisible to MATCH.
   // `seeded` carries the listed header's fork flag; the exact inherited cut is
@@ -194,6 +219,13 @@ function ensurePersistentSchema(db: DatabaseSync): void {
 }
 
 function ensureTemporarySchema(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS temp.live_doc_rows (
+      session_id TEXT NOT NULL,
+      doc_rowid INTEGER NOT NULL,
+      PRIMARY KEY (session_id, doc_rowid)
+    ) WITHOUT ROWID, STRICT
+  `)
   db.exec(`
     CREATE TEMP TABLE IF NOT EXISTS live_sessions (
       id             TEXT PRIMARY KEY,

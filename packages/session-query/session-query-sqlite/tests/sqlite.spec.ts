@@ -1953,7 +1953,7 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
       expect(TestPersistence.reads.get(meta.id)).toBe(2)
       const db = new DatabaseSync(path, { readOnly: true })
       try {
-        expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 })
+        expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: SESSION_QUERY_SQLITE_SCHEMA_VERSION })
       } finally {
         db.close()
       }
@@ -1962,12 +1962,65 @@ describe('SQLite schema, cancellation, and real persistence integration', () => 
     }
   })
 
+  it('backfills indexed FTS row ids on version 10 without rereading sessions', async () => {
+    const path = await temporaryPath()
+    const removed = header('remove-indexed')
+    const retained = header('retain-indexed')
+    TestPersistence.reset([
+      { meta: removed, events: messageEvents('obsolete needle') },
+      { meta: retained, events: messageEvents('retained needle') },
+    ])
+    const owner = await liveContext({ path })
+    try {
+      await owner.plugin(TestPersistence)
+      await owner.sessionQuery.searchSessions({ query: 'needle' })
+    } finally {
+      await owner.fiber.dispose()
+    }
+
+    const legacy = new DatabaseSync(path)
+    try {
+      legacy.exec('DROP TABLE persisted_doc_rows; PRAGMA user_version = 10')
+    } finally {
+      legacy.close()
+    }
+
+    const migrated = await liveContext({ path })
+    try {
+      await migrated.plugin(TestPersistence)
+      const result = await migrated.sessionQuery.searchSessions({ query: 'needle' })
+      expect(result.items.map(item => item.header.id).sort()).toEqual([removed.id, retained.id])
+      expect(TestPersistence.reads.get(removed.id)).toBe(1)
+      expect(TestPersistence.reads.get(retained.id)).toBe(1)
+
+      const db = new DatabaseSync(path, { readOnly: true })
+      try {
+        const plan = db.prepare('EXPLAIN QUERY PLAN DELETE FROM persisted_docs'
+          + ' WHERE rowid IN (SELECT doc_rowid FROM persisted_doc_rows WHERE session_id = ?)').all(removed.id)
+        expect(plan).toEqual(expect.arrayContaining([
+          expect.objectContaining({ detail: expect.stringMatching(/VIRTUAL TABLE INDEX .*=/) }),
+          expect.objectContaining({ detail: expect.stringContaining('SEARCH persisted_doc_rows USING PRIMARY KEY') }),
+        ]))
+        expect(db.prepare('SELECT COUNT(*) AS count FROM persisted_doc_rows').get())
+          .toEqual(db.prepare('SELECT COUNT(*) AS count FROM persisted_docs').get())
+      } finally {
+        db.close()
+      }
+
+      TestPersistence.entries.delete(removed.id)
+      const next = await migrated.sessionQuery.searchSessions({ query: 'needle' })
+      expect(next.items.map(item => item.header.id)).toEqual([retained.id])
+    } finally {
+      await migrated.fiber.dispose()
+    }
+  })
+
   it('resets a recognized incompatible schema but refuses unknown or foreign tables', { timeout: 20_000 }, async () => {
     const stalePath = await temporaryPath('stale.db')
     const staleOwner = await liveContext({ path: stalePath })
     await (staleOwner.sessionQuery as SqliteSessionQueryEngine).close()
     const stale = new DatabaseSync(stalePath)
-    stale.exec(`PRAGMA user_version = ${SESSION_QUERY_SQLITE_SCHEMA_VERSION - 1}`)
+    stale.exec('PRAGMA user_version = 8')
     stale.close()
     const staleCtx = await liveContext({ path: stalePath })
     staleCtx.sessions.create(SessionId('live'), { seed: messageEvents('needle') })
