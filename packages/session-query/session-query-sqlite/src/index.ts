@@ -98,8 +98,8 @@ export const SESSION_QUERY_SQLITE_DEFAULT_LIMIT = 20
 export const SESSION_QUERY_SQLITE_MAX_LIMIT = 100
 /** Default maximum snippet length in Unicode code points. */
 export const SESSION_QUERY_SQLITE_SNIPPET_CHARS = 240
-/** Default interval between background source reconciliations, in milliseconds. */
-export const SESSION_QUERY_SQLITE_DEFAULT_SYNC_INTERVAL_MS = 5000
+/** Periodic reconciliation is disabled by default. */
+export const SESSION_QUERY_SQLITE_DEFAULT_SYNC_INTERVAL_MS = 0
 /** Default concurrent cold-log reads in background synchronization. */
 export const SESSION_QUERY_SQLITE_DEFAULT_SYNC_READ_CONCURRENCY = 2
 /** Default validated sessions committed per background transaction. */
@@ -153,7 +153,7 @@ export interface Config extends SessionQueryConfig {
    * Defaults to `on-search`.
    */
   syncMode?: SyncMode
-  /** Interval between background reconciliations in milliseconds. At most 2147483647 (Node's maximum timer delay); defaults to 5000. */
+  /** Optional interval between background reconciliations in milliseconds. Defaults to 0 (disabled); maximum 2147483647. */
   syncIntervalMs?: number
   /** Concurrent cold-log reads in one background reconciliation. At most `Number.MAX_SAFE_INTEGER`; defaults to 2. */
   syncReadConcurrency?: number
@@ -350,7 +350,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     syncMode: z.union(['on-search', 'background'] as const).default('on-search'),
     syncIntervalMs: z.number()
       .step(1)
-      .min(1)
+      .min(0)
       .max(MAX_SYNC_INTERVAL_MS)
       .default(SESSION_QUERY_SQLITE_DEFAULT_SYNC_INTERVAL_MS),
     syncReadConcurrency: z.number()
@@ -932,8 +932,10 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
     const controller = new AbortController()
     this._syncAbort = controller
-    this._syncTimer = setInterval(() => { this._requestSync() }, this.config.syncIntervalMs)
-    this._syncTimer.unref()
+    if (this.config.syncIntervalMs > 0) {
+      this._syncTimer = setInterval(() => { this._requestSync() }, this.config.syncIntervalMs)
+      this._syncTimer.unref()
+    }
     this._requestSync()
   }
 
@@ -1086,16 +1088,25 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       }
       work.push({ id, revision: entry.revision, header: entry.header })
     }
-    for (const id of committed.keys()) if (!listed.has(id)) hidden.push(id)
-    for (const id of ledger.keys()) if (!listed.has(id)) deleteLedger.add(id)
-    if (hidden.length > 0 || deleteLedger.size > 0 || upserts.length > 0) {
+    const removed = new Set<SessionId>()
+    for (const id of committed.keys()) if (!listed.has(id)) removed.add(id)
+    for (const id of ledger.keys()) {
+      if (listed.has(id)) continue
+      deleteLedger.add(id)
+      removed.add(id)
+    }
+    if (hidden.length > 0 || removed.size > 0 || deleteLedger.size > 0 || upserts.length > 0) {
       this._transaction(() => {
-        for (const id of hidden) this._deleteSession('persisted', id)
+        // Queries join through the header. Keep hidden documents for comparison
+        // with the validated replacement, and let the ledger track their owner.
+        const hide = db.prepare('DELETE FROM persisted_sessions WHERE id = ?')
+        for (const id of hidden) hide.run(id)
+        for (const id of removed) this._deleteSession('persisted', id)
         for (const id of deleteLedger) db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(id)
         for (const upsert of upserts) this._upsertSyncRow(upsert.id, upsert.entry, upsert.state)
       })
     }
-    if (hidden.length > 0) this._globalGeneration += 1
+    if (hidden.length > 0 || [...removed].some(id => committed.has(id))) this._globalGeneration += 1
     this._syncVerified = true
     this._syncCheckedAt = Date.now()
     this._syncListingFailed = false
@@ -1254,7 +1265,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     this._transaction(() => {
       next = this._mainGeneration() + 1
       for (const { target, prepared } of accepted) {
-        this._replacePersistedSession(prepared, target.revision, next)
+        this._publishPersistedSession(prepared, target.revision, next)
         db.prepare('DELETE FROM sync_sessions WHERE id = ?').run(target.id)
       }
       db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(next)
@@ -1379,9 +1390,11 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const persistentChanges = observation.persistenceBinding.service === undefined
       ? []
       : [...observation.persisted.values()].filter(entry => entry.loaded !== undefined)
+    const pendingRows = db.prepare('SELECT id FROM sync_sessions').all() as Array<{ id: string }>
     const persistentDeletes = observation.persistenceBinding.service === undefined
       ? []
-      : persistedRows.filter(row => !observation.persisted.has(row.id as SessionId))
+      : [...new Set([...persistedRows, ...pendingRows].map(row => row.id as SessionId))]
+        .filter(id => !observation.persisted.has(id))
     const liveChanges = [...observation.live.values()].filter((entry) => {
       const indexed = liveById.get(entry.header.id)
       const persisted = observation.persisted.has(entry.header.id) ? 1 : 0
@@ -1412,11 +1425,16 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       try {
         db.exec('BEGIN IMMEDIATE')
         began = true
-        for (const row of persistentDeletes) this._deleteSession('persisted', row.id as SessionId)
+        const removePending = db.prepare('DELETE FROM sync_sessions WHERE id = ?')
+        for (const id of persistentDeletes) {
+          this._deleteSession('persisted', id)
+          removePending.run(id)
+        }
         for (const entry of persistentChanges) {
           /* v8 ignore next -- observation loads every entry whose revision differs */
           if (entry.loaded === undefined) throw new Error(`missing loaded revision for session "${entry.header.id}"`)
-          this._replacePersistedSession(entry.loaded, entry.revision, nextMainGeneration)
+          this._publishPersistedSession(entry.loaded, entry.revision, nextMainGeneration)
+          removePending.run(entry.header.id)
         }
         if (persistentChanges.length > 0 || persistentDeletes.length > 0) {
           db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(nextMainGeneration)
@@ -1545,39 +1563,75 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
   }
 
-  private _replacePersistedSession(
+  private _publishPersistedSession(
     entry: SessionPublication,
     revision: SessionPersistenceRevision,
     generation: number,
   ): void {
-    this._deleteSession('persisted', entry.header.id)
     const db = this._requireDb()
     db.prepare(`
       INSERT INTO persisted_sessions
         (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, revision, generation)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        version = excluded.version, created_at = excluded.created_at, cwd = excluded.cwd,
+        parent_session = excluded.parent_session, seed_length = excluded.seed_length,
+        delegation_depth = excluded.delegation_depth, agent_preset = excluded.agent_preset,
+        revision = excluded.revision, generation = excluded.generation
     `).run(
       ...headerBindings(entry.header, entry.inheritedEventCount),
       revision,
       generation,
     )
+
+    // Walk the session's rowid map first to bound the lookup to this session.
+    const rows = db.prepare(`
+      SELECT r.doc_rowid, d.seq, d.text, d.type, d.time, d.surface, d.codepoint_length
+      FROM persisted_doc_rows AS r
+      CROSS JOIN persisted_docs AS d ON d.rowid = r.doc_rowid
+      WHERE r.session_id = ?
+    `).all(entry.header.id) as Array<{
+      doc_rowid: number
+      seq: SessionSeq
+      text: string
+      type: string
+      time: number
+      surface: SessionEventSearchDocument['surface']
+      codepoint_length: number
+    }>
+    const previous = new Map(rows.map(row => [row.seq, row]))
     const insert = db.prepare(`
       INSERT INTO persisted_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
+    const update = db.prepare(`
+      UPDATE persisted_docs SET text = ?, type = ?, time = ?, surface = ?, codepoint_length = ?
+      WHERE rowid = ?
+    `)
     const mapRow = db.prepare('INSERT INTO persisted_doc_rows (session_id, doc_rowid) VALUES (?, ?)')
     for (const document of entry.documents) {
       const text = sanitizeFtsText(document.text)
-      const { lastInsertRowid } = insert.run(
-        segmentHan(text),
-        document.sessionId,
-        document.seq,
-        document.type,
-        document.time,
-        document.surface,
-        Array.from(text).length,
-      )
-      mapRow.run(document.sessionId, lastInsertRowid)
+      const segmented = segmentHan(text)
+      const length = Array.from(text).length
+      const row = previous.get(document.seq)
+      if (row === undefined) {
+        const { lastInsertRowid } = insert.run(
+          segmented, document.sessionId, document.seq, document.type, document.time, document.surface, length,
+        )
+        mapRow.run(document.sessionId, lastInsertRowid)
+        continue
+      }
+      previous.delete(document.seq)
+      if (row.text !== segmented || row.type !== document.type || row.time !== document.time
+        || row.surface !== document.surface || row.codepoint_length !== length) {
+        update.run(segmented, document.type, document.time, document.surface, length, row.doc_rowid)
+      }
+    }
+    const deleteDocument = db.prepare('DELETE FROM persisted_docs WHERE rowid = ?')
+    const deleteMapping = db.prepare('DELETE FROM persisted_doc_rows WHERE session_id = ? AND doc_rowid = ?')
+    for (const row of previous.values()) {
+      deleteDocument.run(row.doc_rowid)
+      deleteMapping.run(entry.header.id, row.doc_rowid)
     }
   }
 
@@ -2193,10 +2247,10 @@ function resolveConfig(config: Config): ResolvedConfig {
   if (!syncModes.includes(resolved.syncMode)) throw invalidConfig('syncMode is not supported')
   if (
     !Number.isSafeInteger(resolved.syncIntervalMs)
-    || resolved.syncIntervalMs < 1
+    || resolved.syncIntervalMs < 0
     || resolved.syncIntervalMs > MAX_SYNC_INTERVAL_MS
   ) {
-    throw invalidConfig(`syncIntervalMs must be an integer between 1 and ${MAX_SYNC_INTERVAL_MS}`)
+    throw invalidConfig(`syncIntervalMs must be an integer between 0 and ${MAX_SYNC_INTERVAL_MS}`)
   }
   if (
     !Number.isSafeInteger(resolved.syncReadConcurrency)

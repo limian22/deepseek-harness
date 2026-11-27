@@ -3250,7 +3250,7 @@ export interface Config extends SessionQueryConfig {
    * Defaults to `on-search`.
    */
   syncMode?: SyncMode
-  /** Interval between background reconciliations in milliseconds. At most 2147483647 (Node's maximum timer delay); defaults to 5000. */
+  /** Optional interval between background reconciliations in milliseconds. Defaults to 0 (disabled); maximum 2147483647. */
   syncIntervalMs?: number
   /** Concurrent cold-log reads in one background reconciliation. At most `Number.MAX_SAFE_INTEGER`; defaults to 2. */
   syncReadConcurrency?: number

@@ -2592,19 +2592,82 @@ async function awaitBackgroundSync(service: SqliteSessionQueryEngine): Promise<v
   await service.whenSynchronized()
 }
 
-/** Background-mode configuration with a quiet periodic timer for deterministic scans. */
+/** Background-mode configuration with request-driven synchronization. */
 const BACKGROUND_SYNC = {
   path: ':memory:',
   syncMode: 'background',
-  syncIntervalMs: 60_000,
 } as const
 
 describe('SQLite background synchronization', () => {
+
+  it.each(['on-search', 'background'] as const)('reuses unchanged persisted FTS rows in %s mode', async (syncMode) => {
+    const path = await temporaryPath()
+    const target = header('delta-target')
+    const keeper = header('delta-keeper')
+    const original = messageEvents('originalword')[0]!
+    const stale = { ...messageEvents('staleword')[0]!, seq: SessionSeq(1) }
+    TestPersistence.reset([{ meta: target, events: [original, stale] }])
+    const ctx = await liveContext({ ...BACKGROUND_SYNC, path, syncMode })
+    try {
+      await ctx.plugin(TestPersistence)
+      const service = ctx.sessionQuery as SqliteSessionQueryEngine
+      const search = async (query: string) => {
+        await service.searchSessions({ query })
+        await awaitBackgroundSync(service)
+        return service.searchEvents({ sessionId: target.id, query })
+      }
+      expect((await search('originalword')).items).toHaveLength(1)
+
+      const db = Reflect.get(service, '_db') as DatabaseSync
+      const rows = (id: SessionIdType) => db.prepare(
+        'SELECT doc_rowid FROM persisted_doc_rows WHERE session_id = ? ORDER BY doc_rowid',
+      ).all(id)
+      const originalRow = rows(target.id)[0]
+      expect(originalRow).toBeDefined()
+      // A later row keeps SQLite from reusing the target's rowids after deletion.
+      TestPersistence.set({ meta: keeper, events: messageEvents('keeperword') })
+      await service.searchSessions({ query: 'keeperword' })
+      await awaitBackgroundSync(service)
+      expect(rows(keeper.id)).toHaveLength(1)
+
+      const appended = { ...messageEvents('appendedword')[0]!, seq: SessionSeq(2) }
+      TestPersistence.set({ meta: target, events: [original, stale, appended] })
+      expect((await search('appendedword')).items).toHaveLength(1)
+      expect(rows(target.id)).toHaveLength(3)
+      expect(rows(target.id)[0]).toEqual(originalRow)
+
+      const replacement = {
+        type: 'user/message' as const,
+        seq: SessionSeq(1),
+        time: 2,
+        data: createUserMessage({
+          content: [{ type: 'text', text: 'replacementword' }], source: { kind: 'user' },
+        }),
+        surfaceOp: { op: 'replace' as const, startSeq: SessionSeq(0), endSeq: SessionSeq(0) },
+        sourceEventSeqs: [SessionSeq(0)],
+      }
+      TestPersistence.set({ meta: target, events: [original, replacement] })
+      expect((await search('originalword')).items).toMatchObject([{ surface: 'shadowed' }])
+      expect((await search('replacementword')).items).toHaveLength(1)
+      expect((await search('staleword')).items).toEqual([])
+      expect((await search('appendedword')).items).toEqual([])
+      expect(rows(target.id)).toHaveLength(2)
+
+      TestPersistence.entries.delete(target.id)
+      await service.searchSessions({ query: 'keeperword' })
+      await awaitBackgroundSync(service)
+      expect(rows(target.id)).toEqual([])
+      expect(rows(keeper.id)).toHaveLength(1)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('exposes background defaults and validates its sync configuration', async () => {
     const defaults = new SqliteSessionQueryEngine.Config({ path: ':memory:' })
     expect(defaults).toMatchObject({
       syncMode: 'on-search',
-      syncIntervalMs: 5000,
+      syncIntervalMs: 0,
       syncReadConcurrency: 2,
       syncBatchSessions: 24,
     })
@@ -2619,7 +2682,7 @@ describe('SQLite background synchronization', () => {
       path: ':memory:',
       syncMode: 'later' as never,
     })).toThrow()
-    for (const syncIntervalMs of [0, -1, 1.5, 2 ** 31, Number.MAX_SAFE_INTEGER]) {
+    for (const syncIntervalMs of [-1, 1.5, 2 ** 31, Number.MAX_SAFE_INTEGER]) {
       expect(() => new SqliteSessionQueryEngine.Config({ path: ':memory:', syncIntervalMs })).toThrow()
     }
     for (const syncReadConcurrency of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
@@ -2633,7 +2696,7 @@ describe('SQLite background synchronization', () => {
     const service = ctx.sessionQuery as SqliteSessionQueryEngine
     expect(service.config).toMatchObject({
       syncMode: 'background',
-      syncIntervalMs: 60_000,
+      syncIntervalMs: 0,
       syncReadConcurrency: 2,
     })
     await service.close()
