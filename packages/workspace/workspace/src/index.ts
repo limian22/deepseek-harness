@@ -171,6 +171,8 @@ interface BootstrapGroup {
   readonly newestAt: number
 }
 
+type IndexedPath = { readonly path: string } | { readonly reason: string; readonly missing?: boolean }
+
 const sameIds = (left: readonly WorkspaceId[], right: readonly WorkspaceId[]): boolean =>
   left.length === right.length && left.every((id, index) => id === right[index])
 
@@ -833,31 +835,40 @@ export class WorkspaceRegistry extends Service {
   }
 
   private async indexHeaders(headers: readonly SessionHeader[]): Promise<void> {
-    for (const header of headers) await this.indexHeader(header)
+    // Recheck paths in every pass so changes to the filesystem can update membership.
+    const paths = new Map<string, IndexedPath>()
+    for (const header of headers) {
+      const { id, cwd } = header
+      this.headers.set(id, header)
+      this.sessionPaths.delete(id)
+      this.missingSessionPaths.delete(id)
+      if (cwd === undefined) {
+        this.invalidSessionPaths.set(id, 'header has no cwd')
+        continue
+      }
+      let result = paths.get(cwd)
+      if (result === undefined) {
+        result = await this.resolveIndexedPath(cwd)
+        paths.set(cwd, result)
+      }
+      if ('path' in result) {
+        this.sessionPaths.set(id, result.path)
+        this.invalidSessionPaths.delete(id)
+      } else {
+        if (result.missing) this.missingSessionPaths.add(id)
+        this.invalidSessionPaths.set(id, result.reason)
+      }
+    }
   }
 
-  private async indexHeader(header: SessionHeader): Promise<void> {
-    this.headers.set(header.id, header)
-    this.sessionPaths.delete(header.id)
-    this.missingSessionPaths.delete(header.id)
-    if (header.cwd === undefined) {
-      this.invalidSessionPaths.set(header.id, 'header has no cwd')
-      return
-    }
+  private async resolveIndexedPath(cwd: string): Promise<IndexedPath> {
     try {
-      const path = await realpathNormalize(header.cwd)
-      if (!(await stat(path)).isDirectory()) {
-        this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' is not a directory`)
-        return
-      }
-      this.sessionPaths.set(header.id, path)
-      this.invalidSessionPaths.delete(header.id)
+      const path = await realpathNormalize(cwd)
+      return (await stat(path)).isDirectory() ? { path } : { reason: `cwd '${cwd}' is not a directory` }
     } catch (error) {
-      if (fullyQualifiedWorkspacePath(header.cwd)
-        && error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-        this.missingSessionPaths.add(header.id)
-      }
-      this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' does not resolve`)
+      const missing = fullyQualifiedWorkspacePath(cwd)
+        && error instanceof Error && 'code' in error && error.code === 'ENOENT'
+      return { reason: `cwd '${cwd}' does not resolve`, missing }
     }
   }
 

@@ -970,6 +970,28 @@ describe('SessionProjectionCache durable cold checkpoints', () => {
     })
   })
 
+  it('publishes an opening descriptor atomically with the full current projection cut', async () => {
+    const { ctx, cache } = await harness()
+    await ctx.sessionProjections.register(titleUnit)
+    const meta = headerOf(brandString<SessionId>('durable-opening'), 9)
+    const receipt = { digest: '0'.repeat(64), revision: 'first-cut', offset: 128, firstSeq: 1, cursor: 2, version: 1 as const }
+    await cache.writeOpening(meta, receipt, titledLog())
+    const opening = cache.cachedOpening(meta)
+    expect(opening?.receipt).toEqual(receipt)
+    expect(opening?.projections).toEqual({ asOfSeq: 2, values: { title: 'Durable title', 'cache-test/marks': { marks: [] } } })
+    expect(cache.cachedOpening({ ...meta, createdAt: 10 })).toBeUndefined()
+    const changed = titledLog()
+    changed[1] = {
+      type: 'session/title', seq: SessionSeq(1), time: 2,
+      data: { title: 'Replacement title', messageSeqs: [], source: { kind: 'user' } },
+    }
+    const prepared = ctx.sessions.prepare(meta.id, { meta, seed: changed })
+    expect(cache.hydratePrepared(prepared, changed).values.title).toBe('Replacement title')
+    await cache.coldSnapshotDurable(meta, SessionLogOffset(0), SessionSeq(2), titledLog())
+    expect(cache.cachedOpening(meta)?.receipt).toEqual(receipt)
+    expect(cache.hasOpening(meta.id, 'different-cut')).toBe(false)
+  })
+
   /** One stored human prompt at `time`, shaped like the real user/message event. */
   const promptEvent = (seq: number, time: number): SessionEvent => ({
     type: 'user/message',

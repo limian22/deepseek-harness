@@ -940,6 +940,56 @@ describe('SessionProjectionRegistry drive', () => {
     expect(ctx.sessionProjections.viewCheckpoint({})).toEqual({})
   })
 
+  it('renders current wire views from an exact checkpoint', async () => {
+    const { ctx, session } = await harness()
+    let setting = 'initial'
+    await ctx.sessionProjections.register(stableViewUnit(() => ({ marks: [setting] })))
+    await ctx.sessionProjections.register(countUnit())
+    const cursor = mark(session, ['stored']).seq
+    const checkpoint = ctx.sessionProjections.checkpoint(session)
+
+    setting = 'current'
+    expect(ctx.sessionProjections.viewExactCheckpoint(checkpoint, cursor)).toEqual({
+      asOfSeq: cursor,
+      values: { 'test/stable-view': { marks: ['current'] } },
+    })
+  })
+
+  it('rejects a checkpoint when a current projection row is unusable', async () => {
+    const { ctx, session } = await harness()
+    await ctx.sessionProjections.register(marksUnit())
+    const cursor = mark(session, ['stored']).seq
+    const checkpoint = ctx.sessionProjections.checkpoint(session)
+    await ctx.sessionProjections.register(countUnit())
+    const view = (row: (typeof checkpoint)[string]) =>
+      ctx.sessionProjections.viewExactCheckpoint({ ...checkpoint, 'test/count': row }, cursor)
+
+    expect(ctx.sessionProjections.viewExactCheckpoint(checkpoint, cursor)).toBeUndefined()
+    expect(view({ ver: 2, seq: cursor, val: 1 })).toBeUndefined()
+    expect(view({ ver: 1, seq: -1, val: 1 })).toBeUndefined()
+    expect(view({ ver: 1, seq: SessionSeq(cursor + 1), val: 1 })).toBeUndefined()
+    expect(view({ ver: 1, seq: cursor, val: 'invalid' })).toBeUndefined()
+    expect(view({ ver: 1, seq: cursor, val: 1 })).toEqual({
+      asOfSeq: cursor,
+      values: { 'test/marks': { marks: ['stored'] } },
+    })
+  })
+
+  it('declines an exact checkpoint if the current wire view fails', async () => {
+    const { ctx, session } = await harness()
+    let mode: 'valid' | 'invalid' | 'throws' = 'valid'
+    const render = (): MarksView => {
+      if (mode === 'throws') throw new Error('view unavailable')
+      return mode === 'invalid' ? { marks: [1 as never] } : { marks: [] }
+    }
+    await ctx.sessionProjections.register(stableViewUnit(render))
+    const checkpoint = ctx.sessionProjections.checkpoint(session)
+    mode = 'invalid'
+    expect(ctx.sessionProjections.viewExactCheckpoint(checkpoint, -1)).toBeUndefined()
+    mode = 'throws'
+    expect(ctx.sessionProjections.viewExactCheckpoint(checkpoint, -1)).toBeUndefined()
+  })
+
   it('viewCheckpoint and restore exclude host-only state while retaining its checkpoint', async () => {
     const { ctx } = await harness()
     await ctx.sessionProjections.register(marksUnit())

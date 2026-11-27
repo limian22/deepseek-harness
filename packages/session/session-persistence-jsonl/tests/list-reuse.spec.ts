@@ -9,7 +9,7 @@ import { SESSION_FORMAT_VERSION, SessionId, type SessionHeader } from '@deepseek
 import { SessionPersistenceRevision } from '@deepseek-ai/dsh-session-persistence'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { generationLogPath, sessionDir, toHeaderLine } from '../src/format.ts'
@@ -20,6 +20,7 @@ const io = vi.hoisted(() => ({
   stat: new Map<string, number>(),
   readdir: new Map<string, number>(),
   onStat: undefined as undefined | ((path: string, count: number) => void | Promise<void>),
+  onReaddir: undefined as undefined | ((path: string) => Promise<void>),
   onHandleRead: undefined as undefined | ((path: string) => void | Promise<void>),
 }))
 
@@ -56,7 +57,9 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       return identity
     }) as typeof actual.stat,
     readdir: (async (...args: Parameters<typeof actual.readdir>) => {
-      if (io.enabled) tally(io.readdir, String(args[0]))
+      const path = String(args[0])
+      if (io.enabled) tally(io.readdir, path)
+      if (io.onReaddir !== undefined) await io.onReaddir(path)
       return actual.readdir(...args)
     }) as typeof actual.readdir,
   }
@@ -124,6 +127,7 @@ function resetIo(): void {
   io.stat.clear()
   io.readdir.clear()
   io.onStat = undefined
+  io.onReaddir = undefined
   io.onHandleRead = undefined
   io.enabled = true
 }
@@ -155,9 +159,82 @@ function byId<T extends { readonly header: SessionHeader }>(rows: readonly T[]):
 afterEach(async () => {
   io.enabled = false
   io.onStat = undefined
+  io.onReaddir = undefined
   io.onHandleRead = undefined
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+})
+
+describe('JsonlSessionPersistence exact project lookup', () => {
+  it.each([false, true])('bounds simultaneous project reads and skips queued probes on abort (%s)', async (cancel) => {
+    const root = await freshRoot()
+    const target = header('target', '/a')
+    await seed(root, target)
+    for (const cwd of ['/b', '/c', '/d']) await seed(root, header('other', cwd))
+    const ctx = await backend(root)
+    // Prime the one-time encoding check before observing the exact lookup.
+    await ctx.sessionPersistence.stat(target.id)
+    const paths = new Set(['/a', '/b', '/c', '/d'].map(cwd => sessionDir(root, cwd, target.id)))
+    const release = Promise.withResolvers<undefined>()
+    const controller = new AbortController()
+    const reason = new Error('exact lookup cancelled')
+    resetIo()
+    io.onReaddir = async (path) => {
+      if (paths.has(path)) await release.promise
+    }
+    const lookup = ctx.sessionPersistence.stat(target.id, { signal: controller.signal })
+    const settled = Promise.allSettled([lookup])
+    const calls = () => [...paths].reduce((sum, path) => sum + count(io.readdir, path), 0)
+    try {
+      await vi.waitFor(() => { expect(calls()).toBe(3) }, { timeout: 2500 })
+      if (cancel) controller.abort(reason)
+    } finally {
+      release.resolve(undefined)
+      await settled
+    }
+    if (cancel) {
+      await expect(lookup).rejects.toBe(reason)
+      expect(calls()).toBe(3)
+    } else {
+      await expect(lookup).resolves.toMatchObject({ header: target })
+      expect(calls()).toBe(4)
+    }
+  })
+
+  it('keeps project enumeration order when errors complete out of order', async () => {
+    const root = await freshRoot()
+    const target = header('target', '/a')
+    await seed(root, target)
+    await seed(root, header('other', '/b'))
+    const ctx = await backend(root)
+    await ctx.sessionPersistence.stat(target.id)
+    const projects = await readdir(root)
+    const first = join(root, projects[0]!, target.id)
+    const second = join(root, projects[1]!, target.id)
+    const firstError = Object.assign(new Error('first project denied'), { code: 'EACCES' })
+    const secondError = Object.assign(new Error('second project denied'), { code: 'EACCES' })
+    const release = Promise.withResolvers<undefined>()
+    let secondEntered = false
+    io.onReaddir = async (path) => {
+      if (path === first) {
+        await release.promise
+        throw firstError
+      }
+      if (path === second) {
+        secondEntered = true
+        throw secondError
+      }
+    }
+    const lookup = ctx.sessionPersistence.stat(target.id)
+    const settled = Promise.allSettled([lookup])
+    try {
+      await vi.waitFor(() => { expect(secondEntered).toBe(true) }, { timeout: 2500 })
+    } finally {
+      release.resolve(undefined)
+      await settled
+    }
+    await expect(lookup).rejects.toBe(firstError)
+  })
 })
 
 describe('JsonlSessionPersistence listing identity reuse', () => {

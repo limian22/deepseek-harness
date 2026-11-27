@@ -2,6 +2,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
 import type { HistoryController } from '../history/controller.ts'
 import { addressId, rejectNotFound } from '../history.ts'
@@ -15,12 +16,14 @@ export class WebController {
   /**
    * @param ctx - Host context carrying Session queries and identity projections.
    * @param historyController - passive reading and listener construction.
-   * @param promote - background activation requested before an opening snapshot is delivered.
+   * @param promote - background activation using a retained full observation.
+   * @param promoteIndexed - admit background activation by id after an indexed opening.
    */
   constructor(
     private readonly ctx: Context,
     private readonly historyController: HistoryController,
     private readonly promote: (observation: SessionObservation) => void,
+    private readonly promoteIndexed?: (sessionId: SessionId) => void,
   ) {}
 
   /**
@@ -38,17 +41,35 @@ export class WebController {
     using assistantListener = request.assistantStream === true
       ? streams.bind(sessionId, signal, queue)
       : undefined
-    using observation = await this.historyController.usingObservation({ sessionId, projection: true }, signal)
-      .catch((error: unknown) => {
-        if (remoteErrorOf(error)?.code === 'session/not-found') rejectNotFound(request.address)
-        throw error
-      })
-    validateObservationAddress(request.address, observation)
-    let opening: SessionFollowFrame = {
-      type: 'snapshot',
-      header: { ...observation.header },
-      projections: projections(observation),
-      ...history(observation, spec),
+    const indexedRequest = { ...request, maxMessages: spec.maxMessages }
+    const indexed = request.address.kind === 'session' && this.ctx.sessions.get(sessionId) === undefined
+      ? await this.historyController.indexedOpening(indexedRequest, signal)
+      : undefined
+    signal.throwIfAborted()
+    const source = indexed !== undefined && indexed.header.id === sessionId && indexed.header.cwd !== undefined
+      && indexed.header.origin !== 'subagent' && this.ctx.sessions.get(sessionId) === undefined
+      ? { kind: 'indexed' as const, indexed }
+      : {
+        kind: 'observed' as const,
+        observation: await this.historyController.usingObservation({ sessionId, projection: true }, signal)
+          .catch((error: unknown) => {
+            if (remoteErrorOf(error)?.code === 'session/not-found') rejectNotFound(request.address)
+            throw error
+          }),
+      }
+    using observation = source.observation
+    signal.throwIfAborted()
+    let opening: Extract<SessionFollowFrame, { type: 'snapshot' }>
+    if (source.kind === 'indexed') {
+      opening = { type: 'snapshot', ...source.indexed }
+    } else {
+      validateObservationAddress(request.address, source.observation)
+      opening = {
+        type: 'snapshot',
+        header: { ...source.observation.header },
+        projections: projections(source.observation),
+        ...history(source.observation, spec),
+      }
     }
     listener.setCursor(opening.cursor)
     if (assistantListener !== undefined) {
@@ -56,21 +77,24 @@ export class WebController {
       opening = { ...opening, assistantStream }
       assistantListener.setOrdinalCut(ordinal)
     }
-    // Increments come from the queue, so the opening ends this lease in every branch;
-    // activation continues on its own retained lease. Promotion starts before the opening is
-    // delivered, so a consumer that stops after the snapshot still gets the activation it asked for.
-    if (request.activate === true && !signal.aborted
-      && observation.header.origin !== 'subagent' && observation.source === 'prepared') {
-      const promotion = observation.retain()
-      observation[Symbol.dispose]()
-      try {
-        this.promote(promotion)
-      } catch (error: unknown) {
-        promotion[Symbol.dispose]()
-        throw error
-      }
+    // Admit activation before yielding so a snapshot-only reader still gets it.
+    if (source.kind === 'indexed') {
+      if (request.activate === true) this.promoteIndexed?.(sessionId)
     } else {
-      observation[Symbol.dispose]()
+      const observed = source.observation
+      const canPromote = observed.source === 'prepared' && observed.header.origin !== 'subagent'
+      if (canPromote) this.historyController.rememberOpening(observed, indexedRequest, opening)
+      const promotion = canPromote && request.activate === true && !signal.aborted ? observed.retain() : undefined
+      // Increments come from the queue, so the opening ends the observation lease.
+      observation?.[Symbol.dispose]()
+      if (promotion !== undefined) {
+        try {
+          this.promote(promotion)
+        } catch (error: unknown) {
+          promotion[Symbol.dispose]()
+          throw error
+        }
+      }
     }
     yield opening
     yield* queue.items()

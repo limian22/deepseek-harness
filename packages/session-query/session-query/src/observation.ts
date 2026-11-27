@@ -52,6 +52,8 @@ export interface SessionObservationOptions {
   readonly signal?: AbortSignal
   /** Whether to compute every projection or leave projection state untouched. */
   readonly projectionMode?: 'all' | 'none'
+  /** Omit caching of a newly prepared observation for background maintenance. */
+  readonly cachePrepared?: false
 }
 
 /**
@@ -106,7 +108,7 @@ export class SessionObservationReader {
     sessionId: SessionId,
     options: SessionObservationOptions = {},
   ): Promise<SessionObservation> {
-    const { signal, projectionMode = 'all' } = options
+    const { signal, projectionMode = 'all', cachePrepared = true } = options
     for (;;) {
       throwIfObservationAborted(signal)
       const live = this.ctx.sessions.get(sessionId)
@@ -155,7 +157,7 @@ export class SessionObservationReader {
           events: Object.freeze(seed),
           refs: 0,
         }
-        this.store(sessionId, entry)
+        if (cachePrepared) this.store(sessionId, entry)
       }
 
       let projections: ProjectionSnapshot | undefined

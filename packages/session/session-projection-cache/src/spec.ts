@@ -66,10 +66,22 @@ export type CheckpointIdentity = z.infer<typeof checkpointIdentity>
  * every write (whole-value discipline — the registry checkpoint is always
  * the complete per-session cut).
  */
+const openingReceipt = z.object({
+  version: z.literal(1),
+  digest: z.string().regex(/^[0-9a-f]{64}$/u),
+  revision: z.string(),
+  offset: z.number().int().positive(),
+  firstSeq: z.number().int().nonnegative(),
+  cursor: z.number().int().nonnegative(),
+})
+
 export const checkpointRecord = z.object({
   identity: checkpointIdentity,
   rows: z.record(z.string(), checkpointRow),
 })
+
+export const openingRecord = checkpointRecord.extend({ receipt: openingReceipt })
+export type OpeningRecord = z.infer<typeof openingRecord>
 
 /** One stored per-session checkpoint record, inferred from {@link checkpointRecord}. */
 export type CheckpointRecord = z.infer<typeof checkpointRecord>
@@ -103,5 +115,8 @@ export const projectionCacheDomainSpec = defineDomain({
   compatibleVersions: [3, 4, 5, 6],
   invalidRecords: 'backup-and-skip',
   layout: 'per-record',
-  tables: { sessions: domainTable<SessionId, CheckpointRecord>(checkpointRecord) },
+  tables: {
+    sessions: domainTable<SessionId, CheckpointRecord>(checkpointRecord),
+    openings: domainTable<SessionId, OpeningRecord>(openingRecord),
+  },
 })

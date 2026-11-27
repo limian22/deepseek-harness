@@ -2,6 +2,7 @@
 
 import { hostname } from 'node:os'
 import { resolve } from 'node:path'
+import { scheduler } from 'node:timers/promises'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-fs'
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -180,7 +181,11 @@ export class SessionController extends TypertRemoteService {
     // opening frame arriving during that await would otherwise have no listener.
     this.historyController = new HistoryController(ctx)
     this.stateController = new StateController(ctx, this.historyController)
-    this.webController = new WebController(ctx, this.historyController, (observation) => { this.promote(observation) })
+    this.webController = new WebController(
+      ctx, this.historyController,
+      (observation) => { this.promote(observation.header.id, observation) },
+      (sessionId) => { this.promote(sessionId) },
+    )
     this.listState = new ApiSessionList(ctx, this.listWorkSliceMs)
     await this.commands.initialize()
     ctx.fiber.assertActive()
@@ -221,13 +226,17 @@ export class SessionController extends TypertRemoteService {
 
   /**
    * Request background activation through the existing Session Agent controller.
-   * @param observation - owned lease disposed by the background task; callers retain their own lease separately.
+   * @param sessionId - ordinary Session whose Agent is requested.
+   * @param observation - owned full observation, when the opening already prepared one.
    */
-  private promote(observation: SessionObservation): void {
-    const sessionId = observation.header.id
+  private promote(sessionId: SessionId, observation?: SessionObservation): void {
     const task = (async () => {
       using ownedObservation = observation
-      const result = await this.agents.resolveObservedAgent(ownedObservation)
+      // An indexed opening has no prepared lease. Let its frame leave before loading the full log.
+      if (ownedObservation === undefined) await scheduler.yield()
+      const result = ownedObservation === undefined
+        ? await this.agents.resolveAgent(sessionId)
+        : await this.agents.resolveObservedAgent(ownedObservation)
       if ('error' in result) this.ctx.emit('api-session/error', sessionId, result.error.message)
     })().catch((error: unknown) => {
       this.ctx.logger.error(`session-controller: background activation for "${sessionId}" failed: ${errorChain(error)}`)
@@ -254,7 +263,10 @@ export class SessionController extends TypertRemoteService {
   @Remote('list')
   async list(_request: SessionListRequest, signal: AbortSignal): Promise<SessionListValue> {
     const items = await this.listState.list(signal)
-    return { items: items.filter(item => this.ctx.remoteAccess.allows({ kind: 'session', id: item.sessionId })) }
+    const visible = items.filter(item => this.ctx.remoteAccess.allows({ kind: 'session', id: item.sessionId }))
+    const allowed = new Set(visible.map(item => item.sessionId))
+    this.historyController.indexCatalog(this.listState.coldCatalog.filter(record => allowed.has(record.header.id)))
+    return { items: visible }
   }
 
   /**

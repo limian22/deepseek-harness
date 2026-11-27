@@ -67,6 +67,14 @@ export interface SessionPersistenceSnapshot {
   readonly location?: SessionLocation
 }
 
+/** Derived physical cut into a fully validated immutable log revision. */
+export interface SessionOpeningSuffix {
+  readonly digest: string
+  readonly offset: number
+  readonly firstSeq: number
+  readonly cursor: number
+}
+
 /** Options for {@link SessionPersistence.create}. */
 export interface SessionPersistenceCreateOptions {
   /** Optional cancellation observed before backend work starts. */
@@ -224,6 +232,19 @@ export abstract class SessionPersistence extends Service {
    * @returns the snapshot, or `undefined` when the session does not exist.
    */
   abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<SessionPersistenceSnapshot | undefined>
+
+  /** Whether this instance can produce and check indexed opening descriptors. */
+  supportsOpeningIndex?(): boolean
+
+  /** Derive a disposable page descriptor for the exact revision already fully read by this backend. */
+  describeOpening?(
+    snapshot: SessionPersistenceSnapshot, events: readonly SessionEvent[], firstSeq: number, signal?: AbortSignal,
+  ): Promise<SessionOpeningSuffix | undefined>
+
+  /** Read the described page only when its source still matches the supplied observation. */
+  readOpening?(
+    snapshot: SessionPersistenceSnapshot, receipt: SessionOpeningSuffix, signal?: AbortSignal,
+  ): Promise<SessionEvent[] | undefined>
 
   /**
    * List every stored session visible to this process, in no promised order.

@@ -546,6 +546,62 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
     await expect(pending).rejects.toBe(reason)
   })
 
+  it('shares one cold decode for overlapping reads of the same revision', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('shared-cold-zstd')
+    const events = oneTurnLog()
+    await writeLog(ctx.sessionPersistence, header, events)
+    const reader = ctx.sessionPersistence as JsonlSessionPersistence.JsonlSessionPersistence
+    const decoder = vi.spyOn(reader as unknown as ZstdReaderInternals, 'readZstdPrefix')
+    const path = logPath(root, header.cwd, header.id, 'zstd')
+
+    const [first, second] = await Promise.all([
+      reader.readStoredLog(path, header.id),
+      reader.readStoredLog(path, header.id),
+    ])
+
+    expect(decoder).toHaveBeenCalledTimes(1)
+    expect(first).toBe(second)
+    expect(first.events).toEqual(events)
+  })
+
+  it('keeps a shared cold decode running when another caller cancels', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('shared-cold-zstd-cancellation')
+    const events = oneTurnLog()
+    await writeLog(ctx.sessionPersistence, header, events)
+    const reader = ctx.sessionPersistence as JsonlSessionPersistence.JsonlSessionPersistence
+    const internals = reader as unknown as ZstdReaderInternals
+    const decode = internals.readZstdPrefix.bind(internals)
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const decoder = vi.spyOn(internals, 'readZstdPrefix').mockImplementation(async (bytes, signal) => {
+      entered.resolve()
+      await release.promise
+      return decode(bytes, signal)
+    })
+    const path = logPath(root, header.cwd, header.id, 'zstd')
+    const cancelled = new AbortController()
+    const remaining = new AbortController()
+    const waiting = vi.spyOn(remaining.signal, 'addEventListener')
+    const first = reader.readStoredLog(path, header.id, cancelled.signal)
+    const reason = new Error('reader cancelled')
+    const cancellation = expect(first).rejects.toBe(reason)
+    await entered.promise
+    const second = reader.readStoredLog(path, header.id, remaining.signal)
+    try {
+      await vi.waitFor(() => expect(waiting).toHaveBeenCalledWith('abort', expect.any(Function), expect.anything()))
+      cancelled.abort(reason)
+      await cancellation
+    } finally {
+      release.resolve()
+    }
+    expect((await second).events).toEqual(events)
+    expect(decoder).toHaveBeenCalledTimes(1)
+  })
+
   it('continues decoding every frame after a slice deadline yields', async () => {
     const root = await freshRoot()
     const ctx = await mount(root)

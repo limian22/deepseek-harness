@@ -1,9 +1,10 @@
 /** Independent Session snapshots and passive event subscriptions. */
 
+import { scheduler } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import { SessionLogOffset, SessionSeq, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session'
 import type { SessionId, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
+import type { SessionObservation, SessionRecord } from '@deepseek-ai/dsh-session-query'
 import { RemoteError, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
 import {
   DEFAULT_MAX_MESSAGES, paginate, pageRecords, entryFor, addressId,
@@ -12,21 +13,165 @@ import {
 import { EventListener, ProjectionListener } from './listener.ts'
 import { SessionAssistantStreamsListener } from './assistant-stream.ts'
 import type {
-  SessionEventFrame, SessionEventsPage, SessionPageRequest,
+  SessionEventFrame, SessionEventsPage, SessionFollowFrame, SessionFollowRequest, SessionPageRequest,
   SessionObserveEventRequest, SessionProjectionsRequest, SessionProjectionFrame,
   SessionAddress, SessionProjectionBaseline, SessionProjectionValues, SessionProjectionsValue, SessionWaitOutput, SessionHistoryRecord,
 } from '../types.ts'
 
+interface ObservationRequest {
+  readonly sessionId: SessionId
+  readonly projection: boolean
+  readonly cachePrepared?: false
+}
+
+type OpeningSnapshot = Extract<SessionFollowFrame, { type: 'snapshot' }>
+type OpeningRequest = SessionFollowRequest & Pick<SessionPageRequest, 'beforeSeq' | 'throughSeq'> & { readonly maxMessages: number }
+
+const INDEX_WINDOW = { maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }
+const MIN_BACKFILL_BYTES = 512 * 1024
+
+function indexable(request: OpeningRequest): boolean {
+  return request.address.kind === 'session' && request.beforeSeq === undefined && request.throughSeq === undefined
+    && request.maxMessages === INDEX_WINDOW.maxMessages
+    && request.turnWindow?.minMessages === INDEX_WINDOW.turnWindow.minMessages
+    && request.turnWindow.minTurns === INDEX_WINDOW.turnWindow.minTurns
+}
 
 /** Session snapshots do not share lifetime with passive subscriptions. */
 export class HistoryController {
 
   /** Reconnect state for this controller's assistant subscriptions. */
   readonly streamsListener: SessionAssistantStreamsListener
+  private readonly catalogQueue = new Map<SessionId, () => Promise<void>>()
+  private readonly unindexedRevision = new Map<SessionId, string>()
+  private readonly indexLifetime = new AbortController()
+  private indexing = false
 
   /** @param ctx - Host context carrying Session reads and projections. */
   constructor(private readonly ctx: Context) {
     this.streamsListener = new SessionAssistantStreamsListener(this.ctx)
+    this.ctx.effect(() => () => { this.indexLifetime.abort() }, 'session-history.opening-index')
+  }
+
+  /** Read a cold opening only when persistence and all current projection units accept its receipt. */
+  async indexedOpening(request: OpeningRequest, signal: AbortSignal): Promise<Omit<OpeningSnapshot, 'type' | 'assistantStream'> | undefined> {
+    if (!indexable(request)) return undefined
+    const id = addressId(request.address)
+    const persistence = this.ctx.get('sessionPersistence')
+    const cache = this.ctx.get('sessionProjectionCache')
+    if (persistence?.readOpening === undefined || cache?.hasOpening(id) !== true
+      || this.ctx.sessions.get(id) !== undefined) return undefined
+    let attached = false
+    const hasAttached = () => attached
+    const detach = this.ctx.on('session/created', (session) => { if (session.id === id) attached = true }, { global: true })
+    try {
+      const source = await persistence.stat(id, { signal })
+      if (source === undefined || source.header.id !== id || source.header.cwd === undefined
+        || source.header.isSeeded || source.header.origin === 'subagent' || hasAttached()) return undefined
+      const receipt = cache.openingReceipt(source.header)
+      if (receipt === undefined || receipt.revision !== source.revision) return undefined
+      const events = await persistence.readOpening(source, receipt, signal)
+      signal.throwIfAborted()
+      if (events === undefined || hasAttached() || this.ctx.sessions.get(id) !== undefined
+        || this.ctx.get('sessionPersistence')?.identity !== persistence.identity) return undefined
+      const current = this.ctx.get('sessionProjectionCache')?.cachedOpening(source.header)
+      if (current?.receipt !== receipt) return undefined
+      const cursor = SessionSeq(receipt.cursor)
+      const page = paginate(events, undefined, request.maxMessages, cursor, request.turnWindow, SessionLogOffset(receipt.firstSeq))
+      if (page.needsEarlier === true) return undefined
+      return {
+        header: source.header, cursor, records: pageRecords(page.events), hasMore: page.hasMore,
+        projections: current.projections as SessionProjectionBaseline,
+      }
+    } catch {
+      signal.throwIfAborted()
+      return undefined
+    } finally {
+      detach()
+    }
+  }
+
+  /** Prepare a future indexed opening from a fully restored ordinary session. */
+  rememberOpening(observation: SessionObservation, request: OpeningRequest, opening: OpeningSnapshot): void {
+    if (!indexable(request) || observation.source !== 'prepared' || !opening.hasMore
+      || observation.header.isSeeded || observation.header.origin === 'subagent'
+      || observation.persistedEventCount !== observation.cursor + 1 || observation.revision === undefined) return
+    const firstSeq = opening.records[0]?.event.seq
+    if (firstSeq === undefined || firstSeq === 0) return
+    if (!this.canIndex()) return
+    const id = observation.header.id
+    if (!this.catalogQueue.has(id)) this.catalogQueue.set(id, () => this.writeOpening(observation, firstSeq))
+    this.startIndexing()
+  }
+
+  /** Schedule one bounded background lane for long, current, ordinary session logs. */
+  indexCatalog(records: readonly SessionRecord[]): void {
+    const cache = this.ctx.get('sessionProjectionCache')
+    if (cache === undefined || !this.canIndex()) return
+    for (const { header, formatStatus, sizeBytes, revision } of records) {
+      if (formatStatus === 'current' && revision !== undefined && (sizeBytes ?? 0) >= MIN_BACKFILL_BYTES
+        && header.origin !== 'subagent' && !header.isSeeded && this.unindexedRevision.get(header.id) !== revision
+        && !this.catalogQueue.has(header.id)
+        && !cache.hasOpening(header.id, revision)) {
+        this.catalogQueue.set(header.id, () => this.buildCatalogOpening(header.id))
+      }
+    }
+    this.startIndexing()
+  }
+
+  private canIndex(): boolean {
+    return !this.indexLifetime.signal.aborted && this.ctx.get('sessionProjectionCache') !== undefined
+      && this.ctx.get('sessionPersistence')?.supportsOpeningIndex?.() === true
+  }
+
+  private startIndexing(): void {
+    if (this.indexing || this.catalogQueue.size === 0 || !this.canIndex()) return
+    this.indexing = true
+    void this.drainOpeningIndex().finally(() => { this.indexing = false })
+  }
+
+  private async drainOpeningIndex(): Promise<void> {
+    for (const [id, build] of this.catalogQueue) {
+      await scheduler.yield()
+      if (!this.canIndex()) break
+      try {
+        if (this.ctx.sessions.get(id) === undefined) await build()
+      } catch {
+        // A failed or superseded index must not affect the authority of the stored log.
+      } finally {
+        this.catalogQueue.delete(id)
+      }
+    }
+    this.catalogQueue.clear()
+  }
+
+  private async buildCatalogOpening(id: SessionId): Promise<void> {
+    const signal = this.indexLifetime.signal
+    using observation = await this.usingObservation({ sessionId: id, projection: false, cachePrepared: false }, signal)
+    if (observation.source !== 'prepared' || observation.revision === undefined) return
+    const page = history(observation, INDEX_WINDOW)
+    const firstSeq = page.records[0]?.event.seq
+    if (!page.hasMore || firstSeq === undefined || observation.persistedEventCount !== observation.cursor + 1) {
+      this.unindexedRevision.set(id, observation.revision)
+      return
+    }
+    await this.writeOpening(observation, firstSeq)
+  }
+
+  private async writeOpening(observation: SessionObservation, firstSeq: number): Promise<void> {
+    const signal = this.indexLifetime.signal
+    const persistence = this.ctx.get('sessionPersistence')
+    const cache = this.ctx.get('sessionProjectionCache')
+    const { header, events, revision } = observation
+    if (signal.aborted || persistence?.describeOpening === undefined || cache === undefined
+      || this.ctx.sessions.get(header.id) !== undefined) return
+    const source = await persistence.stat(header.id, { signal })
+    if (source === undefined || source.revision !== revision) return
+    const receipt = await persistence.describeOpening(source, events, firstSeq, signal)
+    if (receipt === undefined) return
+    await cache.writeOpening(header, { ...receipt, revision: source.revision, version: 1 }, events, async () =>
+      !signal.aborted && this.ctx.get('sessionPersistence')?.identity === persistence.identity
+      && (await persistence.stat(header.id, { signal }))?.revision === source.revision)
   }
 
   /**
@@ -150,7 +295,7 @@ export class HistoryController {
    * @returns a lease the caller must dispose.
    */
   usingObservation(
-    request: { readonly sessionId: SessionId; readonly projection: boolean }, signal: AbortSignal, callback?: undefined,
+    request: ObservationRequest, signal: AbortSignal, callback?: undefined,
   ): Promise<SessionObservation>
   /**
    * Keep the borrowed lease alive until the callback settles, then dispose it.
@@ -160,16 +305,19 @@ export class HistoryController {
    * @returns the callback result; read and callback failures propagate.
    */
   usingObservation<T>(
-    request: { readonly sessionId: SessionId; readonly projection: boolean }, signal: AbortSignal,
+    request: ObservationRequest, signal: AbortSignal,
     callback: (observation: SessionObservation) => T,
   ): Promise<Awaited<T>>
   async usingObservation<T>(
-    { sessionId, projection }: { readonly sessionId: SessionId; readonly projection: boolean }, signal: AbortSignal,
+    { sessionId, projection, cachePrepared }: ObservationRequest,
+    signal: AbortSignal,
     callback?: (observation: SessionObservation) => T,
   ): Promise<SessionObservation | Awaited<T>> {
     let observation: SessionObservation
     try {
-      observation = await this.ctx.sessionQuery.observeSession(sessionId, { signal, projectionMode: projection ? 'all' : 'none' })
+      observation = await this.ctx.sessionQuery.observeSession(sessionId, {
+        signal, projectionMode: projection ? 'all' : 'none', ...(cachePrepared === undefined ? {} : { cachePrepared }),
+      })
     } catch (error: unknown) {
       const code = (error as { readonly code?: unknown } | null | undefined)?.code
       if (code === 'SESSION_QUERY_SESSION_NOT_FOUND') {

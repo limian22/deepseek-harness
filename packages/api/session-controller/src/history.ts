@@ -121,13 +121,14 @@ export function rejectNotFound(address: SessionAddress): never {
 }
 
 /**
- * Cut one message-aligned backwards page from a contiguous event prefix.
- * @param events - contiguous events starting at seq 0.
+ * Cut one message-aligned backwards page from a contiguous sequence of events.
+ * @param events - contiguous events starting at baseSeq.
  * @param beforeSeq - exclusive upper offset of an older page.
  * @param maxMessages - message budget.
  * @param throughSeq - inclusive log cut.
  * @param turnWindow - optional turn-boundary stop rule.
- * @returns the page events and whether older events remain.
+ * @param baseSeq - absolute sequence of the first supplied event.
+ * @returns the page, or an indication that the supplied events omit its start.
  */
 export function paginate(
   events: readonly SessionEvent[],
@@ -135,13 +136,14 @@ export function paginate(
   maxMessages: number,
   throughSeq: SessionSeqCursor,
   turnWindow?: SessionPageRequest['turnWindow'],
-): { readonly events: SessionEvent[]; readonly hasMore: boolean } {
+  baseSeq: SessionLogOffsetType = SessionLogOffset(0),
+): { readonly events: SessionEvent[]; readonly hasMore: boolean; readonly needsEarlier?: true } {
   const end = SessionLogOffset(Math.min(throughSeq + 1, beforeSeq ?? throughSeq + 1))
   let count = 0
   let turns = 0
   let cut = SessionLogOffset(0)
-  for (let index = end - 1; index >= 0; index--) {
-    const event = events[index] as SessionEvent
+  for (let index = end - 1; index >= baseSeq; index--) {
+    const event = events[index - baseSeq] as SessionEvent
     if (turnWindow !== undefined && event.type === 'turn/start') {
       turns++
       if (count >= turnWindow.minMessages && turns >= turnWindow.minTurns) {
@@ -163,7 +165,8 @@ export function paginate(
       break
     }
   }
-  return { events: events.slice(cut, end), hasMore: cut > 0 }
+  if (cut < baseSeq) return { events: [], hasMore: true, needsEarlier: true }
+  return { events: events.slice(cut - baseSeq, end - baseSeq), hasMore: cut > 0 }
 }
 
 /**

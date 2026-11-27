@@ -244,6 +244,31 @@ describe('WorkspaceRegistry lifecycle and bootstrap', () => {
     })
   })
 
+  it('resolves each exact cwd once per indexing pass and rechecks it on restart', async () => {
+    const dir = await makeDir('shared')
+    const alias = join(base, 'shared-link')
+    const missing = join(base, 'missing')
+    await symlink(dir, alias, process.platform === 'win32' ? 'junction' : 'dir')
+    const resolvePath = vi.spyOn(workspacePaths, 'realpathNormalize')
+    onTestFinished(() => { resolvePath.mockRestore() })
+    const sessions = [
+      header('a', dir), header('b', dir), header('c', alias),
+      header('absent-a', missing), header('absent-b', missing),
+    ]
+    const first = await harness({ sessions })
+    expect(resolvePath.mock.calls.map(([cwd]) => cwd)).toEqual([dir, alias, missing])
+    expect(first.registry.list().map(workspace => workspace.sessionIds)).toEqual([['a', 'b', 'c']])
+
+    await first.ctx.fiber.dispose()
+    await rm(alias)
+    await writeFile(alias, 'regular file')
+    await mkdir(missing)
+    resolvePath.mockClear()
+    const next = await harness({ pool: first.pool, sessions })
+    expect(resolvePath.mock.calls.map(([cwd]) => cwd)).toEqual([dir, alias, missing])
+    expect(next.registry.list().map(workspace => workspace.sessionIds)).toEqual([['a', 'b']])
+  })
+
   it('breaks equal bootstrap timestamps by session id and canonical path', async () => {
     const first = await makeDir('tie-first')
     const second = await makeDir('tie-second')

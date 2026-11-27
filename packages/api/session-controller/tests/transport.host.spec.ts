@@ -1,4 +1,8 @@
 import { Context } from '@deepseek-ai/cordis'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import type { ApiSessionAgentController } from '../src/agent.ts'
+import { entryFor } from '../src/history.ts'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import SessionStore, { SESSION_FORMAT_VERSION, type SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SurfaceIntent } from '@deepseek-ai/dsh-session'
@@ -8,7 +12,8 @@ import { subagentIdentityProjectionDefinition } from '@deepseek-ai/dsh-subagent/
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HistoryController } from '../src/history/controller.ts'
 import { WebController } from '../src/web/controller.ts'
-import { installSessionReadTestServices, testSessionPersistence } from './test-remote.ts'
+import type { SessionFollowFrame } from '../src/types.ts'
+import { createSessionTestController, installSessionReadTestServices, testSessionPersistence } from './test-remote.ts'
 import { brandString } from '@deepseek-ai/dsh-brand'
 
 const signal = (): AbortSignal => new AbortController().signal
@@ -100,6 +105,99 @@ async function setup(): Promise<{ ctx: Context; history: HistoryController; web:
 }
 
 describe('Session history and Web follow', () => {
+  it('uses an indexed opening and admits activation for a consumer that only reads the snapshot', async () => {
+    const ctx = new Context()
+    roots.add(ctx)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(AgentRegistry)
+    const controller = await createSessionTestController(ctx, {
+      defaultModelSelection: () => ({ provider: 'fixture', model: 'fixture-model' }), cwd: '/workspace',
+    })
+    const { historyController: history, agents } = controller as unknown as {
+      historyController: HistoryController
+      agents: ApiSessionAgentController
+    }
+    const id = brandString<SessionId>('indexed-opening')
+    const header: SessionHeader = {
+      version: SESSION_FORMAT_VERSION, id, createdAt: 1, cwd: '/workspace', isSeeded: false,
+    }
+    const start = event('fixture/start', SessionSeq(0))
+    const opening = {
+      header,
+      cursor: start.seq,
+      hasMore: false,
+      records: [entryFor(start)],
+      projections: { asOfSeq: start.seq, values: {} },
+    }
+    vi.spyOn(history, 'indexedOpening').mockResolvedValue(opening)
+    const remember = vi.spyOn(history, 'rememberOpening')
+    const observe = vi.spyOn(history, 'usingObservation')
+    const promote = vi.spyOn(agents, 'resolveObservedAgent')
+    const resolveAgent = vi.spyOn(agents, 'resolveAgent').mockResolvedValue({
+      error: new RemoteError('gateway/internal', 'fixture activation stopped', {}),
+    })
+    const iterator = controller.follow({
+      address: { kind: 'session', sessionId: id }, assistantStream: true, activate: true,
+      maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 },
+    }, signal())[Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: { type: 'snapshot', ...opening, assistantStream: { revision: 0 } },
+    })
+    expect(resolveAgent).not.toHaveBeenCalled()
+    await iterator.return?.(undefined)
+    await vi.waitFor(() => { expect(resolveAgent).toHaveBeenCalledExactlyOnceWith(id) })
+    expect(promote).not.toHaveBeenCalled()
+    expect(observe).not.toHaveBeenCalled()
+    expect(remember).not.toHaveBeenCalled()
+  })
+
+  it('prefers a live Session attached during indexed lookup and follows from its cursor', async () => {
+    const { ctx, history } = await setup()
+    const id = brandString<SessionId>('indexed-opening-race')
+    const pending = deferred<Omit<Extract<SessionFollowFrame, { type: 'snapshot' }>, 'type' | 'assistantStream'>>()
+    const indexedOpening = vi.spyOn(history, 'indexedOpening').mockReturnValue(pending.promise)
+    const rememberOpening = vi.spyOn(history, 'rememberOpening')
+    const promoteIndexed = vi.fn()
+    const web = new WebController(ctx, history, vi.fn(), promoteIndexed)
+    const iterator = web.follow({ address: { kind: 'session', sessionId: id }, activate: true }, signal())[Symbol.asyncIterator]()
+    const opened = iterator.next()
+    expect(indexedOpening).toHaveBeenCalledOnce()
+    const session = ctx.sessions.create(id, { meta: { cwd: '/workspace' } })
+    const live = append(session, 'fixture/live', {})
+    pending.resolve({ header: session.header, cursor: -1, hasMore: false, records: [], projections: { asOfSeq: -1, values: {} } })
+
+    await expect(opened).resolves.toMatchObject({ value: { type: 'snapshot', cursor: live.seq } })
+    const next = append(session, 'fixture/next', {})
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'event', event: next } })
+    await iterator.return?.(undefined)
+    expect(promoteIndexed).not.toHaveBeenCalled()
+    expect(rememberOpening).not.toHaveBeenCalled()
+  })
+
+  it('does not deliver an indexed opening or activate after cancellation during lookup', async () => {
+    const { ctx, history } = await setup()
+    const id = brandString<SessionId>('indexed-opening-cancel')
+    const pending = deferred<NonNullable<Awaited<ReturnType<HistoryController['indexedOpening']>>>>()
+    vi.spyOn(history, 'indexedOpening').mockReturnValue(pending.promise)
+    const promoteIndexed = vi.fn()
+    const observe = vi.spyOn(history, 'usingObservation')
+    const web = new WebController(ctx, history, vi.fn(), promoteIndexed)
+    const abort = new AbortController()
+    const iterator = web.follow({ address: { kind: 'session', sessionId: id }, activate: true }, abort.signal)[Symbol.asyncIterator]()
+    const opened = iterator.next()
+    abort.abort(new Error('cancelled opening'))
+    pending.resolve({
+      header: { version: SESSION_FORMAT_VERSION, id, createdAt: 1, cwd: '/workspace', isSeeded: false },
+      cursor: -1, hasMore: false, records: [], projections: { asOfSeq: -1, values: {} },
+    })
+
+    await expect(opened).rejects.toThrow('cancelled opening')
+    expect(observe).not.toHaveBeenCalled()
+    expect(promoteIndexed).not.toHaveBeenCalled()
+  })
+
   it('opens at the current cursor and follows later events from an ordinary Session', async () => {
     const { ctx, history, web } = await setup()
     const session = ctx.sessions.create(brandString<SessionId>('ordinary'), { meta: { cwd: '/workspace' } })

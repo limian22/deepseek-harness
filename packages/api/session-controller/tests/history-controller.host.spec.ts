@@ -1,6 +1,17 @@
+import { randomBytes } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { createMessage } from '@deepseek-ai/dsh-llm'
-import SessionStore, { type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import SessionStore, { SESSION_FORMAT_VERSION, type SessionEvent, type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import * as Jsonl from '@deepseek-ai/dsh-session-persistence-jsonl'
+import ProjectionCache from '@deepseek-ai/dsh-session-projection-cache'
+import Storage from '@deepseek-ai/dsh-storage'
+import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
+import * as StorageJson from '@deepseek-ai/dsh-storage-json'
+import { titleProjectionDefinition } from '@deepseek-ai/dsh-session-title'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HistoryController } from '../src/history/controller.ts'
 import { WebController } from '../src/web/controller.ts'
@@ -29,6 +40,65 @@ async function fixture() {
 }
 
 describe('HistoryController passive reads', () => {
+  it('indexes a never-opened JSONL session without activation and refuses it after the log advances', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-opening-test-'))
+    const ctx = new Context()
+    try {
+      await ctx.plugin(Storage)
+      await ctx.plugin(StorageJson, { root: join(root, 'storage') })
+      await ctx.plugin(StorageDomain, { backend: 'json' })
+      await ctx.plugin(SessionStore)
+      await ctx.plugin(AgentRegistry)
+      await installSessionReadTestServices(ctx)
+      await ctx.sessionProjections.register(titleProjectionDefinition)
+      await ctx.plugin(Jsonl, { root: join(root, 'logs') })
+      await ctx.plugin(ProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 60_000 })
+      const id = brandString<SessionId>('indexed-history')
+      const header = { id, version: SESSION_FORMAT_VERSION, cwd: root, createdAt: 1, isSeeded: false }
+      {
+        await using writer = await ctx.sessionPersistence.create(header)
+        for (let turn = 1; turn <= 55; turn += 1) {
+          const seq = (turn - 1) * 3
+          const content = [{ type: 'text' as const, text: randomBytes(11 * 1024).toString('base64') }]
+          await writer.append([
+            { type: 'turn/start', seq: SessionSeq(seq), time: seq + 1, data: { turn } },
+            {
+              type: 'user/message', seq: SessionSeq(seq + 1), time: seq + 2, surfaceOp: 'append',
+              data: createMessage({ role: 'user', content, source: { kind: 'user' } }),
+            },
+            { type: 'turn/end', seq: SessionSeq(seq + 2), time: seq + 3, data: { turn, reason: { kind: 'completed' } } },
+          ] as SessionEvent[])
+        }
+      }
+      const history = new HistoryController(ctx)
+      const web = new WebController(ctx, history, (observation) => { observation[Symbol.dispose]() })
+      const signal = new AbortController().signal
+      const request = { address: { kind: 'session' as const, sessionId: id }, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }
+      const listed = await ctx.sessionQuery.listSessions(signal)
+      history.indexCatalog(listed)
+      history.indexCatalog(listed)
+      await vi.waitFor(() => { expect(ctx.sessionProjectionCache.hasOpening(id)).toBe(true) })
+      const indexed = await history.indexedOpening(request, signal)
+      expect(indexed).toMatchObject({ cursor: 164, hasMore: true })
+      expect(ctx.sessions.get(id)).toBeUndefined()
+      const full = web.follow({ ...request, maxMessages: 501 }, signal)[Symbol.asyncIterator]()
+      expect((await full.next()).value).toEqual({ type: 'snapshot', ...indexed })
+      await full.return?.()
+      const writer = await ctx.sessionPersistence.open(id, { access: 'write' })
+      await writer.append([
+        { type: 'turn/start', seq: SessionSeq(165), time: 166, data: { turn: 56 } },
+        { type: 'turn/end', seq: SessionSeq(166), time: 167, data: { turn: 56, reason: { kind: 'completed' } } },
+      ])
+      await writer.close()
+      expect(await history.indexedOpening(request, signal)).toBeUndefined()
+      history.indexCatalog(await ctx.sessionQuery.listSessions(signal))
+      await vi.waitFor(() => { expect(ctx.sessionProjectionCache.openingReceipt(header)?.cursor).toBe(166) })
+      expect((await history.indexedOpening(request, signal))?.cursor).toBe(166)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+    }
+  })
   it('subscribes without reading an Observation and emits later durable events', async () => {
     const f = await fixture()
     const observe = vi.spyOn(f.ctx.sessionQuery, 'observeSession')

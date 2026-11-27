@@ -48,6 +48,10 @@ export interface SessionRecord {
   persisted: boolean
   /** Current for live Sessions; otherwise the persistence format status when reported. */
   formatStatus?: 'current' | 'migration-required'
+  /** Durable artifact size when supplied by the backend. */
+  sizeBytes?: number
+  /** Durable change token for a cold record, when supplied by the backend. */
+  revision?: string
 }
 
 /** One atomic live-preferred observation of a session's current model surface. */

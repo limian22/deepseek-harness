@@ -27,7 +27,7 @@ import {
   assertStoredId, materializeCreateHeader, sessionFormatVersionRefusal, validateStoredEvents,
   type SessionAccess, type SessionHandle,
   type SessionHandleReadResult,
-  type SessionLocation, type SessionPersistenceCreateOptions,
+  type SessionLocation, type SessionOpeningSuffix, type SessionPersistenceCreateOptions,
   type SessionPersistenceListOptions, type SessionPersistenceOpenOptions,
   type SessionPersistenceSnapshot, type SessionPersistenceStatOptions,
   type SessionPersistenceRevision as PersistenceRevision,
@@ -55,6 +55,7 @@ import {
   type ReadLogWorkerResult,
 } from './read-worker-client.ts'
 import { fileRevision } from './revision.ts'
+import { describeOpeningSuffix, openingSourceDigest, readOpeningSuffix } from './opening-suffix.ts'
 import { prepareCatalogFacts } from './catalog-migration.ts'
 import {
   JsonlGenerationSourceChangedError,
@@ -93,7 +94,7 @@ const DEFAULT_COMPRESSION: JsonlCompression = 'zstd'
  * frame-boundary event-loop yields against `setImmediate` overhead. One frame
  * remains an indivisible synchronous decode.
  */
-const ZSTD_DECODE_YIELD_INTERVAL_MS = 500
+const ZSTD_DECODE_YIELD_INTERVAL_MS = 16
 
 /** Assert that the independently decodable first frame contains only the header record. */
 function assertZstdHeaderFrame(plaintext: Buffer): void {
@@ -165,6 +166,7 @@ interface StoredLogBase extends FrozenStoredEvents {
 /** A decoded current generation that is already durable. */
 interface CurrentStoredLog extends StoredLogBase {
   readonly status: 'current'
+  readonly openingSourceDigest?: string
 }
 
 /** A migrated historical generation retained until an explicit write open publishes it. */
@@ -230,12 +232,12 @@ interface ObservedJsonlGeneration {
   readonly reusable?: HeaderObservation
 }
 
-/** One backend-owned historical preparation shared by its current callers. */
-interface MigrationPreparation {
+/** One backend-owned log read shared by its current callers. */
+interface LogRead<T extends StoredLog> {
   readonly sourcePath: string
   readonly sourceRevision: PersistenceRevision
   readonly controller: AbortController
-  readonly promise: Promise<PreparedStoredLog>
+  readonly promise: Promise<T>
   settled: boolean
   waiters: number
 }
@@ -274,11 +276,11 @@ function isENOENT(error: unknown): boolean {
 }
 
 /**
- * Run `task` over `items` through the backend's shared listing limiter and
+ * Run `task` over `items` through a shared I/O limiter and
  * settle every call. Callers consume the outcomes in input order, so the first
  * failure they report matches a sequential loop whatever the completion order.
  * A limited task must never wait on the same limiter.
- * @param limit - the backend's shared listing limiter.
+ * @param limit - the backend's shared I/O limiter.
  * @param items - inputs in their sequential order.
  * @param task - per-item operation.
  * @returns one outcome per item, in input order.
@@ -358,6 +360,8 @@ export class JsonlSessionPersistence extends SessionPersistence {
    * Queued tasks of a cancelled listing run and reject at their signal check.
    */
   private readonly listLimit: LimitFunction
+  // Exact reads should not wait behind a full listing's queued project and Session probes.
+  private readonly lookupLimit: LimitFunction
   private rootEncodingCheck: Promise<void> | undefined
   private readonly generationFormat: Omit<JsonlGenerationFormatAdapter, 'createRestore'>
   /**
@@ -380,7 +384,8 @@ export class JsonlSessionPersistence extends SessionPersistence {
    */
   private headerObservations = new Map<string, HeaderObservation>()
   /** One joinable decode/migration operation per selected historical Session file revision. */
-  private readonly migrationPreparations = new Map<SessionId, MigrationPreparation>()
+  private readonly migrationPreparations = new Map<SessionId, LogRead<PreparedStoredLog>>()
+  private readonly currentReads = new Map<SessionId, LogRead<CurrentStoredLog>>()
   /**
    * Owns the optional cold-read Worker Thread. The worker is spawned on the
    * first worker-eligible open and reused; this owner terminates it on dispose.
@@ -406,6 +411,7 @@ export class JsonlSessionPersistence extends SessionPersistence {
     this.root = resolve(config.root)
     this.compression = config.compression ?? DEFAULT_COMPRESSION
     this.listLimit = pLimit(config.listConcurrency ?? DEFAULT_LIST_CONCURRENCY)
+    this.lookupLimit = pLimit(this.listLimit.concurrency)
     this.generationFormat = {
       currentVersion: sessionFormatCatalog.currentVersion,
       encodeHeader: (header, inheritedEventCount) =>
@@ -759,6 +765,45 @@ export class JsonlSessionPersistence extends SessionPersistence {
     }
   }
 
+  override supportsOpeningIndex(): boolean {
+    return this.compression === 'zstd' && this.readWorkerClient === undefined
+  }
+
+  override async describeOpening(
+    snapshot: SessionPersistenceSnapshot, events: readonly SessionEvent[], firstSeq: number, signal?: AbortSignal,
+  ): Promise<SessionOpeningSuffix | undefined> {
+    const full = this.coldLogMemo.get(snapshot.header.id)
+    if (full?.status !== 'current' || full.revision !== snapshot.revision || full.openingSourceDigest === undefined
+      || full.events.length !== events.length || !events.every((event, index) => event === full.events[index])) return undefined
+    const bytes = await this.captureOpeningSource(snapshot, signal)
+    if (bytes === undefined || openingSourceDigest(bytes) !== full.openingSourceDigest) return undefined
+    return describeOpeningSuffix(bytes, firstSeq, events.length - 1, signal)
+  }
+
+  override async readOpening(
+    snapshot: SessionPersistenceSnapshot, receipt: SessionOpeningSuffix, signal?: AbortSignal,
+  ): Promise<SessionEvent[] | undefined> {
+    const bytes = await this.captureOpeningSource(snapshot, signal)
+    if (bytes === undefined) return undefined
+    const events = await readOpeningSuffix(bytes, receipt, signal)
+    if (events === undefined) return undefined
+    const current = await this.stat(snapshot.header.id, signal === undefined ? undefined : { signal })
+    return current?.revision === snapshot.revision && current.location?.path === snapshot.location?.path ? events : undefined
+  }
+
+  private async captureOpeningSource(snapshot: SessionPersistenceSnapshot, signal?: AbortSignal): Promise<Buffer | undefined> {
+    const id = snapshot.header.id
+    const location = snapshot.location
+    if (!this.supportsOpeningIndex() || snapshot.formatStatus !== 'current' || snapshot.header.isSeeded || snapshot.header.origin === 'subagent'
+      || location?.kind !== 'jsonl' || this.tracker.hasPending(id) || this.tracker.closeCompletion(id) !== undefined) return undefined
+    await this.assertStoredIdentity(location.path, SESSION_FORMAT_VERSION, snapshot.header, id, signal)
+    const captured = await readStableJsonlFile(location.path, signal)
+    const after = await stat(location.path, { bigint: true })
+    signal?.throwIfAborted()
+    return fileRevision(captured.identity) === snapshot.revision && samePhysicalIdentity(captured.identity, after)
+      && BigInt(captured.bytes.length) === after.size ? captured.bytes : undefined
+  }
+
   /**
    * List every stored session visible to this process: materialized artifacts
    * plus this process's created-but-unmaterialized sessions. Every call rescans
@@ -813,32 +858,8 @@ export class JsonlSessionPersistence extends SessionPersistence {
     if (selected.sourceVersion < SESSION_FORMAT_VERSION) {
       const sourceRevision = fileRevision(await stat(selected.sourcePath, { bigint: true }))
       signal?.throwIfAborted()
-      let preparation = this.migrationPreparations.get(id)
-      if (preparation === undefined
-        || preparation.sourcePath !== selected.sourcePath
-        || preparation.sourceRevision !== sourceRevision) {
-        const controller = new AbortController()
-        const promise = this.loadStoredMigration(id, selected, sourceRevision, controller.signal)
-        preparation = {
-          sourcePath: selected.sourcePath,
-          sourceRevision,
-          controller,
-          promise,
-          settled: false,
-          waiters: 0,
-        }
-        this.migrationPreparations.set(id, preparation)
-        const created = preparation
-        const release = (): void => {
-          created.settled = true
-          if (this.migrationPreparations.get(id) === created) {
-            this.migrationPreparations.delete(id)
-          }
-        }
-        void promise.then(release, release)
-      }
-      signal?.throwIfAborted()
-      return this.waitForPreparation(id, preparation, signal)
+      return this.shareLogRead(this.migrationPreparations, id, selected.sourcePath, sourceRevision,
+        innerSignal => this.loadStoredMigration(id, selected, sourceRevision, innerSignal), signal)
     }
     if (selected.sourceVersion > SESSION_FORMAT_VERSION) {
       const header = await this.readGenerationHeader(selected, id, signal)
@@ -855,21 +876,7 @@ export class JsonlSessionPersistence extends SessionPersistence {
         { kind: 'jsonl', path: selected.sourcePath },
       )
     }
-    const probe = fileRevision(await stat(selected.sourcePath, { bigint: true }))
-    const memoized = this.coldLogMemo.get(id)
-    if (memoized?.status === 'current' && memoized.revision === probe) {
-      this.coldLogMemo.delete(id)
-      this.coldLogMemo.set(id, memoized)
-      return memoized
-    }
-    const current = await readStableJsonlFile(selected.sourcePath, signal)
-    return this.decodeStoredLog(
-      selected.sourcePath,
-      id,
-      current.bytes,
-      fileRevision(current.identity),
-      signal,
-    )
+    return this.readStoredLog(selected.sourcePath, id, signal)
   }
 
   /** Probe the memo and otherwise decode one historical generation under backend cancellation. */
@@ -895,23 +902,37 @@ export class JsonlSessionPersistence extends SessionPersistence {
     return this.prepareStoredMigration(id, selected, signal)
   }
 
-  /** Await shared preparation for one caller and abort it only after its last waiter leaves. */
-  private async waitForPreparation(
+  /** Join a read of the same file revision, with independently cancellable callers. */
+  private async shareLogRead<T extends StoredLog>(
+    reads: Map<SessionId, LogRead<T>>,
     id: SessionId,
-    preparation: MigrationPreparation,
+    sourcePath: string,
+    sourceRevision: PersistenceRevision,
+    load: (signal: AbortSignal) => Promise<T>,
     signal?: AbortSignal,
-  ): Promise<PreparedStoredLog> {
-    preparation.waiters += 1
+  ): Promise<T> {
+    signal?.throwIfAborted()
+    let read = reads.get(id)
+    if (read === undefined || read.sourcePath !== sourcePath || read.sourceRevision !== sourceRevision) {
+      const controller = new AbortController()
+      const promise = load(controller.signal)
+      const started = { sourcePath, sourceRevision, controller, promise, settled: false, waiters: 0 }
+      reads.set(id, started)
+      const release = (): void => {
+        started.settled = true
+        if (reads.get(id) === started) reads.delete(id)
+      }
+      void promise.then(release, release)
+      read = started
+    }
+    read.waiters += 1
     try {
-      return await waitWithAbort(preparation.promise, signal)
+      return await waitWithAbort(read.promise, signal)
     } finally {
-      preparation.waiters -= 1
-      if (preparation.waiters === 0 && !preparation.settled) {
-        /* v8 ignore else -- a newer selected source may already own this id's preparation slot. */
-        if (this.migrationPreparations.get(id) === preparation) {
-          this.migrationPreparations.delete(id)
-        }
-        preparation.controller.abort()
+      read.waiters -= 1
+      if (read.waiters === 0 && !read.settled) {
+        if (reads.get(id) === read) reads.delete(id)
+        read.controller.abort()
       }
     }
   }
@@ -1048,8 +1069,10 @@ export class JsonlSessionPersistence extends SessionPersistence {
       this.coldLogMemo.set(expectedId, memoized)
       return memoized
     }
-    const { bytes, identity } = await readStableJsonlFile(path, signal)
-    return this.decodeStoredLog(path, expectedId, bytes, fileRevision(identity), signal)
+    return this.shareLogRead(this.currentReads, expectedId, path, probe, async (innerSignal) => {
+      const { bytes, identity } = await readStableJsonlFile(path, innerSignal)
+      return this.decodeStoredLog(path, expectedId, bytes, fileRevision(identity), innerSignal)
+    }, signal)
   }
 
   /** Decode and memoize one already-stable current physical snapshot. */
@@ -1107,6 +1130,9 @@ export class JsonlSessionPersistence extends SessionPersistence {
       ...rest,
       ...freezeStoredEvents(events),
       revision,
+      ...(this.compression === 'zstd' && this.readWorkerClient === undefined && parsed.tornTruncateTo === undefined
+        ? { openingSourceDigest: openingSourceDigest(buffer) }
+        : {}),
     }
     this.memoizeStoredLog(expectedId, stored)
     return stored
@@ -1893,15 +1919,14 @@ export class JsonlSessionPersistence extends SessionPersistence {
 
   /** Find the unique authoritative generation for an id across project directories. */
   private async findLog(id: SessionId, signal?: AbortSignal): Promise<ResolvedJsonlGeneration | undefined> {
-    const matches: ResolvedJsonlGeneration[] = []
-    for (const project of await this.listProjectDirs(signal)) {
+    const projects = await this.listProjectDirs(signal)
+    const outcomes = await settleLimited(this.lookupLimit, projects, async (project) => {
       signal?.throwIfAborted()
       await this.rejectLegacyFlatArtifact(project, id, signal)
       signal?.throwIfAborted()
-      const dir = join(project, encodeSegment(id))
-      const selected = await this.resolveGenerationInDirectory(dir, signal)
-      if (selected !== undefined) matches.push(selected)
-    }
+      return this.resolveGenerationInDirectory(join(project, encodeSegment(id)), signal)
+    })
+    const matches = settledValues(outcomes).filter(selected => selected !== undefined)
     if (matches.length > 1) {
       throw new Error(`duplicate JSONL session id "${id}" appears in multiple project directories`)
     }

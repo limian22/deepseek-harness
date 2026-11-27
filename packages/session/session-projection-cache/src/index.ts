@@ -19,7 +19,7 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
-import { SessionLogOffset } from '@deepseek-ai/dsh-session'
+import { SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type {
   Session,
   SessionEvent,
@@ -35,7 +35,7 @@ import type {
 } from '@deepseek-ai/dsh-session-projection'
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { projectionCacheDomainSpec } from './spec.ts'
-import type { CheckpointIdentity, CheckpointRecord } from './spec.ts'
+import type { CheckpointIdentity, CheckpointRecord, OpeningRecord } from './spec.ts'
 
 /**
  * The identity a Session header alone witnesses: the format generation the
@@ -136,6 +136,7 @@ export class SessionProjectionCache extends Service {
   static Config: z<Config> = Config
 
   private table?: KvTable<SessionId, CheckpointRecord>
+  private openings?: KvTable<SessionId, OpeningRecord>
   private readonly dirty = new Map<Session, DirtyState>()
   /**
    * Monotonic per-session write epoch. A cold durable checkpoint captures it
@@ -154,6 +155,7 @@ export class SessionProjectionCache extends Service {
     const domain = await this.ctx.storageDomain.open(projectionCacheDomainSpec)
     this.ctx.effect(() => () => domain.close(), 'sessionProjectionCache.domainClose')
     this.table = domain.table('sessions')
+    this.openings = domain.table('openings')
     this.installWritePath()
   }
 
@@ -420,6 +422,52 @@ export class SessionProjectionCache extends Service {
     }
     await this.put(meta.id, identity, rows)
     return restored.snapshot
+  }
+
+  /** Whether an indexed read is worth attempting before looking up the durable source. */
+  hasOpening(id: SessionId, revision?: string): boolean {
+    const receipt = this.openings?.get(id)?.receipt
+    return receipt !== undefined && (revision === undefined || receipt.revision === revision)
+  }
+
+  /** Read the exact projections paired with a disposable opening descriptor. */
+  openingReceipt(meta: SessionHeader): OpeningRecord['receipt'] | undefined {
+    const opening = this.openings?.get(meta.id)
+    return opening !== undefined && identityMatches(opening.identity, identityOf(meta, SessionLogOffset(0)))
+      ? opening.receipt
+      : undefined
+  }
+
+  cachedOpening(meta: SessionHeader): {
+    receipt: OpeningRecord['receipt']
+    projections: ProjectionSnapshot
+  } | undefined {
+    const opening = this.openings?.get(meta.id)
+    if (opening === undefined || !identityMatches(opening.identity, identityOf(meta, SessionLogOffset(0)))) return undefined
+    const { receipt } = opening
+    const projections = this.ctx.sessionProjections.viewExactCheckpoint(opening.rows, SessionSeq(receipt.cursor))
+    return projections === undefined ? undefined : { receipt, projections }
+  }
+
+  /** Store both parts of a validated indexed cut in the same durable record. */
+  async writeOpening(
+    meta: SessionHeader,
+    receipt: OpeningRecord['receipt'],
+    events: readonly SessionEvent[],
+    guard?: () => boolean | Promise<boolean>,
+  ): Promise<void> {
+    const cursor = SessionSeq(receipt.cursor)
+    if (meta.isSeeded || receipt.firstSeq > cursor || events.length !== cursor + 1 || events.at(-1)?.seq !== cursor) return
+    const identity = identityOf(meta, SessionLogOffset(0))
+    const epoch = this.epochOf(meta.id)
+    const { checkpoint } = this.ctx.sessionProjections.restore({}, events, SessionLogOffset(0), meta, SessionLogOffset(0))
+    if (guard !== undefined && !(await guard())) return
+    if (this.ctx.sessions.get(meta.id) !== undefined || this.epochOf(meta.id) !== epoch) return
+    const existing = this.recordFor(meta.id, identity)
+    if (existing !== undefined && highestRowSeq(existing.rows) > cursor) return
+    const detached = snapshotJsonValue(checkpoint)
+    if (detached === undefined) return
+    await this.openings?.put(meta.id, { identity, receipt, rows: detached as CheckpointRecord['rows'] })
   }
 
   // --- write-behind (throttle + mandatory points) ---

@@ -120,6 +120,24 @@ it('publishes a complete-log result independently of the visible page and releas
   expect(ctx.sessionProjections.snapshot(session).values).not.toHaveProperty('conversationContinuation')
 })
 
+it('uses absolute pagination cuts for a verified suffix', () => {
+  const log = [events(failed('SERVER')), events(failed('SERVER')), events(failed('SERVER'))]
+    .flat().map((event, index) => ({ ...event, seq: SessionSeq(index) }))
+  const cursor = log.at(-1)!.seq
+  const window = { minMessages: 1, minTurns: 1 }
+  const expected = paginate(log, undefined, 500, cursor, window)
+  expect(expected.hasMore).toBe(true)
+  expect(paginate(log.slice(2), undefined, 500, cursor, window, SessionLogOffset(2))).toEqual(expected)
+})
+
+it('requires an earlier suffix when a message budget cut reaches an unloaded source', () => {
+  const log = events(failed('SERVER'))
+  const user = log.find(event => event.type === 'user/message')!
+  const suffix = log.slice(user.seq).map(event => event === user ? { ...event, sourceEventSeqs: [SessionSeq(0)] } : event)
+  expect(paginate(suffix, undefined, 1, suffix.at(-1)!.seq, undefined, SessionLogOffset(user.seq)))
+    .toMatchObject({ needsEarlier: true })
+})
+
 it('restores valid, absent and outdated checkpoints through the registry', async () => {
   const ctx = new Context()
   onTestFinished(() => ctx.fiber.dispose())

@@ -683,6 +683,29 @@ export class SessionProjectionRegistry extends Service {
   }
 
   /**
+   * Render the current wire views of an exact, source-bound checkpoint.
+   * @param checkpoint - rows from the log cut already verified by the caller.
+   * @param cursor - the verified inclusive log cut.
+   * @returns the snapshot when every active unit has a valid row at the cut, otherwise a cache miss.
+   */
+  viewExactCheckpoint(checkpoint: ProjectionCheckpoint, cursor: SessionSeqCursor): ProjectionSnapshot | undefined {
+    const values = new Map<string, unknown>()
+    try {
+      for (const registration of this.registrations.values()) {
+        if (registration.refs === 0) continue
+        const def = registration.def
+        const row = Object.hasOwn(checkpoint, def.key) ? checkpoint[def.key] : undefined
+        if (row?.ver !== def.stateVersion || row.seq !== cursor) return undefined
+        const state = def.stateSchema.parse(row.val)
+        if (def.wire !== undefined) values.set(def.key, def.wire.viewSchema.parse(def.wire.view(state)))
+      }
+    } catch {
+      return undefined
+    }
+    return { asOfSeq: cursor, values: Object.fromEntries(values) }
+  }
+
+  /**
    * Cold read: fold every persisted unit over a stored log suffix, seeding
    * each from its checkpoint row when usable — the one read recipe (cached
    * state + forward tail replay + `view`) applied without a live `Session`.

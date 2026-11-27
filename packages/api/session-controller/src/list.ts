@@ -195,6 +195,10 @@ export class ApiSessionList {
     }
   }
 
+  get coldCatalog(): readonly SessionRecord[] {
+    return this.coldRecords
+  }
+
   /**
    * Read every visible attached and persisted Session without activating an Agent.
    * @param signal - optional cancellation for persistence reads and summary generation.
